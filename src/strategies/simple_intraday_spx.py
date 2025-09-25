@@ -7,7 +7,7 @@ The real implementation would:
 - Manage exits (time-based, profit target, delta shift)
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Any, Iterable
 
 
@@ -16,6 +16,10 @@ class StrategySignal:
     name: str
     value: float
     metadata: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        return d
 
 
 class SimpleIntradaySPXStrategy:

@@ -2,16 +2,18 @@
 pandas==2.3.2
 numpy==2.3.3
 scipy>=1.11.0
+pyarrow>=17.0.0
 
 # Data & APIs (uncomment / add as you integrate)
 openai==1.109.1
 websocket-client==1.8.0
+httpx>=0.28.1
 # polygon-api-client
 # iqfeed
-# httpx  # already pulled indirectly via openai
 
 # Config & validation
 pydantic>=2.6.0
+pydantic-settings>=2.6.0
 python-dotenv>=1.0.0
 
 # CLI / Tooling

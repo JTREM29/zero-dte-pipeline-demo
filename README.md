@@ -2,44 +2,72 @@
 
 A structured Python pipeline for researching, ingesting, and modeling zero-day (0DTE) options data.
 
-## Goals
-- Ingest intraday options + underlying market data (e.g., SPX/SPY) from providers (IQFeed, Polygon, etc.)
-- Normalize and store raw + enriched datasets
-- Feature engineering for strategy research and ML modeling
-- Support experimentation with latency-sensitive signals and execution logic
+## Features Implemented
+- Config management via Pydantic `Settings`
+- Polygon + IQFeed client placeholders
+- Simple strategy producing demo signals
+- Logging (console + rotating file in `logs/pipeline.log`)
+- Optional OpenAI summarization of signals
+- Parquet persistence for signals (`data/signals/`)
+- Typer CLI (`python -m src.cli --help`)
+- Smoke tests (`pytest`)
 
-## Initial Layout (subject to evolution)
+## Layout
 ```
 ZeroDTE-pipeline/
-  .venv/                # Local virtual environment (ignored)
-  main.py               # Entry point / quick orchestrator
-  requirements.txt      # Python dependencies
-  src/                  # (To be added) package code
-  data/                 # (You create) raw/processed datasets (gitignored later if needed)
-  notebooks/            # (Optional) exploratory analysis
+  src/
+    config.py
+    cli.py
+    persistence.py
+    openai_client.py
+    datafeeds/
+    strategies/
+    utils/
+  tests/
+  data/
+  logs/
+  main.py
 ```
 
-## Getting Started
-1. Create / activate the virtual environment:
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
-2. Install dependencies:
-   ```powershell
-   pip install -r requirements.txt
-   ```
-3. Run the entry point:
-   ```powershell
-   python main.py
-   ```
+## Quickstart
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+copy .env.example .env  # fill in keys
+python main.py
+```
 
-## Next Steps
-- Add `src/zero_dte/` package with data fetching & transformations
-- Introduce configuration pattern (pydantic or dynaconf)
-- Add logging and basic CLI arguments (argparse or Typer)
-- Implement data provider abstractions
-- Add tests (pytest) and CI workflow
+## CLI Examples
+```powershell
+python -m src.cli snapshot SPX
+python -m src.cli demo_strategy --symbol SPX
+python -m src.cli iqfeed_chain SPX
+python -m src.cli ensure_dirs
+```
+
+## Environment Variables (.env)
+| Variable | Purpose |
+|----------|---------|
+| POLYGON_API_KEY | Polygon data access |
+| IQFEED_USERNAME | IQFeed login |
+| IQFEED_PASSWORD | IQFeed login |
+| OPENAI_API_KEY  | OpenAI summarization |
+| LOG_LEVEL       | Logging verbosity |
+| DATA_DIR        | Base data directory (default `data`) |
+
+## Tests
+```powershell
+pytest -q
+```
+
+## Next Ideas
+- Real Polygon REST + WebSocket
+- IQFeed streaming interface
+- Strategy parameterization + backtesting harness
+- Feature engineering module
+- CI workflow (GitHub Actions)
+- Risk management / PnL attribution utilities
 
 ## License
 (Choose a license and add a LICENSE file.)
