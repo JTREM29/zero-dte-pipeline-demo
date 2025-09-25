@@ -11,6 +11,7 @@ from .datafeeds.polygon_client import PolygonClient, PolygonConfig
 from .datafeeds.iqfeed_client import IQFeedClient, IQFeedConfig
 from .strategies.simple_intraday_spx import SimpleIntradaySPXStrategy
 from .openai_client import OpenAIWrapper
+from .ingestion.polygon_ingestor import PolygonIngestor
 
 app = typer.Typer(help="Zero DTE research & execution pipeline CLI")
 LOGGER = get_logger("zero_dte.cli")
@@ -102,6 +103,25 @@ def iqfeed_ping():
     client = IQFeedClient(cfg)
     ok = client.ping()
     typer.echo(json.dumps({"ok": ok}))
+
+
+@app.command()
+def ingest_prev_spx(normalize: bool = True, no_cache: bool = False):
+    """Ingest previous SPX aggregate bar from Polygon into parquet (partitioned by date)."""
+    settings = Settings()
+    if not settings.has_polygon:
+        typer.echo("Polygon API key missing")
+        raise typer.Exit(1)
+    ing = PolygonIngestor(settings.data_dir or "data")  # type: ignore[arg-type]
+    res = ing.ingest_prev_spx(normalize=normalize, use_cache=not no_cache)
+    typer.echo(json.dumps({
+        "symbol": res.symbol,
+        "rows": res.rows,
+        "path": str(res.path) if res.path else None,
+        "normalized": res.normalized,
+        "ts": res.ts,
+        "cached": res.cached,
+    }, indent=2))
 
 
 if __name__ == "__main__":  # pragma: no cover

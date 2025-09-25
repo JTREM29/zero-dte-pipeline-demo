@@ -57,6 +57,7 @@ python -m src.cli ensure_dirs
 python -m src.cli polygon_last_spx            # raw previous aggregate JSON
 python -m src.cli polygon_last_spx --normalize  # normalized bar DataFrame as JSON
 python -m src.cli iqfeed_ping                 # test IQFeed socket connectivity
+python -m src.cli ingest_prev_spx             # ingest previous SPX aggregate -> parquet
 ```
 
 ## Environment Variables (.env)
@@ -82,6 +83,7 @@ pytest -q
 - Polygon requests include simple retry/backoff (exponential linear pattern)
 - In-memory TTL cache (~30s) for previous SPX aggregate to reduce API calls
 - Normalization helper converts Polygon aggregate keys to readable column names
+- Ingestion writes parquet to `data/raw/polygon/prev_spx/date=YYYY-MM-DD/part.parquet`
 
 ## Next Ideas
 - Real Polygon REST + WebSocket
