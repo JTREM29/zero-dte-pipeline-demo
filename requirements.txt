@@ -34,6 +34,7 @@ pytest>=8.0.0
 # Linting / Formatting (optional: set up later)
 black>=24.0.0
 ruff>=0.5.0
+requests>=2.32.3
 
 # --- Notes ---
 # Pinned core runtime libs above to ensure reproducible environment.
