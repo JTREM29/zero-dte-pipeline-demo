@@ -1,0 +1,68 @@
+# Python / Project ignores
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# Byte-compiled / optimized / DLL files
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+env/
+venv/
+ENV/
+.venv/
+
+# Logs / outputs
+*.log
+logs/
+output/
+
+# Testing / coverage
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+coverage.xml
+
+# Tooling / IDE
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment & secrets (create a local .env file manually)
+.env
+.env.*
+!.env.example
+
+# C extensions
+*.c
+*.cpp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Cache
+.cache/
+
+# Profiling
+.prof
+
+# Data & runtime artifacts
+data/
+logs/

@@ -1,0 +1,38 @@
+# Core scientific stack
+pandas==2.3.2
+numpy==2.3.3
+scipy>=1.11.0
+
+# Data & APIs (uncomment / add as you integrate)
+openai==1.109.1
+websocket-client==1.8.0
+# polygon-api-client
+# iqfeed
+# httpx  # already pulled indirectly via openai
+
+# Config & validation
+pydantic>=2.6.0
+python-dotenv>=1.0.0
+
+# CLI / Tooling
+typer>=0.12.0
+rich>=13.7.0
+
+# Scheduling / pipelines (optional candidates)
+# prefect
+# airflow
+
+# ML / Modeling (add when needed)
+# scikit-learn
+# xgboost
+
+# Testing
+pytest>=8.0.0
+
+# Linting / Formatting (optional: set up later)
+black>=24.0.0
+ruff>=0.5.0
+
+# --- Notes ---
+# Pinned core runtime libs above to ensure reproducible environment.
+# Consider generating a full lock (pip freeze > requirements.lock) for deployments.
