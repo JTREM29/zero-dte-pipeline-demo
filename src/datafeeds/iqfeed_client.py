@@ -1,13 +1,24 @@
-"""IQFeed client placeholder.
+"""IQFeed connectivity utilities.
 
-Real implementation would manage TCP socket login, request chains, and streaming updates.
+This module now contains:
+ - IQFeedClient (lookup/ping/demo chain stubs)
+ - IQFeedLevel1Stream: a lightweight threaded Level1 quote streamer
+ - parse_level1_line: parser for raw IQFeed 'Q' lines into a dict
+
+It does NOT perform full protocol negotiation (login, advanced field set selection),
+but provides a practical starting point for real-time ingestion. The IQFeed Windows
+client must be running locally and permissions for Level1 data must exist.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Callable, Dict
 import os
 import socket
 import time
+import threading
+import queue
+
+from src.utils.logging_setup import get_logger
 
 
 @dataclass
@@ -34,7 +45,7 @@ class IQFeedConfig:
 class IQFeedClient:
     def __init__(self, cfg: IQFeedConfig):
         self._cfg = cfg
-        self.log = get_logger("iqfeed")  # type: ignore[assignment]
+        self.log = get_logger("iqfeed")
         self.host: str = cfg.host
         self.port: int = cfg.port_level1
         self.timeout: float = cfg.timeout
@@ -77,3 +88,149 @@ class IQFeedClient:
             {"symbol": f"{root}250925C00000000", "type": "call", "_demo": True},
             {"symbol": f"{root}250925P00000000", "type": "put", "_demo": True},
         ]
+
+
+# ---------------------- Level1 Streaming ----------------------
+
+def parse_level1_line(line: str) -> Optional[Dict[str, Any]]:
+    """Parse a raw Level1 'Q' update line.
+
+    IQFeed 'Q' message fields (simplified subset). Real spec has many more;
+    we map a few indices for convenience. Returns None if not parsable.
+    """
+    line = line.strip()
+    if not line or line.startswith("S,"):
+        return None  # server/system message
+    if line[0] != "Q":
+        return None
+    parts = line.split(",")
+    # Minimal sanity check
+    if len(parts) < 12:
+        return None
+    try:
+        return {
+            "type": parts[0],
+            "symbol": parts[1],
+            "bid": float(parts[2]) if parts[2] else None,
+            "ask": float(parts[3]) if parts[3] else None,
+            "last": float(parts[11]) if parts[11] else None,
+            "raw": line,
+        }
+    except ValueError:
+        return None
+
+
+class IQFeedLevel1Stream:
+    """Threaded Level1 quote streamer.
+
+    Usage:
+        stream = IQFeedLevel1Stream(cfg)
+        stream.start(["SPX"])
+        msg = stream.get(timeout=2)
+    """
+
+    def __init__(self, cfg: IQFeedConfig, on_message: Optional[Callable[[dict[str, Any]], None]] = None):
+        self.cfg = cfg
+        self.log = get_logger("iqfeed.stream")
+        self.on_message = on_message
+        self._sock: Optional[socket.socket] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._queue: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        self._watched: set[str] = set()
+
+    # --- Public API ---
+    def start(self, symbols: list[str]):
+        if self._thread and self._thread.is_alive():
+            self.log.warning("Stream already running")
+            return
+        self._connect()
+        for sym in symbols:
+            self.watch(sym)
+        self._thread = threading.Thread(target=self._reader_loop, name="iqfeed-l1", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+        self._close()
+
+    def watch(self, symbol: str):
+        if not self._sock:
+            raise RuntimeError("Stream socket not connected. Call start().")
+        if symbol in self._watched:
+            return
+        cmd = f"w{symbol}\n"
+        self._sock.sendall(cmd.encode("utf-8"))
+        self._watched.add(symbol)
+
+    def unwatch(self, symbol: str):
+        if not self._sock or symbol not in self._watched:
+            return
+        cmd = f"u{symbol}\n"
+        try:
+            self._sock.sendall(cmd.encode("utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+        self._watched.discard(symbol)
+
+    def get(self, timeout: Optional[float] = None) -> Optional[dict[str, Any]]:
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    # --- Internals ---
+    def _connect(self):
+        self._sock = socket.create_connection((self.cfg.host, self.cfg.port_level1), timeout=self.cfg.timeout)
+        # Set small timeout for responsive shutdown
+        self._sock.settimeout(0.5)
+        # Basic protocol version negotiation (best effort)
+        try:
+            self._sock.sendall(b"S,SET PROTOCOL,6.2\n")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _close(self):
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._sock = None
+
+    def _reader_loop(self):  # pragma: no cover - requires live feed
+        buf = b""
+        while not self._stop_event.is_set():
+            try:
+                chunk = self._sock.recv(65536) if self._sock else b""
+                if not chunk:
+                    time.sleep(0.05)
+                    continue
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    text = line.decode("utf-8", errors="replace")
+                    parsed = parse_level1_line(text)
+                    if parsed:
+                        self._queue.put(parsed)
+                        if self.on_message:
+                            try:
+                                self.on_message(parsed)
+                            except Exception as exc:  # noqa: BLE001
+                                self.log.warning("on_message error: %s", exc)
+            except socket.timeout:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("Reader loop error: %s", exc)
+                time.sleep(0.2)
+        self.log.info("Reader loop exiting")
+
+
+__all__ = [
+    "IQFeedClient",
+    "IQFeedConfig",
+    "IQFeedLevel1Stream",
+    "parse_level1_line",
+]

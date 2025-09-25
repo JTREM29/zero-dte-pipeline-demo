@@ -8,7 +8,7 @@ from pathlib import Path
 from .config import Settings
 from .utils.logging_setup import get_logger
 from .datafeeds.polygon_client import PolygonClient, PolygonConfig
-from .datafeeds.iqfeed_client import IQFeedClient, IQFeedConfig
+from .datafeeds.iqfeed_client import IQFeedClient, IQFeedConfig, IQFeedLevel1Stream
 from .strategies.simple_intraday_spx import SimpleIntradaySPXStrategy
 from .openai_client import OpenAIWrapper
 from .ingestion.polygon_ingestor import PolygonIngestor
@@ -121,6 +121,35 @@ def ingest_prev_spx(normalize: bool = True, no_cache: bool = False):
         "normalized": res.normalized,
         "ts": res.ts,
         "cached": res.cached,
+    }, indent=2))
+
+
+@app.command()
+def iqfeed_stream(symbols: str = typer.Argument("SPX", help="Comma-separated symbols to watch"), samples: int = 5, timeout: float = 10.0):
+    """Stream real-time Level1 quotes from a running IQFeed client (requires local IQConnect)."""
+    cfg = IQFeedConfig.from_env()
+    syms = [s.strip() for s in symbols.split(",") if s.strip()]
+    collected: list[dict] = []
+
+    def _on_msg(msg: dict):  # noqa: D401
+        if msg.get("symbol") in syms:
+            collected.append(msg)
+
+    stream = IQFeedLevel1Stream(cfg, on_message=_on_msg)
+    stream.start(syms)
+    import time as _t
+    start = _t.time()
+    while len(collected) < samples and (_t.time() - start) < timeout:
+        m = stream.get(timeout=0.5)
+        if m and m.get("symbol") in syms:
+            # ensure capture in addition to callback
+            if m not in collected:
+                collected.append(m)
+    stream.stop()
+    typer.echo(json.dumps({
+        "symbols": syms,
+        "received": len(collected),
+        "messages": collected[:samples],
     }, indent=2))
 
 
