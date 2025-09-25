@@ -38,6 +38,12 @@ copy .env.example .env  # fill in keys
 python main.py
 ```
 
+## One-Line Bootstrap (optional PowerShell snippet)
+```powershell
+# Creates venv, installs deps, copies env template
+python -m venv .venv; .\.venv\Scripts\Activate.ps1; pip install -r requirements.txt; if (-not (Test-Path .env)) { copy .env.example .env }
+```
+
 ## CLI Examples
 ```powershell
 python -m src.cli snapshot SPX
@@ -52,9 +58,13 @@ python -m src.cli ensure_dirs
 | POLYGON_API_KEY | Polygon data access |
 | IQFEED_USERNAME | IQFeed login |
 | IQFEED_PASSWORD | IQFeed login |
+| IQFEED_HOST | IQFeed desktop host (default 127.0.0.1) |
+| IQFEED_PORT_LEVEL1 | Level1/lookup port (default 5009) |
+| IQFEED_PORT_ADMIN | Admin port (default 5009) |
 | OPENAI_API_KEY  | OpenAI summarization |
 | LOG_LEVEL       | Logging verbosity |
 | DATA_DIR        | Base data directory (default `data`) |
+| LOG_DIR         | Log directory (default `logs`) |
 
 ## Tests
 ```powershell

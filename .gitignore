@@ -38,6 +38,7 @@ coverage.xml
 
 # Tooling / IDE
 .vscode/
+!.vscode/settings.json
 .idea/
 *.iml
 
