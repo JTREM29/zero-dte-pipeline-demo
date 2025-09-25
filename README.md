@@ -52,6 +52,13 @@ python -m src.cli iqfeed_chain SPX
 python -m src.cli ensure_dirs
 ```
 
+## Additional CLI Commands
+```powershell
+python -m src.cli polygon_last_spx            # raw previous aggregate JSON
+python -m src.cli polygon_last_spx --normalize  # normalized bar DataFrame as JSON
+python -m src.cli iqfeed_ping                 # test IQFeed socket connectivity
+```
+
 ## Environment Variables (.env)
 | Variable | Purpose |
 |----------|---------|
@@ -70,6 +77,11 @@ python -m src.cli ensure_dirs
 ```powershell
 pytest -q
 ```
+
+## Implementation Notes
+- Polygon requests include simple retry/backoff (exponential linear pattern)
+- In-memory TTL cache (~30s) for previous SPX aggregate to reduce API calls
+- Normalization helper converts Polygon aggregate keys to readable column names
 
 ## Next Ideas
 - Real Polygon REST + WebSocket

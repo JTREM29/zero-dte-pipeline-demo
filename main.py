@@ -55,7 +55,11 @@ def main() -> int:
         poly_cfg = PolygonConfig.from_env()
         poly_client = PolygonClient(poly_cfg)
         snap = poly_client.fetch_underlying_snapshot("SPX")
-        LOGGER.info("Fetched snapshot: %s", snap)
+        prev = poly_client.last_trade_spx(use_cache=True)
+        if prev:
+            norm_df = poly_client.normalize_prev_agg(prev)
+            if norm_df is not None:
+                LOGGER.info("Prev agg close: %s", norm_df.iloc[0].get("close"))
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Polygon snapshot unavailable: %s", exc)
         snap = {"symbol": "SPX", "lastPrice": 0.0}

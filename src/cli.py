@@ -73,5 +73,36 @@ def ensure_dirs():
     typer.echo("Directories ensured.")
 
 
+@app.command()
+def polygon_last_spx(normalize: bool = typer.Option(False, help="Return normalized DataFrame-like JSON"), cache: bool = True):
+    """Fetch previous SPX aggregate via Polygon (with retry + optional cache)."""
+    settings = Settings()
+    if not settings.has_polygon:
+        typer.echo("Polygon API key missing")
+        raise typer.Exit(1)
+    client = PolygonClient(PolygonConfig.from_env())
+    data = client.last_trade_spx(use_cache=cache)
+    if not data:
+        typer.echo("{}")
+        raise typer.Exit(1)
+    if normalize:
+        df = client.normalize_prev_agg(data)
+        if df is None:
+            typer.echo("{}")
+        else:
+            typer.echo(df.to_json(orient="records"))
+    else:
+        typer.echo(json.dumps(data, indent=2))
+
+
+@app.command()
+def iqfeed_ping():
+    """Ping IQFeed Level1 socket."""
+    cfg = IQFeedConfig.from_env()
+    client = IQFeedClient(cfg)
+    ok = client.ping()
+    typer.echo(json.dumps({"ok": ok}))
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()
