@@ -12,6 +12,7 @@ from .datafeeds.iqfeed_client import IQFeedClient, IQFeedConfig, IQFeedLevel1Str
 from .strategies.simple_intraday_spx import SimpleIntradaySPXStrategy
 from .openai_client import OpenAIWrapper
 from .ingestion.polygon_ingestor import PolygonIngestor
+from .ingestion.iqfeed_level1_writer import Level1BatchWriter, BatchConfig
 
 app = typer.Typer(help="Zero DTE research & execution pipeline CLI")
 LOGGER = get_logger("zero_dte.cli")
@@ -150,6 +151,37 @@ def iqfeed_stream(symbols: str = typer.Argument("SPX", help="Comma-separated sym
         "symbols": syms,
         "received": len(collected),
         "messages": collected[:samples],
+    }, indent=2))
+
+
+@app.command()
+def iqfeed_stream_persist(symbols: str = typer.Argument("SPX", help="Comma-separated symbols"), duration: float = 30.0, flush_secs: float = 2.0, max_rows: int = 3000):
+    """Stream Level1 quotes and persist to parquet micro-batches for the given duration (seconds)."""
+    settings = Settings()
+    cfg = IQFeedConfig.from_env()
+    syms = [s.strip() for s in symbols.split(",") if s.strip()]
+    writer = Level1BatchWriter(BatchConfig(base_dir=Path(settings.data_dir or "data"), flush_secs=flush_secs, max_rows=max_rows))  # type: ignore[arg-type]
+
+    def _on(msg: dict):  # noqa: D401
+        if msg.get("symbol") in syms:
+            writer.add(msg)
+
+    stream = IQFeedLevel1Stream(cfg, on_message=_on)
+    stream.start(syms)
+    import time as _t
+    start = _t.time()
+    while (_t.time() - start) < duration:
+        m = stream.get(timeout=0.5)
+        if m:
+            if m.get("symbol") in syms:
+                writer.add(m)
+    stream.stop()
+    writer.flush()
+    typer.echo(json.dumps({
+        "symbols": syms,
+        "status": "completed",
+        "duration_sec": duration,
+        "target_dir": str(Path(settings.data_dir or "data") / "raw" / "iqfeed" / "level1"),
     }, indent=2))
 
 

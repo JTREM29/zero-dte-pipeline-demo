@@ -92,32 +92,48 @@ class IQFeedClient:
 
 # ---------------------- Level1 Streaming ----------------------
 
-def parse_level1_line(line: str) -> Optional[Dict[str, Any]]:
-    """Parse a raw Level1 'Q' update line.
+LEVEL1_FIELD_MAP = {
+    0: "msg_type",      # 'Q'
+    1: "symbol",
+    2: "bid",
+    3: "ask",
+    4: "bid_size",
+    5: "ask_size",
+    6: "last_trade",
+    7: "last_trade_size",
+    8: "last_trade_time",  # textual timestamp (convert later if needed)
+    9: "total_volume",
+    10: "day_high",
+    11: "day_low",
+}
 
-    IQFeed 'Q' message fields (simplified subset). Real spec has many more;
-    we map a few indices for convenience. Returns None if not parsable.
+_NUMERIC_FIELDS = {"bid", "ask", "bid_size", "ask_size", "last_trade", "last_trade_size", "total_volume", "day_high", "day_low"}
+
+
+def parse_level1_line(line: str) -> Optional[Dict[str, Any]]:
+    """Parse a raw Level1 'Q' message into a dict.
+
+    Returns None for system/unsupported lines. Minimal safe parsing; unknown fields ignored.
     """
     line = line.strip()
-    if not line or line.startswith("S,"):
-        return None  # server/system message
-    if line[0] != "Q":
+    if not line or line.startswith("S,") or not line.startswith("Q"):
         return None
     parts = line.split(",")
-    # Minimal sanity check
-    if len(parts) < 12:
+    if len(parts) < 7:  # need at least up to last trade
         return None
-    try:
-        return {
-            "type": parts[0],
-            "symbol": parts[1],
-            "bid": float(parts[2]) if parts[2] else None,
-            "ask": float(parts[3]) if parts[3] else None,
-            "last": float(parts[11]) if parts[11] else None,
-            "raw": line,
-        }
-    except ValueError:
-        return None
+    data: Dict[str, Any] = {"raw": line}
+    for idx, key in LEVEL1_FIELD_MAP.items():
+        if idx >= len(parts):
+            continue
+        raw_val = parts[idx]
+        if key in _NUMERIC_FIELDS:
+            try:
+                data[key] = float(raw_val) if raw_val else None
+            except ValueError:
+                data[key] = None
+        else:
+            data[key] = raw_val
+    return data
 
 
 class IQFeedLevel1Stream:
