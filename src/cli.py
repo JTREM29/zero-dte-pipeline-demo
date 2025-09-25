@@ -13,6 +13,8 @@ from .strategies.simple_intraday_spx import SimpleIntradaySPXStrategy
 from .openai_client import OpenAIWrapper
 from .ingestion.polygon_ingestor import PolygonIngestor
 from .ingestion.iqfeed_level1_writer import Level1BatchWriter, BatchConfig
+from .aggregation.bar_builder import TimeBarAggregator
+import pandas as pd
 
 app = typer.Typer(help="Zero DTE research & execution pipeline CLI")
 LOGGER = get_logger("zero_dte.cli")
@@ -183,6 +185,51 @@ def iqfeed_stream_persist(symbols: str = typer.Argument("SPX", help="Comma-separ
         "duration_sec": duration,
         "target_dir": str(Path(settings.data_dir or "data") / "raw" / "iqfeed" / "level1"),
     }, indent=2))
+
+
+@app.command()
+def build_bars(symbol: str, interval: float = 1.0, date: str = typer.Option(None, help="Date partition YYYY-MM-DD (defaults today)")):
+    """Aggregate stored Level1 ticks (persisted parquet) into time bars."""
+    settings = Settings()
+    base = Path(settings.data_dir or "data") / "raw" / "iqfeed" / "level1"
+    if date is None:
+        date = time.strftime("%Y-%m-%d", time.gmtime())
+    part_dir = base / f"date={date}"
+    if not part_dir.exists():
+        typer.echo(json.dumps({"error": f"partition {part_dir} missing"}))
+        raise typer.Exit(1)
+    files = sorted(part_dir.glob("*.parquet"))
+    if not files:
+        typer.echo(json.dumps({"error": "no parquet files"}))
+        raise typer.Exit(1)
+    agg = TimeBarAggregator(interval_sec=interval)
+    import time as _t
+    bars_out = []
+    for f in files:
+        df = pd.read_parquet(f)
+        for rec in df.to_dict(orient="records"):
+            if rec.get("symbol") != symbol:
+                continue
+            bars = agg.add_tick(rec)  # type: ignore[arg-type]
+            if bars:
+                bars_out.extend(bars)
+    # Flush remainder
+    bars_out.extend(agg.flush())
+    payload = [
+        {
+            "symbol": b.symbol,
+            "start_ts": b.start_ts,
+            "end_ts": b.end_ts,
+            "open": b.open,
+            "high": b.high,
+            "low": b.low,
+            "close": b.close,
+            "volume": b.volume,
+            "trades": b.trades,
+        }
+        for b in bars_out
+    ]
+    typer.echo(json.dumps({"symbol": symbol, "interval": interval, "bars": payload}, indent=2))
 
 
 if __name__ == "__main__":  # pragma: no cover
