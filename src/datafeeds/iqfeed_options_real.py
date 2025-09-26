@@ -12,11 +12,12 @@ Future work:
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable, Iterable
 import socket
 import time
 
 from .iqfeed_client import IQFeedConfig
+from .options_chain import parse_occ_symbol, OptionContract
 from ..utils.logging import get_logger
 
 
@@ -40,6 +41,20 @@ class IQFeedOptionChainClient:
             pass
         return s
 
+    @staticmethod
+    def parse_chain_line(line: str) -> Optional[str]:
+        """Heuristic extraction of an OCC symbol from a raw chain line.
+
+        Looks for first token matching the OCC pattern used elsewhere (root+YYMMDD+CP+strike).
+        Returns the symbol string if found, else None.
+        """
+        parts = [p for p in line.replace(" ", ",").split(',') if p]
+        for p in parts:
+            if len(p) >= 20 and p.isalnum():  # rough filter, final validation via parse_occ_symbol
+                if parse_occ_symbol(p):  # reuse existing validator
+                    return p
+        return None
+
     def request_chain(self, root: str, month_codes: str = "", year: str = "") -> List[str]:  # pragma: no cover - network
         """Fetch raw chain symbols for a root (simplified).
 
@@ -48,18 +63,15 @@ class IQFeedOptionChainClient:
         """
         try:
             with self._open() as s:
-                # Placeholder command; adjust per official doc (OCH chain request or CEO etc.)
-                cmd = f"OCH,{root}\n".encode("utf-8")
+                cmd = f"OCH,{root}\n".encode("utf-8")  # placeholder command
                 s.sendall(cmd)
                 raw = self._collect_until_end(s)
-            symbols = []
+            symbols: List[str] = []
             for line in raw:
-                if line.startswith("!END"):
+                if line.startswith("!END") or line.startswith("!ENDMSG"):
                     break
-                # Real parsing: each line may encode contract metadata; here we just gather tokens
-                parts = line.split(",")
-                if len(parts) >= 2 and parts[0] == "OC":  # Example prefix
-                    sym = parts[1]
+                sym = self.parse_chain_line(line)
+                if sym:
                     symbols.append(sym)
             return symbols
         except Exception as exc:  # noqa: BLE001
@@ -85,12 +97,12 @@ class IQFeedOptionChainClient:
                     # collect a short burst
                     lines = self._collect_until_silence(s, silence=0.15, max_lines=200)
                     for ln in lines:
-                        out.append(RawOptionRecord(line=ln, parsed=None))
+                        out.append(RawOptionRecord(line=ln, parsed=self.parse_greeks_line(ln)))
         except Exception as exc:  # noqa: BLE001
             self.log.warning("request_greeks_snapshot failed: %s", exc)
         return out
 
-    # ---- helpers ----
+    # ---- socket collection helpers (used by both chain & greeks snapshots) ----
     def _collect_until_end(self, sock: socket.socket, end_marker: str = "!ENDMSG!") -> List[str]:
         lines: List[str] = []
         start = time.time()
@@ -137,8 +149,89 @@ class IQFeedOptionChainClient:
                 break
         return lines
 
+    # ---- parsing helpers ----
+    @staticmethod
+    def parse_greeks_line(line: str) -> Optional[Dict[str, Any]]:
+        """Very rough placeholder greeks parser.
+
+        If a line resembles a Level1 'Q,' message and contains an OCC option symbol it will:
+          - parse via parse_level1_line
+          - attach dummy greeks (delta/gamma/theta/vega) derived from mid & strike heuristic
+        This is purely for scaffolding tests; real implementation should request the proper
+        option greeks fieldset from IQFeed.
+        """
+        if not line or not line.startswith("Q,"):
+            return None
+        try:
+            from .iqfeed_client import parse_level1_line  # local import
+            parsed = parse_level1_line(line)
+            if not parsed:
+                return None
+            sym = parsed.get("symbol")
+            if not isinstance(sym, str) or not parse_occ_symbol(sym or ""):
+                return None
+            # Derive dummy greeks
+            last = parsed.get("last_trade") or parsed.get("last_price") or parsed.get("mid")
+            strike = None
+            c = parse_occ_symbol(sym)
+            if c:
+                strike = c.strike
+            if isinstance(last, (int, float)) and strike:
+                moneyness = (last - strike) / strike if strike else 0.0
+            else:
+                moneyness = 0.0
+            delta = max(-1.0, min(1.0, 0.5 + moneyness * 10))  # crude mapping
+            gamma = 0.01 * (1 - abs(delta))
+            theta = -0.02 * (1 - abs(moneyness))
+            vega = 0.10 * (1 - abs(delta))
+            parsed.update({
+                "delta": float(delta),
+                "gamma": float(gamma),
+                "theta": float(theta),
+                "vega": float(vega),
+            })
+            return parsed
+        except Exception:
+            return None
+
+
+class IQFeedOptionGreeksStream:
+    """Scaffold streaming greeks (wraps Level1-like polling with heuristic greeks).
+
+    This class periodically invokes `request_greeks_snapshot` for a subset of symbols
+    and pushes parsed records to a user callback. Not a real streaming greeks feed
+    but a bridge until proper protocol implementation.
+    """
+
+    def __init__(self, chain_client: IQFeedOptionChainClient, symbols: Iterable[str], interval: float = 5.0,
+                 on_record: Optional[Callable[[Dict[str, Any]], None]] = None):
+        self.client = chain_client
+        self.symbols = list(symbols)
+        self.interval = interval
+        self.on_record = on_record
+        self._stop = False
+        self.log = get_logger("iqfeed.greeks.stream")
+
+    def run(self, duration: float = 30.0):  # pragma: no cover - timing
+        start = time.time()
+        while (time.time() - start) < duration and not self._stop:
+            recs = self.client.request_greeks_snapshot(self.symbols)
+            for r in recs:
+                if r.parsed and self.on_record:
+                    try:
+                        self.on_record(r.parsed)
+                    except Exception:  # noqa: BLE001
+                        pass
+            time.sleep(self.interval)
+
+    def stop(self):  # pragma: no cover
+        self._stop = True
+
+    # ---- helpers ----
+
 
 __all__ = [
     "IQFeedOptionChainClient",
     "RawOptionRecord",
+    "IQFeedOptionGreeksStream",
 ]
