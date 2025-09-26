@@ -51,6 +51,15 @@ def setup_logger(name: str = "app", level: str | int | None = None, log_dir: Opt
 
         logger.addHandler(ch)
         logger.addHandler(fh)
+
+        if os.getenv("LOG_JSON", "false").lower() == "true":
+            try:
+                from .json_logging import JsonFormatter  # local import
+                json_formatter = JsonFormatter()
+                for h in logger.handlers:
+                    h.setFormatter(json_formatter)
+            except Exception:  # pragma: no cover
+                pass
     return logger
 
 

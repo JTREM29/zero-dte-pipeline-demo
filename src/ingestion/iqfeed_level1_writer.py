@@ -29,6 +29,9 @@ class Level1BatchWriter:
         self.log = get_logger("iqfeed.l1writer")
 
     def add(self, quote: Dict[str, Any]):
+        # Attach arrival timestamp for auditing latency vs. exchange (epoch from feed may exist)
+        if "arrival_ts" not in quote:
+            quote = {**quote, "arrival_ts": time.time()}
         self.buffer.append(quote)
         now = time.time()
         if len(self.buffer) >= self.cfg.max_rows or (now - self.last_flush) >= self.cfg.flush_secs:

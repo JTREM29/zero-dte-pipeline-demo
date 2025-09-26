@@ -4,13 +4,20 @@ A structured Python pipeline for researching, ingesting, and modeling zero-day (
 
 ## Features Implemented
 - Config management via Pydantic `Settings`
-- Polygon + IQFeed client placeholders
-- Simple strategy producing demo signals
-- Logging (console + rotating file in `logs/pipeline.log`)
-- Optional OpenAI summarization of signals
-- Parquet persistence for signals (`data/signals/`)
+- Polygon REST previous aggregate ingestion (with caching + normalization)
+- IQFeed Level1 streaming client (threaded queue + callback)
+- Time-based bar aggregation from persisted Level1 ticks
+- Options chain OCC symbol parsing + filtering utilities
+- Simple strategy producing demo signals (backtest & live demo)
+  - Now includes fast/slow moving average crossover (configurable via CLI)
+- Backtest execution over derived bars (`backtest_bars` CLI)
+- Option math utilities (Black-Scholes pricing & implied volatility estimation)
+- Logging (console + rotating file in `logs/pipeline.log`, optional JSON mode)
+- Parquet persistence for signals & raw market data (`data/raw/...`, `data/derived/...`)
 - Typer CLI (`python -m src.cli --help`)
-- Smoke tests (`pytest`)
+- OpenAI summarization (optional, if API key set)
+- Unit tests & parsing / aggregation tests (`pytest`)
+- GitHub Actions CI (lint + tests) [if workflow present]
 
 ## Layout
 ```
@@ -58,6 +65,23 @@ python -m src.cli polygon_last_spx            # raw previous aggregate JSON
 python -m src.cli polygon_last_spx --normalize  # normalized bar DataFrame as JSON
 python -m src.cli iqfeed_ping                 # test IQFeed socket connectivity
 python -m src.cli ingest_prev_spx             # ingest previous SPX aggregate -> parquet
+python -m src.cli iqfeed_stream SPX,NDX       # sample real-time quotes (requires IQConnect)
+python -m src.cli iqfeed_stream_persist SPX   # stream + micro-batch parquet persistence
+python -m src.cli build_bars SPX --interval 1 --date 2025-09-25 --write  # build & store bars
+python -m src.cli live_strategy SPX           # run simple strategy live for default duration
+python -m src.cli live_strategy SPX --fast 3 --slow 10 --duration 30
+python -m src.cli backtest_bars SPX --interval 1
+python -m src.cli backtest_bars SPX --interval 1 --fast 3 --slow 10
+python -m src.cli live_strategy SPX --persist  # persist streaming signals
+python -m src.cli backtest_bars SPX --persist  # persist backtest signals
+- Signals Persistence: add --persist to live_strategy or backtest_bars to write parquet under data/derived/signals/strategy=simple_intraday_spx/
+python -m src.cli option_iv --spot 4500 --strike 4525 --mid 12.5 --days 0.5
+python -m src.cli latency_summary SPX         # summarize ingestion latency
+python -m src.cli chain_window "SPXW250925C00045000,SPXW250925P00045500" --root SPXW --center 4550 --width 100
+python -m src.cli compact_metrics_cmd backtest # compact metrics logs -> parquet
+python -m src.cli market_stream --symbols @SPX.X,NDX.X --synthetic --ticks 30 --correlations --annualize-factor 100000 \
+  --log-returns --ewma-alpha 0.2 --corr-alert 0.5  # advanced real-time analytics demo
+python -m src.cli compact_alerts               # compact correlation/other alerts to parquet
 ```
 
 ## Environment Variables (.env)
@@ -82,16 +106,27 @@ pytest -q
 ## Implementation Notes
 - Polygon requests include simple retry/backoff (exponential linear pattern)
 - In-memory TTL cache (~30s) for previous SPX aggregate to reduce API calls
+- Streaming analytics supports:
+  - Rolling volatility (arithmetic or log returns)
+  - Annualized volatility scaling (ticks_per_year factor)
+  - EWMA volatility (configurable alpha)
+  - Realized variance / realized volatility (per window & annualized)
+  - Parkinson volatility approximation from adjacent ticks
+  - Multi-symbol rolling correlations with optional alert threshold persistence
+  - Feature whitelisting & raw tick persistence for lightweight downstream consumers
 - Normalization helper converts Polygon aggregate keys to readable column names
 - Ingestion writes parquet to `data/raw/polygon/prev_spx/date=YYYY-MM-DD/part.parquet`
 
 ## Next Ideas
-- Real Polygon REST + WebSocket
-- IQFeed streaming interface
-- Strategy parameterization + backtesting harness
-- Feature engineering module
-- CI workflow (GitHub Actions)
-- Risk management / PnL attribution utilities
+- IQFeed options chain lookup integration (currently only parsing helper)
+- Exchange timestamp usage instead of wall-clock for bar alignment
+- Enhanced PnL attribution & risk metrics in backtest engine
+- Level2 (order book) stream ingestion & aggregation
+- Strategy parameter grid search + result persistence
+- Persist greeks surface snapshots & IV term structure
+- Metrics dashboard / visualization layer (e.g., Panel, Dash, or Streamlit)
+- Additional data quality & gap detection utilities
+- Live portfolio/risk dashboard (e.g., FastAPI + Web UI)
 
 ## License
 (Choose a license and add a LICENSE file.)

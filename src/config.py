@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     data_dir: str = Field(default="data", alias="DATA_DIR")
+    default_symbols: Optional[str] = Field(default=None, alias="DEFAULT_SYMBOLS")  # comma-separated
+    bar_interval_sec: float = Field(default=1.0, alias="BAR_INTERVAL_SEC")
+    risk_free_rate: float = Field(default=0.0, alias="RISK_FREE_RATE")  # annualized decimal
 
     model_config = {
         "extra": "ignore",
@@ -27,3 +30,9 @@ class Settings(BaseSettings):
     @property
     def has_openai(self) -> bool:
         return bool(self.openai_api_key)
+
+    @property
+    def symbols_list(self) -> list[str]:
+        if not self.default_symbols:
+            return []
+        return [s.strip() for s in self.default_symbols.split(",") if s.strip()]

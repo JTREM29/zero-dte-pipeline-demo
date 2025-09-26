@@ -67,11 +67,24 @@ class IQFeedClient:
         should be expanded based on IQFeed documentation. This is a minimal stub.
         """
         try:
-            # Negotiate protocol (optional)
+            # Negotiate protocol (optional) then watch once
             self._send_and_recv("S,SET PROTOCOL,6.2\n")
             res = self._send_and_recv(f"w{symbol}\n")
-            self._send_and_recv(f"u{symbol}\n")  # unwatch
-            return {"symbol": symbol, "raw": res}
+            self._send_and_recv(f"u{symbol}\n")  # unwatch immediately
+            payload: dict[str, Any] = {"symbol": symbol, "raw": res}
+            # Attempt to parse first Q line for structured fields
+            for line in res.splitlines():
+                if line.startswith("Q,"):
+                    from .iqfeed_client import parse_level1_line  # local import to avoid circular
+                    parsed = parse_level1_line(line)
+                    if parsed:
+                        payload.update({k: v for k, v in parsed.items() if k not in {"raw"}})
+                        # Provide canonical last_price alias
+                        lp = parsed.get("last_trade")
+                        if isinstance(lp, (int, float)):
+                            payload["last_price"] = lp
+                    break
+            return payload
         except Exception as e:  # noqa: BLE001
             return None
 
@@ -93,6 +106,7 @@ class IQFeedClient:
 # ---------------------- Level1 Streaming ----------------------
 
 LEVEL1_FIELD_MAP = {
+    # Subset of IQFeed Q message (v6.2). Full spec has many more indexes; extend as needed.
     0: "msg_type",      # 'Q'
     1: "symbol",
     2: "bid",
@@ -101,38 +115,105 @@ LEVEL1_FIELD_MAP = {
     5: "ask_size",
     6: "last_trade",
     7: "last_trade_size",
-    8: "last_trade_time",  # textual timestamp (convert later if needed)
+    8: "last_trade_time",  # HH:MM:SS(.ms)
     9: "total_volume",
     10: "day_high",
     11: "day_low",
+    12: "open",
+    13: "close_yest",
+    14: "bid_time",      # HH:MM:SS
+    15: "ask_time",      # HH:MM:SS
+    16: "trade_market_center",
+    17: "bid_market_center",
+    18: "ask_market_center",
+    19: "day_num_trades",
+    20: "reserved_0",
+    21: "exchange_id",
+    22: "fraction_disp",
+    # indices beyond this truncated intentionally (can be extended without breaking parsing)
 }
 
-_NUMERIC_FIELDS = {"bid", "ask", "bid_size", "ask_size", "last_trade", "last_trade_size", "total_volume", "day_high", "day_low"}
+_NUMERIC_HINTS = {
+    "bid", "ask", "bid_size", "ask_size", "last_trade", "last_trade_size", "total_volume", "day_high",
+    "day_low", "open", "close_yest", "day_num_trades"
+}
+
+
+def _parse_trade_time(value: str) -> Optional[float]:
+    """Parse IQFeed last trade time (HH:MM:SS[.mmm]) into epoch seconds for *today*.
+
+    IQFeed supplies time only; we assume current local date. If parsing fails returns None.
+    """
+    if not value:
+        return None
+    try:
+        parts = value.split(":")
+        if len(parts) < 3:
+            return None
+        h, m, s_part = parts
+        if "." in s_part:
+            s, frac = s_part.split(".", 1)
+            ms = int((frac + "000")[:3])  # pad / truncate to ms
+        else:
+            s = s_part
+            ms = 0
+        h_i = int(h); m_i = int(m); s_i = int(s)
+        import datetime as _dt, time as _t
+        today = _dt.date.fromtimestamp(_t.time())  # local date
+        dt = _dt.datetime(today.year, today.month, today.day, h_i, m_i, s_i, ms * 1000)
+        return dt.timestamp()
+    except Exception:
+        return None
 
 
 def parse_level1_line(line: str) -> Optional[Dict[str, Any]]:
-    """Parse a raw Level1 'Q' message into a dict.
+    """Parse a raw Level1 'Q' message into a dict (extended subset).
 
-    Returns None for system/unsupported lines. Minimal safe parsing; unknown fields ignored.
+    Unknown field indexes are ignored. Adds convenience aliases:
+      - last_price (alias of last_trade when present)
+      - mid (if bid+ask numeric)
+      - spread (ask - bid) & spread_bps
+      - epoch (derived from last_trade_time local day)
+    Returns None for system or malformed lines.
     """
+    if not line:
+        return None
     line = line.strip()
-    if not line or line.startswith("S,") or not line.startswith("Q"):
+    if not line or line.startswith("S,") or not line.startswith("Q,"):
         return None
     parts = line.split(",")
-    if len(parts) < 7:  # need at least up to last trade
+    if len(parts) < 9:  # ensure we have basic time field
         return None
     data: Dict[str, Any] = {"raw": line}
     for idx, key in LEVEL1_FIELD_MAP.items():
         if idx >= len(parts):
             continue
         raw_val = parts[idx]
-        if key in _NUMERIC_FIELDS:
-            try:
-                data[key] = float(raw_val) if raw_val else None
-            except ValueError:
+        if key in _NUMERIC_HINTS:
+            if raw_val == "":
                 data[key] = None
+            else:
+                try:
+                    data[key] = float(raw_val)
+                except ValueError:
+                    data[key] = None
         else:
             data[key] = raw_val
+    # Derived helpers
+    bid = data.get("bid"); ask = data.get("ask")
+    if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and bid > 0 and ask > 0:
+        data["mid"] = (bid + ask) / 2.0
+        spread = ask - bid
+        data["spread"] = spread
+        data["spread_bps"] = (spread / bid) * 10000.0 if bid else None
+    lt = data.get("last_trade_time")
+    if isinstance(lt, str):
+        epoch = _parse_trade_time(lt)
+        if epoch:
+            data["epoch"] = epoch
+    # alias
+    if "last_trade" in data and isinstance(data["last_trade"], (int, float)):
+        data["last_price"] = data["last_trade"]
     return data
 
 
@@ -145,7 +226,8 @@ class IQFeedLevel1Stream:
         msg = stream.get(timeout=2)
     """
 
-    def __init__(self, cfg: IQFeedConfig, on_message: Optional[Callable[[dict[str, Any]], None]] = None):
+    def __init__(self, cfg: IQFeedConfig, on_message: Optional[Callable[[dict[str, Any]], None]] = None,
+                 heartbeat_secs: float = 5.0, reconnect_idle_secs: float = 20.0):
         self.cfg = cfg
         self.log = get_logger("iqfeed.stream")
         self.on_message = on_message
@@ -154,6 +236,9 @@ class IQFeedLevel1Stream:
         self._stop_event = threading.Event()
         self._queue: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._watched: set[str] = set()
+        self._last_msg_time = time.time()
+        self._heartbeat_secs = heartbeat_secs
+        self._reconnect_idle_secs = reconnect_idle_secs
 
     # --- Public API ---
     def start(self, symbols: list[str]):
@@ -207,6 +292,13 @@ class IQFeedLevel1Stream:
             self._sock.sendall(b"S,SET PROTOCOL,6.2\n")
         except Exception:  # noqa: BLE001
             pass
+        # Re-watch existing symbols after reconnect
+        if self._watched:
+            for sym in list(self._watched):  # ensure iteration stable
+                try:
+                    self._sock.sendall(f"w{sym}\n".encode("utf-8"))
+                except Exception:  # noqa: BLE001
+                    self.log.debug("Failed to re-watch %s", sym)
 
     def _close(self):
         if self._sock:
@@ -222,6 +314,8 @@ class IQFeedLevel1Stream:
             try:
                 chunk = self._sock.recv(65536) if self._sock else b""
                 if not chunk:
+                    self._maybe_heartbeat()
+                    self._maybe_reconnect()
                     time.sleep(0.05)
                     continue
                 buf += chunk
@@ -230,6 +324,7 @@ class IQFeedLevel1Stream:
                     text = line.decode("utf-8", errors="replace")
                     parsed = parse_level1_line(text)
                     if parsed:
+                        self._last_msg_time = time.time()
                         self._queue.put(parsed)
                         if self.on_message:
                             try:
@@ -237,11 +332,44 @@ class IQFeedLevel1Stream:
                             except Exception as exc:  # noqa: BLE001
                                 self.log.warning("on_message error: %s", exc)
             except socket.timeout:
+                self._maybe_heartbeat()
+                self._maybe_reconnect()
                 continue
             except Exception as exc:  # noqa: BLE001
                 self.log.warning("Reader loop error: %s", exc)
                 time.sleep(0.2)
         self.log.info("Reader loop exiting")
+
+    def _maybe_heartbeat(self):  # pragma: no cover - timing dependent
+        if not self._sock:
+            return
+        now = time.time()
+        if (now - self._last_msg_time) >= self._heartbeat_secs:
+            try:
+                self._sock.sendall(b"S,SERVER CONNECTED\n")  # simple ping
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _maybe_reconnect(self):  # pragma: no cover - timing dependent
+        now = time.time()
+        if (now - self._last_msg_time) >= self._reconnect_idle_secs:
+            self.log.warning("Idle %.1fs >= %.1fs threshold; reconnecting", (now - self._last_msg_time), self._reconnect_idle_secs)
+            try:
+                self._close()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.25)
+            try:
+                self._connect()
+                self._last_msg_time = time.time()
+            except Exception as exc:  # noqa: BLE001
+                self.log.error("Reconnect failed: %s", exc)
+                # leave for next cycle
+
+
+def should_reconnect(last_time: float, now: float, threshold: float) -> bool:
+    """Pure helper to determine if reconnect should trigger (for unit testing)."""
+    return (now - last_time) >= threshold
 
 
 __all__ = [
@@ -249,4 +377,5 @@ __all__ = [
     "IQFeedConfig",
     "IQFeedLevel1Stream",
     "parse_level1_line",
+    "should_reconnect",
 ]

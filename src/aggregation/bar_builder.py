@@ -42,7 +42,8 @@ class TimeBarAggregator:
         price = tick.get("last_trade") or tick.get("last") or tick.get("bid") or tick.get("ask")
         if price is None or not isinstance(price, (int, float)) or (isinstance(price, float) and isnan(price)):
             return []
-        ts = time.time()
+        # Prefer provided epoch (from feed parsing) else fallback to arrival time.
+        ts = float(tick.get("epoch") or time.time())
         key = self._bucket_key(symbol, ts)
         bucket = self._buckets.get(key)
         completed: List[Bar] = []

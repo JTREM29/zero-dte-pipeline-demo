@@ -1,0 +1,10 @@
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+warn_return_any = true
+warn_unused_ignores = true
+strict = false
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
