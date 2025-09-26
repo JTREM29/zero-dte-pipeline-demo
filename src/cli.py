@@ -33,6 +33,26 @@ app = typer.Typer(help="Zero DTE research & execution pipeline CLI")
 LOGGER = get_logger("zero_dte.cli")
 
 
+@app.command(name="secrets_check")
+def secrets_check():
+    """Report which critical environment variables / secrets are present (values not shown)."""
+    import os
+    keys = [
+        "POLYGON_API_KEY",
+        "OPENAI_API_KEY",
+        "IQFEED_USERNAME",
+        "IQFEED_PASSWORD",
+    ]
+    status = {}
+    for k in keys:
+        v = os.getenv(k)
+        status[k] = bool(v)
+    # Derived convenience flags similar to Settings
+    status["has_polygon"] = status["POLYGON_API_KEY"]
+    status["has_openai"] = status["OPENAI_API_KEY"]
+    typer.echo(json.dumps(status, indent=2))
+
+
 def _instantiate_strategy(StratCls, **candidate_kwargs):  # type: ignore[no-untyped-def]
     """Instantiate a strategy class filtering only accepted kwargs.
 
