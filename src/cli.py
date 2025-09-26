@@ -151,7 +151,8 @@ def market_summary(
     strategy: str = typer.Option("odte_direction", help="Strategy name (on_price oriented)"),
     use_cache: bool = typer.Option(True, help="Cache summary for identical feature set within a short TTL"),
     rate_limit_secs: float = typer.Option(5.0, help="Min seconds between OpenAI calls (if enabled)"),
-    extra: str = typer.Option("", help="Comma key=val pairs to inject as features")
+    extra: str = typer.Option("", help="Comma key=val pairs to inject as features"),
+    skew: bool = typer.Option(False, help="Include simulated options skew metrics (placeholder chain)"),
 ):
     """Fetch snapshot (IQFeed → Polygon fallback), run single-tick strategy, produce neutral summary.
 
@@ -233,6 +234,20 @@ def market_summary(
         day_high = iq_snapshot.get("day_high"); day_low = iq_snapshot.get("day_low")
         if isinstance(day_high, (int, float)) and isinstance(day_low, (int, float)) and day_high > day_low > 0:
             features["day_range"] = day_high - day_low
+    # Optional options skew (placeholder simulated chain)
+    if skew:
+        try:
+            from .datafeeds.iqfeed_options import IQFeedOptionsGreeks, skew_signal_from_chain
+            og = IQFeedOptionsGreeks()
+            chain = og.fetch_chain_greeks(spx_symbol)
+            if chain:
+                ss = skew_signal_from_chain(chain)
+                for k, v in ss.items():
+                    if k not in features:
+                        features[k] = v  # type: ignore[assignment]
+                features["skew_chain_size"] = len(chain)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Skew computation failed: %s", exc)
     # Merge strategy meta (non-colliding)
     for k, v in meta.items():
         if k not in features:
@@ -299,6 +314,7 @@ def market_stream(
     duration: float = typer.Option(30.0, help="Stream duration seconds (ignored if --ticks provided)"),
     ticks: int = typer.Option(0, help="Stop after N ticks (overrides duration if >0)"),
     persist: bool = typer.Option(True, help="Persist each summary to metrics log (category=market_stream)"),
+    persist_signals: bool = typer.Option(False, help="Persist emitted strategy signals via SignalWriter parquet"),
     summarize: bool = typer.Option(True, help="Call OpenAI summarize_market if key available"),
     interval_secs: float = typer.Option(2.0, help="Emit summary at most once per this many seconds"),
     synthetic: bool = typer.Option(False, help="Use synthetic price generator instead of real feed (testing)"),
@@ -317,6 +333,10 @@ def market_stream(
     bb_period: int = typer.Option(20, help="Bollinger period"),
     bb_std: float = typer.Option(2.0, help="Bollinger std multiplier"),
     alt_vol_period: int = typer.Option(20, help="Window for Garman-Klass / Rogers-Satchell volatility"),
+    seasonality: bool = typer.Option(False, help="Include month seasonality score/label (heuristic weights)"),
+    regime: bool = typer.Option(False, help="Compute regime filters (choppy / vol_event)"),
+    chop_threshold: float = typer.Option(61.8, help="Override choppiness threshold for regime (default 61.8)"),
+    vol_z_hi: float = typer.Option(1.0, help="Override realized volatility z-score high threshold"),
 ):
     """Continuously stream market snapshots + strategy evaluation + rolling volatility.
 
@@ -341,6 +361,29 @@ def market_stream(
     settings_dir = settings.data_dir or "data"
     StratCls = get_strategy(strategy)
     strat = _instantiate_strategy(StratCls)
+    # Optional signal writer (parquet) separate from metrics append
+    signal_writer = None
+    if persist_signals:
+        try:
+            signal_writer = SignalWriter(settings_dir, strategy)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed initializing SignalWriter: %s", exc)
+            signal_writer = None
+    # Filters (lazy instantiation to avoid imports when not needed)
+    seasonality_filter = None
+    regime_filters = None
+    if seasonality:
+        try:
+            from .strategies.filters import SeasonalityFilter  # local import
+            seasonality_filter = SeasonalityFilter()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("SeasonalityFilter init failed: %s", exc)
+    if regime:
+        try:
+            from .strategies.filters import RegimeFilters
+            regime_filters = RegimeFilters(chop_threshold=chop_threshold, vol_z_hi=vol_z_hi)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("RegimeFilters init failed: %s", exc)
     sym_list = [s.strip() for s in symbols.split(',') if s.strip()]
     primary = sym_list[0]
     vol_calc = RollingVolatility(
@@ -465,11 +508,13 @@ def market_stream(
                 price_hist[s].append(p)
             # Strategy
             sig_name = "n/a"; meta = {}
+            last_signal_obj = None
             if hasattr(strat, "on_price"):
                 try:
                     sres = strat.on_price(float(cur_price))  # type: ignore[attr-defined]
                     sig_name = getattr(sres, "signal", sig_name)
                     meta = getattr(sres, "meta", meta)
+                    last_signal_obj = sres
                 except Exception:
                     pass
             else:
@@ -477,6 +522,7 @@ def market_stream(
                     for s in strat.evaluate({"lastPrice": cur_price}):  # type: ignore[attr-defined]
                         sig_name = getattr(s, "name", sig_name)
                         meta = getattr(s, "metadata", meta)
+                        last_signal_obj = s
                         break
                 except Exception:
                     pass
@@ -485,6 +531,15 @@ def market_stream(
             last_emit = now
             emitted += 1
             features = {"price": float(cur_price), **vol_calc.snapshot()}
+            # Seasonality (month-based weight)
+            if seasonality_filter:
+                import datetime as _dt
+                m = _dt.datetime.utcnow().month
+                try:
+                    features["seasonality_score"] = float(seasonality_filter.score(m))  # type: ignore[arg-type]
+                    features["seasonality_label"] = seasonality_filter.label(m)
+                except Exception:  # noqa: BLE001
+                    pass
             # Optional indicators computed only on primary symbol synthetic history
             if indicators:
                 ph = np.array(price_hist[primary], dtype=float)
@@ -574,6 +629,21 @@ def market_stream(
                     for k, v in corr_map.items():
                         if abs(v) >= corr_alert:
                             features.setdefault("alerts", []).append({"type": "corr_threshold", "pair": k, "value": v})
+            # Regime filters (after indicators so price history is populated)
+            if regime_filters:
+                try:
+                    ph = np.array(price_hist[primary], dtype=float)
+                    if ph.size >= 30:  # require some history
+                        spread = ph * 0.0005
+                        high_arr = ph + spread
+                        low_arr = ph - spread
+                        reg = regime_filters.evaluate(high_arr, low_arr, ph)
+                        # Merge (avoid overwriting existing keys except intentionally)
+                        for rk, rv in reg.items():
+                            if rk not in features:
+                                features[rk] = rv  # type: ignore[assignment]
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.debug("Regime evaluation failed: %s", exc)
             if parsed_rules:
                 for r in parsed_rules:
                     try:
@@ -621,6 +691,12 @@ def market_stream(
                         })  # type: ignore[arg-type]
                 except Exception as exc:
                     LOGGER.warning("Persist alerts failed: %s", exc)
+            # Persist standalone signal object if requested
+            if signal_writer and last_signal_obj is not None:
+                try:
+                    signal_writer.add(last_signal_obj)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.debug("SignalWriter add failed: %s", exc)
             typer.echo(json.dumps(out))
             if synthetic:
                 _sleep(min(0.1, interval_secs / 4))
@@ -629,6 +705,11 @@ def market_stream(
     finally:
         if iq_stream:
             iq_stream.stop()
+        if 'signal_writer' in locals() and signal_writer is not None:
+            try:
+                signal_writer.flush()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("SignalWriter flush failed: %s", exc)
         typer.echo(json.dumps({
             "status": "interrupted" if interrupted else "completed",
             "emissions": emitted,

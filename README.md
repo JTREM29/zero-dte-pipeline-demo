@@ -104,9 +104,6 @@ pytest -q
 ```
 
 ## Implementation Notes
-- Polygon requests include simple retry/backoff (exponential linear pattern)
-- In-memory TTL cache (~30s) for previous SPX aggregate to reduce API calls
-- Streaming analytics supports:
   - Rolling volatility (arithmetic or log returns)
   - Annualized volatility scaling (ticks_per_year factor)
   - EWMA volatility (configurable alpha)
@@ -114,6 +111,10 @@ pytest -q
   - Parkinson volatility approximation from adjacent ticks
   - Multi-symbol rolling correlations with optional alert threshold persistence
   - Feature whitelisting & raw tick persistence for lightweight downstream consumers
+  - Optional technical indicators (RSI simple/Wilder, Bollinger Bands, alternative GK/RS volatility estimators)
+  - Seasonality (month weight heuristic) & regime filters (choppiness / realized vol z-score) via `--seasonality` / `--regime`
+  - Parquet SignalWriter for streaming signals (`--persist-signals` on market_stream) separate from metrics JSONL
+    - Simulated options skew metric (placeholder) via `market_summary --skew` producing `skew_score` and `put_call_iv_spread`
 - Normalization helper converts Polygon aggregate keys to readable column names
 - Ingestion writes parquet to `data/raw/polygon/prev_spx/date=YYYY-MM-DD/part.parquet`
 
@@ -122,6 +123,9 @@ pytest -q
 - Exchange timestamp usage instead of wall-clock for bar alignment
 - Enhanced PnL attribution & risk metrics in backtest engine
 - Level2 (order book) stream ingestion & aggregation
+python -m src.cli market_stream --symbols @SPX.X --synthetic --ticks 50 --indicators --seasonality --regime \
+  --persist-signals --strategy odte_direction  # include indicators + regime + parquet signal persistence
+python -m src.cli market_summary --skew  # include simulated options skew metrics in summary
 - Strategy parameter grid search + result persistence
 - Persist greeks surface snapshots & IV term structure
 - Metrics dashboard / visualization layer (e.g., Panel, Dash, or Streamlit)
