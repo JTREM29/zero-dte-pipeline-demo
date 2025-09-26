@@ -45,6 +45,33 @@ copy .env.example .env  # fill in keys
 python main.py
 ```
 
+### Persisting Environment Variables
+You can either keep secrets in a local `.env` (loaded automatically if `python-dotenv` is installed) or set them in your shell/user profile.
+
+PowerShell (session only):
+```powershell
+$Env:POLYGON_API_KEY = "YOUR_REAL_KEY"
+python main.py
+```
+
+Persistent (new terminals after this) using `setx`:
+```powershell
+setx POLYGON_API_KEY "YOUR_REAL_KEY"
+```
+
+Using the template:
+```powershell
+copy .env.example .env
+# edit .env to insert keys safely (never commit .env)
+```
+
+To verify a key is loaded:
+```powershell
+python -c "import os; print(bool(os.getenv('POLYGON_API_KEY')))"
+```
+
+Rotate keys immediately if they are accidentally exposed (revoke old, issue new, update `.env`).
+
 ## One-Line Bootstrap (optional PowerShell snippet)
 ```powershell
 # Creates venv, installs deps, copies env template
