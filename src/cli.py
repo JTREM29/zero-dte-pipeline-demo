@@ -34,22 +34,52 @@ LOGGER = get_logger("zero_dte.cli")
 
 
 @app.command(name="secrets_check")
-def secrets_check():
-    """Report which critical environment variables / secrets are present (values not shown)."""
+def secrets_check(
+    keys: str = typer.Option("", help="Comma-separated env var names to check (default core set)"),
+    require: str = typer.Option("", help="Comma-separated required keys; non-zero exit if any missing"),
+    mask: bool = typer.Option(False, help="If set, include masked forms of present keys"),
+):
+    """Report presence of environment secrets (Polygon, OpenAI, IQFeed, etc.).
+
+    Examples:
+      python -m src.cli secrets_check --keys POLYGON_API_KEY,OPENAI_API_KEY
+      python -m src.cli secrets_check --require POLYGON_API_KEY,OPENAI_API_KEY
+      python -m src.cli secrets_check --mask
+    """
     import os
-    keys = [
-        "POLYGON_API_KEY",
-        "OPENAI_API_KEY",
-        "IQFEED_USERNAME",
-        "IQFEED_PASSWORD",
-    ]
-    status = {}
-    for k in keys:
+    default_keys = ["POLYGON_API_KEY", "OPENAI_API_KEY", "IQFEED_USERNAME", "IQFEED_PASSWORD"]
+    if keys.strip():
+        target_keys = [k.strip() for k in keys.split(',') if k.strip()]
+    else:
+        target_keys = default_keys
+    status: dict[str, object] = {}
+    missing: list[str] = []
+    for k in target_keys:
         v = os.getenv(k)
-        status[k] = bool(v)
-    # Derived convenience flags similar to Settings
-    status["has_polygon"] = status["POLYGON_API_KEY"]
-    status["has_openai"] = status["OPENAI_API_KEY"]
+        present = bool(v)
+        status[k] = present
+        if mask and present and isinstance(v, str):
+            # Mask: first 6 chars + '…' + last 4 (if long enough)
+            if len(v) > 12:
+                status[f"{k}_masked"] = f"{v[:6]}…{v[-4:]}"
+            else:
+                status[f"{k}_masked"] = "(present)"
+        if not present:
+            missing.append(k)
+    # Derived convenience flags
+    if "POLYGON_API_KEY" in target_keys:
+        status["has_polygon"] = bool(os.getenv("POLYGON_API_KEY"))
+    if "OPENAI_API_KEY" in target_keys:
+        status["has_openai"] = bool(os.getenv("OPENAI_API_KEY"))
+    required_list = [r.strip() for r in require.split(',') if r.strip()] if require.strip() else []
+    unmet = [r for r in required_list if not os.getenv(r)]
+    if unmet:
+        status["error"] = {
+            "missing_required": unmet,
+            "message": "One or more required keys missing",
+        }
+        typer.echo(json.dumps(status, indent=2))
+        raise typer.Exit(code=1)
     typer.echo(json.dumps(status, indent=2))
 
 
