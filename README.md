@@ -56,6 +56,8 @@ python -m venv .venv; .\.venv\Scripts\Activate.ps1; pip install -r requirements.
 python -m src.cli snapshot SPX
 python -m src.cli demo_strategy --symbol SPX
 python -m src.cli iqfeed_chain SPX
+python -m src.cli iqfeed_chain_real SPX   # attempt real chain (scaffold)
+python -m src.cli iqfeed_greeks_snapshot SPX --limit 10  # scaffold greeks snapshot
 python -m src.cli ensure_dirs
 ```
 
@@ -93,6 +95,7 @@ python -m src.cli compact_alerts               # compact correlation/other alert
 | IQFEED_HOST | IQFeed desktop host (default 127.0.0.1) |
 | IQFEED_PORT_LEVEL1 | Level1/lookup port (default 5009) |
 | IQFEED_PORT_ADMIN | Admin port (default 5009) |
+| IQFEED_PORT_LOOKUP | Dedicated lookup/chain/greeks port (if different) |
 | OPENAI_API_KEY  | OpenAI summarization |
 | LOG_LEVEL       | Logging verbosity |
 | DATA_DIR        | Base data directory (default `data`) |

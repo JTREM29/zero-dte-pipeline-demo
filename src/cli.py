@@ -99,6 +99,45 @@ def iqfeed_chain(root: str = "SPX"):
     typer.echo(json.dumps(chain, indent=2))
 
 
+@app.command(name="iqfeed_chain_real")
+def iqfeed_chain_real(root: str = typer.Argument("SPX", help="Option root e.g. SPX or SPXW")):
+    """Attempt real IQFeed chain request (scaffold). Requires live IQFeed and proper entitlements.
+
+    NOTE: This uses a placeholder OCH command and may need adjustment to official spec.
+    """
+    cfg = IQFeedConfig.from_env()
+    try:
+        from .datafeeds.iqfeed_options_real import IQFeedOptionChainClient
+        cli = IQFeedOptionChainClient(cfg)
+        symbols = cli.request_chain(root)
+        typer.echo(json.dumps({"root": root, "count": len(symbols), "symbols": symbols[:50]}, indent=2))
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(json.dumps({"error": str(exc), "root": root}))
+
+
+@app.command(name="iqfeed_greeks_snapshot")
+def iqfeed_greeks_snapshot(root: str = typer.Argument("SPX", help="Option root"), limit: int = typer.Option(20, help="Limit number of symbols to request greeks for (scaffold)")):
+    """Fetch a crude greeks snapshot scaffold by first requesting chain then issuing watch commands.
+
+    OUTPUT: list of raw lines (no full parsing yet). Assumes demonstration only.
+    """
+    cfg = IQFeedConfig.from_env()
+    try:
+        from .datafeeds.iqfeed_options_real import IQFeedOptionChainClient
+        chain_client = IQFeedOptionChainClient(cfg)
+        syms = chain_client.request_chain(root)
+        subset = syms[:limit]
+        raw_recs = chain_client.request_greeks_snapshot(subset)
+        typer.echo(json.dumps({
+            "root": root,
+            "requested": len(subset),
+            "raw_records": [r.line for r in raw_recs[:limit]],
+            "count": len(raw_recs),
+        }, indent=2))
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(json.dumps({"error": str(exc), "root": root}))
+
+
 @app.command(name="ensure_dirs")
 def ensure_dirs():
     """Ensure critical directories exist (data/, logs/)."""

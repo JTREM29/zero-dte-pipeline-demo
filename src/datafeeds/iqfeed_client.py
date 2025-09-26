@@ -28,6 +28,7 @@ class IQFeedConfig:
     host: str = "127.0.0.1"
     port_level1: int = 5009
     port_admin: int = 5009
+    port_lookup: int = 5009  # separate lookup/derivative requests if needed
     timeout: float = 2.0
 
     @classmethod
@@ -38,6 +39,7 @@ class IQFeedConfig:
             host=os.getenv("IQFEED_HOST", "127.0.0.1"),
             port_level1=int(os.getenv("IQFEED_PORT_LEVEL1", "5009")),
             port_admin=int(os.getenv("IQFEED_PORT_ADMIN", "5009")),
+            port_lookup=int(os.getenv("IQFEED_PORT_LOOKUP", os.getenv("IQFEED_PORT_LEVEL1", "5009"))),
             timeout=float(os.getenv("IQFEED_TIMEOUT", "2.0")),
         )
 
