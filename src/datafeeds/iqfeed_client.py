@@ -27,8 +27,8 @@ class IQFeedConfig:
     password: str | None
     host: str = "127.0.0.1"
     port_level1: int = 5009
-    port_admin: int = 5009
-    port_lookup: int = 5009  # separate lookup/derivative requests if needed
+    port_admin: int = 9300
+    port_lookup: int = 9100  # separate lookup/derivative requests if needed
     timeout: float = 2.0
 
     @classmethod
@@ -38,8 +38,8 @@ class IQFeedConfig:
             password=os.getenv("IQFEED_PASSWORD"),
             host=os.getenv("IQFEED_HOST", "127.0.0.1"),
             port_level1=int(os.getenv("IQFEED_PORT_LEVEL1", "5009")),
-            port_admin=int(os.getenv("IQFEED_PORT_ADMIN", "5009")),
-            port_lookup=int(os.getenv("IQFEED_PORT_LOOKUP", os.getenv("IQFEED_PORT_LEVEL1", "5009"))),
+            port_admin=int(os.getenv("IQFEED_PORT_ADMIN", "9300")),
+            port_lookup=int(os.getenv("IQFEED_PORT_LOOKUP", "9100")),
             timeout=float(os.getenv("IQFEED_TIMEOUT", "2.0")),
         )
 
@@ -69,33 +69,222 @@ class IQFeedClient:
         should be expanded based on IQFeed documentation. This is a minimal stub.
         """
         try:
-            # Negotiate protocol (optional) then watch once
-            self._send_and_recv("S,SET PROTOCOL,6.2\n")
-            res = self._send_and_recv(f"w{symbol}\n")
-            self._send_and_recv(f"u{symbol}\n")  # unwatch immediately
-            payload: dict[str, Any] = {"symbol": symbol, "raw": res}
-            # Attempt to parse first Q line for structured fields
-            for line in res.splitlines():
-                if line.startswith("Q,"):
-                    from .iqfeed_client import parse_level1_line  # local import to avoid circular
-                    parsed = parse_level1_line(line)
+            # Open a transient connection to Level1 and issue watch/unwatch
+            with socket.create_connection((self.host, self.port), timeout=self.timeout) as s:
+                s.settimeout(self.timeout)
+                # Use CRLF line endings per IQFeed protocol
+                s.sendall(b"S,SET PROTOCOL,6.2\r\n")
+                try:
+                    s.sendall(b"S,SET CLIENT NAME,ZeroDTE-pipeline\r\n")
+                    s.sendall(b"S,TIMESTAMPSOFF\r\n")
+                except Exception:
+                    pass
+                s.sendall((f"w{symbol}\r\n").encode("utf-8"))
+
+                buf = ""
+                payload: dict[str, Any] = {"symbol": symbol, "raw": ""}
+                end_time = time.time() + max(3.0, self.timeout)
+                first_q: Optional[str] = None
+                while time.time() < end_time:
+                    try:
+                        chunk = s.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk.decode("utf-8", errors="replace")
+                        # Process complete lines
+                        lines = buf.splitlines()
+                        # Keep last partial line in buffer
+                        if buf and not buf.endswith("\n"):
+                            buf = lines[-1]
+                            lines = lines[:-1]
+                        else:
+                            buf = ""
+                        for line in lines:
+                            if line.startswith("Q,") and first_q is None:
+                                first_q = line
+                                # We can break outer loop soon after unwatch
+                                break
+                        if first_q:
+                            break
+                    except socket.timeout:
+                        # try again until end_time
+                        continue
+                # Unwatch using 'r' command
+                try:
+                    s.sendall((f"r{symbol}\r\n").encode("utf-8"))
+                except Exception:
+                    pass
+
+                if first_q:
+                    from .iqfeed_client import parse_level1_line, parse_level1_line_dynamic  # local import to avoid circular
+                    # Prefer dynamic parser; fallback to static if dynamic fails
+                    parsed = parse_level1_line_dynamic(first_q) or parse_level1_line(first_q)
+                    payload["raw"] = first_q
                     if parsed:
                         payload.update({k: v for k, v in parsed.items() if k not in {"raw"}})
                         # Provide canonical last_price alias
                         lp = parsed.get("last_trade")
                         if isinstance(lp, (int, float)):
                             payload["last_price"] = lp
-                    break
-            return payload
+                    return payload
+                # If no Q line received, return raw (if any)
+                if buf:
+                    payload["raw"] = buf
+                    return payload
+                return None
         except Exception as e:  # noqa: BLE001
             return None
 
     def ping(self) -> bool:
         try:
-            self._send_and_recv("S,SERVER CONNECTED\n")
+            from .iqfeed_sockets import IQSocket, DEFAULT_PORTS, DEFAULT_HOST
+            with IQSocket(host=DEFAULT_HOST, port=DEFAULT_PORTS["level1"]) as s:
+                s.send("S,SERVER CONNECTED")
+                # A simple read to flush a response (may be empty on some builds, so ignore)
             return True
-        except Exception as e:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             return False
+
+    def option_nbbo(self, symbol: str, *, timeout: Optional[float] = None) -> Optional[dict[str, Any]]:
+        """Fetch a best-effort option NBBO snapshot for a given OPRA/OSI symbol.
+
+        Uses a transient Level1 connection with watch/unwatch and returns a dict:
+          {"symbol", "bid", "ask", "bs", "asz", "raw"}
+        Returns None on failure or if no quote line was received in time.
+        """
+        to = float(timeout) if (timeout is not None) else max(2.5, self.timeout)
+        try:
+            with socket.create_connection((self.host, self.port), timeout=to) as s:
+                s.settimeout(to)
+                try:
+                    s.sendall(b"S,SET PROTOCOL,6.2\r\n")
+                    s.sendall(b"S,SET CLIENT NAME,ZeroDTE-pipeline\r\n")
+                    s.sendall(b"S,TIMESTAMPSOFF\r\n")
+                except Exception:
+                    pass
+                s.sendall((f"w{symbol}\r\n").encode("utf-8"))
+                buf = ""
+                first_q: Optional[str] = None
+                end_time = time.time() + to
+                while time.time() < end_time:
+                    try:
+                        chunk = s.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk.decode("utf-8", errors="replace")
+                        lines = buf.splitlines()
+                        if buf and not buf.endswith("\n"):
+                            buf = lines[-1]
+                            lines = lines[:-1]
+                        else:
+                            buf = ""
+                        for line in lines:
+                            if line.startswith("Q,"):
+                                first_q = line
+                                break
+                        if first_q:
+                            break
+                    except socket.timeout:
+                        continue
+                try:
+                    s.sendall((f"r{symbol}\r\n").encode("utf-8"))
+                except Exception:
+                    pass
+                if not first_q:
+                    return None
+                # Parse using dynamic fieldnames first; fall back to static map
+                try:
+                    parsed = parse_level1_line_dynamic(first_q)  # type: ignore[name-defined]
+                except Exception:
+                    parsed = None
+                if not parsed:
+                    try:
+                        parsed = parse_level1_line(first_q)  # type: ignore[name-defined]
+                    except Exception:
+                        parsed = None
+                if not isinstance(parsed, dict):
+                    return None
+                bid = parsed.get("bid"); ask = parsed.get("ask")
+                bs = parsed.get("bid_size") or parsed.get("bs")
+                az = parsed.get("ask_size") or parsed.get("asz")
+                out: dict[str, Any] = {
+                    "symbol": symbol,
+                    "bid": float(bid) if isinstance(bid, (int, float)) else float(bid) if isinstance(bid, str) and bid else 0.0,
+                    "ask": float(ask) if isinstance(ask, (int, float)) else float(ask) if isinstance(ask, str) and ask else 0.0,
+                    "bs": int(bs) if isinstance(bs, (int, float)) else int(bs) if isinstance(bs, str) and bs.isdigit() else 0,
+                    "asz": int(az) if isinstance(az, (int, float)) else int(az) if isinstance(az, str) and az.isdigit() else 0,
+                    "raw": first_q,
+                }
+                return out
+        except Exception:
+            return None
+
+    # --- Lookup helpers (symbol search via lookup port) ---
+    def _lookup_open(self) -> socket.socket:
+        s = socket.create_connection((self._cfg.host, self._cfg.port_lookup), timeout=self._cfg.timeout)
+        s.settimeout(self._cfg.timeout)
+        try:
+            s.sendall(b"S,SET PROTOCOL,6.2\n")
+        except Exception:
+            pass
+        return s
+
+    def _collect_until_end(self, sock: socket.socket, end_marker: str = "!ENDMSG!") -> list[str]:
+        lines: list[str] = []
+        start = time.time()
+        buf = b""
+        while (time.time() - start) < self._cfg.timeout:
+            try:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if text:
+                        lines.append(text)
+                        if text.startswith(end_marker):
+                            return lines
+            except socket.timeout:
+                break
+            except Exception:
+                break
+        return lines
+
+    def symbol_search(self, query: str) -> dict[str, Any]:  # pragma: no cover - network
+        """Attempt a basic symbol search for a given query string using IQFeed lookup port.
+
+        Tries multiple known request patterns and returns raw lines for transparency.
+        """
+        attempts = [
+            f"S,REQUEST SYMBOLS,{query}\n",
+            f"S,SYMBOL SEARCH,{query}\n",
+            f"SBF,{query}\n",
+        ]
+        results: dict[str, Any] = {"query": query, "attempts": [], "lines": []}
+        try:
+            with self._lookup_open() as s:
+                for cmd in attempts:
+                    try:
+                        s.sendall(cmd.encode("utf-8"))
+                        lines = self._collect_until_end(s)
+                        # ensure lists for mypy/pyright
+                        if not isinstance(results.get("attempts"), list):
+                            results["attempts"] = []
+                        if not isinstance(results.get("lines"), list):
+                            results["lines"] = []
+                        attempts_list: list[str] = results["attempts"]
+                        attempts_list.append(cmd.strip())
+                        if lines:
+                            lines_list: list[str] = list(lines)
+                            results["lines"] = lines_list
+                            break
+                    except Exception:
+                        continue
+        except Exception as exc:  # noqa: BLE001
+            results["error"] = str(exc)
+        return results
 
     def fetch_demo_chain(self, root: str) -> list[dict[str, Any]]:
         # Placeholder static symbols
@@ -103,6 +292,113 @@ class IQFeedClient:
             {"symbol": f"{root}250925C00000000", "type": "call", "_demo": True},
             {"symbol": f"{root}250925P00000000", "type": "put", "_demo": True},
         ]
+
+    # --- Historical daily close (lookup port) ---
+    def lookup_daily_close(self, symbol: str, date_str: str) -> Optional[float]:  # pragma: no cover - network
+        """Request daily data for a specific date and return the close if available.
+
+        date_str must be in YYYYMMDD format.
+        """
+        try:
+            with self._lookup_open() as s:
+                cmd = f"HDT,{symbol},{date_str},{date_str}\n"
+                s.sendall(cmd.encode("utf-8"))
+                lines = self._collect_until_end(s)
+                for line in lines:
+                    if not line or line.startswith("!ENDMSG!"):
+                        continue
+                    # Expected CSV: YYYYMMDD,open,high,low,close,volume,open_interest
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 5 and parts[0].isdigit():
+                        try:
+                            close_val = float(parts[4])
+                            return close_val
+                        except Exception:
+                            continue
+        except Exception:
+            return None
+        return None
+
+    # --- Best-effort reference helpers: earnings/economic events ---
+    def fetch_earnings_range(self, start_date, end_date) -> Optional[list[dict]]:
+        """Best-effort earnings fetch placeholder for IQFeed.
+
+        IQFeed provides fundamentals and news via separate services/ports. This minimal client
+        doesn't implement those protocols. As a pragmatic step, optionally read from an env-provided
+        JSON/JSONL file path (IQFEED_EARNINGS_JSON) to integrate local exports.
+        """
+        import os as _os
+        from pathlib import Path as _Path
+        path = _os.getenv("IQFEED_EARNINGS_JSON")
+        if not path:
+            self.log.debug("IQFeed earnings fetch not implemented; set IQFEED_EARNINGS_JSON to a JSON/JSONL export if available.")
+            return None
+        p = _Path(path)
+        if not p.exists():
+            self.log.warning("IQFEED_EARNINGS_JSON path does not exist: %s", path)
+            return None
+        try:
+            txt = p.read_text(encoding="utf-8").strip()
+            items: list[dict] = []
+            if txt.startswith("["):
+                import json as __j
+                arr = __j.loads(txt)
+                if isinstance(arr, list):
+                    items = [x for x in arr if isinstance(x, dict)]
+            else:
+                import json as __j
+                for ln in txt.splitlines():
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        obj = __j.loads(ln)
+                        if isinstance(obj, dict):
+                            items.append(obj)
+                    except Exception:
+                        continue
+            return items or None
+        except Exception:
+            return None
+
+    def fetch_economic_events_range(self, start_date, end_date) -> Optional[list[dict]]:
+        """Best-effort economic events fetch placeholder for IQFeed.
+
+        As above, supports reading from IQFEED_ECON_JSON env (JSON/JSONL). Returns None if unavailable.
+        """
+        import os as _os
+        from pathlib import Path as _Path
+        path = _os.getenv("IQFEED_ECON_JSON")
+        if not path:
+            self.log.debug("IQFeed econ fetch not implemented; set IQFEED_ECON_JSON to a JSON/JSONL export if available.")
+            return None
+        p = _Path(path)
+        if not p.exists():
+            self.log.warning("IQFEED_ECON_JSON path does not exist: %s", path)
+            return None
+        try:
+            txt = p.read_text(encoding="utf-8").strip()
+            items: list[dict] = []
+            if txt.startswith("["):
+                import json as __j
+                arr = __j.loads(txt)
+                if isinstance(arr, list):
+                    items = [x for x in arr if isinstance(x, dict)]
+            else:
+                import json as __j
+                for ln in txt.splitlines():
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        obj = __j.loads(ln)
+                        if isinstance(obj, dict):
+                            items.append(obj)
+                    except Exception:
+                        continue
+            return items or None
+        except Exception:
+            return None
 
 
 # ---------------------- Level1 Streaming ----------------------
@@ -219,6 +515,70 @@ def parse_level1_line(line: str) -> Optional[Dict[str, Any]]:
     return data
 
 
+def parse_level1_line_dynamic(line: str) -> Optional[Dict[str, Any]]:
+    """Parse a Level1 'Q' message using dynamic fieldnames from the server.
+
+    This requests update fieldnames to infer the exact column order and then maps a
+    subset to normalized keys (bid, ask, last_trade, last_trade_time, etc.).
+    """
+    if not line or not line.startswith("Q,"):
+        return None
+    try:
+        # Lazy import to avoid cycles
+        from .iqfeed_fieldmap import request_fieldnames  # type: ignore
+        fields = request_fieldnames(max_lines=80)
+        names = fields.get("update", []) or []
+    except Exception:
+        names = []
+    if not names:
+        return None
+    parts = line.strip().split(",")
+    # parts[0] == 'Q'; the remainder should align to names
+    values = parts[1:]
+    n = min(len(values), len(names))
+    if n == 0:
+        return None
+    raw_map: Dict[str, Any] = {names[i]: values[i] for i in range(n)}
+    # Normalize a subset of fields
+    def _num(x: Any) -> Optional[float]:
+        try:
+            return float(x)
+        except Exception:
+            return None
+    norm: Dict[str, Any] = {"raw": line}
+    # Common mappings observed in IQFeed fieldname lists
+    sym = raw_map.get("Symbol")
+    if sym:
+        norm["symbol"] = sym
+    lt = raw_map.get("Most Recent Trade")
+    if lt is not None:
+        v = _num(lt)
+        if v is not None:
+            norm["last_trade"] = v
+            norm["last_price"] = v
+    bid = raw_map.get("Bid")
+    ask = raw_map.get("Ask")
+    bid_v = _num(bid) if bid is not None else None
+    ask_v = _num(ask) if ask is not None else None
+    if bid_v is not None:
+        norm["bid"] = bid_v
+    if ask_v is not None:
+        norm["ask"] = ask_v
+    if bid_v is not None and ask_v is not None and bid_v > 0 and ask_v > 0:
+        mid = (bid_v + ask_v) / 2.0
+        norm["mid"] = mid
+        spread = ask_v - bid_v
+        norm["spread"] = spread
+        norm["spread_bps"] = (spread / bid_v) * 10000.0 if bid_v else None
+    ltt = raw_map.get("Most Recent Trade Time")
+    if ltt:
+        norm["last_trade_time"] = ltt
+        epoch = _parse_trade_time(ltt)
+        if epoch:
+            norm["epoch"] = epoch
+    return norm
+
+
 class IQFeedLevel1Stream:
     """Threaded Level1 quote streamer.
 
@@ -264,14 +624,15 @@ class IQFeedLevel1Stream:
             raise RuntimeError("Stream socket not connected. Call start().")
         if symbol in self._watched:
             return
-        cmd = f"w{symbol}\n"
+        cmd = f"w{symbol}\r\n"
         self._sock.sendall(cmd.encode("utf-8"))
         self._watched.add(symbol)
 
     def unwatch(self, symbol: str):
         if not self._sock or symbol not in self._watched:
             return
-        cmd = f"u{symbol}\n"
+        # Use 'r' (remove watch) for compatibility
+        cmd = f"r{symbol}\r\n"
         try:
             self._sock.sendall(cmd.encode("utf-8"))
         except Exception:  # noqa: BLE001
@@ -291,14 +652,19 @@ class IQFeedLevel1Stream:
         self._sock.settimeout(0.5)
         # Basic protocol version negotiation (best effort)
         try:
-            self._sock.sendall(b"S,SET PROTOCOL,6.2\n")
+            self._sock.sendall(b"S,SET PROTOCOL,6.2\r\n")
+            self._sock.sendall(b"S,SET CLIENT NAME,ZeroDTE-pipeline\r\n")
+            self._sock.sendall(b"S,TIMESTAMPSOFF\r\n")
+            # Request update fieldnames and server stats to aid dynamic parsing/diagnostics
+            self._sock.sendall(b"S,REQUEST CURRENT UPDATE FIELDNAMES\r\n")
+            self._sock.sendall(b"S,REQUEST STATS\r\n")
         except Exception:  # noqa: BLE001
             pass
         # Re-watch existing symbols after reconnect
         if self._watched:
             for sym in list(self._watched):  # ensure iteration stable
                 try:
-                    self._sock.sendall(f"w{sym}\n".encode("utf-8"))
+                    self._sock.sendall(f"w{sym}\r\n".encode("utf-8"))
                 except Exception:  # noqa: BLE001
                     self.log.debug("Failed to re-watch %s", sym)
 
@@ -320,11 +686,21 @@ class IQFeedLevel1Stream:
                     self._maybe_reconnect()
                     time.sleep(0.05)
                     continue
-                buf += chunk
+                # Normalize CR to LF so the loop can split on LF uniformly
+                buf += chunk.replace(b"\r", b"\n")
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     text = line.decode("utf-8", errors="replace")
-                    parsed = parse_level1_line(text)
+                    # Prefer dynamic parsing when fieldnames are available; fallback to static
+                    try:
+                        from .iqfeed_client import parse_level1_line_dynamic  # local import safeguard
+                    except Exception:
+                        parse_level1_line_dynamic = None  # type: ignore
+                    parsed = None
+                    if parse_level1_line_dynamic is not None:
+                        parsed = parse_level1_line_dynamic(text)
+                    if not parsed:
+                        parsed = parse_level1_line(text)
                     if parsed:
                         self._last_msg_time = time.time()
                         self._queue.put(parsed)
@@ -348,7 +724,7 @@ class IQFeedLevel1Stream:
         now = time.time()
         if (now - self._last_msg_time) >= self._heartbeat_secs:
             try:
-                self._sock.sendall(b"S,SERVER CONNECTED\n")  # simple ping
+                self._sock.sendall(b"S,SERVER CONNECTED\r\n")  # simple ping
             except Exception:  # noqa: BLE001
                 pass
 

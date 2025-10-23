@@ -31,7 +31,7 @@ from src.datafeeds.polygon_client import PolygonClient, PolygonConfig
 from src.strategies.simple_intraday_spx import SimpleIntradaySPXStrategy, StrategySignal
 from src.strategies.registry import get_strategy
 from src.datafeeds.iqfeed_client import IQFeedClient, IQFeedConfig
-from src.datafeeds.iqfeed_options import IQFeedOptionsGreeks, skew_signal_from_chain
+from src.datafeeds.iqfeed_options import IQFeedOptionsGreeks, OptionQuote
 from src.config import Settings
 from src.persistence import write_parquet
 from src.openai_client import OpenAIWrapper
@@ -111,12 +111,25 @@ def main() -> int:
     for c in closes:
         list(strat_blended.evaluate({"lastPrice": float(c), "lastSize": 10}))
 
-    # Simulated options chain skew
+    # Live (best-effort) options chain greeks (falls back to simulation internally)
     opt = IQFeedOptionsGreeks()
-    chain = opt.fetch_chain_greeks("SPX") or []
-    skew_stats = skew_signal_from_chain(chain)
-    skew_score = skew_stats["skew_score"]
-    LOGGER.info("Skew stats: %s", skew_stats)
+    chain = opt.fetch_chain_greeks(price) or []
+    from statistics import mean
+
+    def bucket_abs_delta(quotes: list[OptionQuote], side: str, target: float, tol: float = 0.05) -> float:
+        vals = [q.iv for q in quotes if q.right == side and q.iv is not None and q.delta is not None and abs(abs(q.delta) - target) <= tol]
+        return mean(vals) if vals else float("nan")
+
+    c25 = bucket_abs_delta(chain, "C", 0.25); p25 = bucket_abs_delta(chain, "P", 0.25)
+    c50 = bucket_abs_delta(chain, "C", 0.50); p50 = bucket_abs_delta(chain, "P", 0.50)
+    spreads = []
+    if c25 == c25 and p25 == p25:  # not NaN
+        spreads.append(c25 - p25)
+    if c50 == c50 and p50 == p50:
+        spreads.append(c50 - p50)
+    avg_spread = sum(spreads)/len(spreads) if spreads else 0.0
+    skew_score = max(-1.0, min(1.0, avg_spread/0.20))
+    LOGGER.info("Skew buckets: c25=%.4f p25=%.4f c50=%.4f p50=%.4f avg_spread=%.4f skew=%.4f", c25, p25, c50, p50, avg_spread, skew_score)
 
     regime = "trending" if abs(closes[-1] - closes[-20]) > 0.002 * price else "choppy"
     season_bias = 0.05 if datetime.utcnow().month in (4, 11) else 0.0

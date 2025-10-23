@@ -1,15 +1,16 @@
 {
-    "python.defaultInterpreterPath": ".venv/Scripts/python.exe",
-    "python.testing.pytestEnabled": true,
-    "python.analysis.typeCheckingMode": "basic",
-    "editor.formatOnSave": true,
-    "editor.codeActionsOnSave": {
-        "source.organizeImports": true,
-        "source.fixAll": true
-    },
-    "terminal.integrated.defaultProfile.windows": "PowerShell",
-    "files.exclude": {
-        "**/__pycache__": true,
-        "**/*.pyc": true
-    }
+  "python.defaultInterpreterPath": "${workspaceFolder}\\.venv311\\Scripts\\python.exe",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}\\src"
+  ],
+  "python.terminal.activateEnvironment": true,
+  "python.testing.pytestEnabled": true,
+  "python.analysis.typeCheckingMode": "basic",
+  "editor.formatOnSave": true,
+  "terminal.integrated.defaultProfile.windows": "PowerShell",
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true
+  },
+  "git.ignoreLimitWarning": true
 }

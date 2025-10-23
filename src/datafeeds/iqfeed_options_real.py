@@ -32,11 +32,12 @@ class IQFeedOptionChainClient:
         self.cfg = cfg
         self.log = get_logger("iqfeed.options.real")
 
-    def _open(self) -> socket.socket:
-        s = socket.create_connection((self.cfg.host, self.cfg.port_lookup), timeout=self.cfg.timeout)
+    def _open(self, port: int | None = None) -> socket.socket:
+        p = port if port is not None else self.cfg.port_lookup
+        s = socket.create_connection((self.cfg.host, p), timeout=self.cfg.timeout)
         s.settimeout(self.cfg.timeout)
         try:
-            s.sendall(b"S,SET PROTOCOL,6.2\n")
+            s.sendall(b"S,SET PROTOCOL,6.2\r\n")
         except Exception:  # noqa: BLE001
             pass
         return s
@@ -56,24 +57,56 @@ class IQFeedOptionChainClient:
         return None
 
     def request_chain(self, root: str, month_codes: str = "", year: str = "") -> List[str]:  # pragma: no cover - network
-        """Fetch raw chain symbols for a root (simplified).
+        """Fetch raw chain symbols for a root with multiple fallbacks.
 
-        Real IQFeed spec uses requests like: `OCH,ROOT,LIST\n` or similar variants.
-        Placeholder issues command and collects lines until ENDMSG.
+        Attempts the lookup port first (cfg.port_lookup), then falls back to the level1 port
+        (cfg.port_level1) in case the IQFeed client is configured with a combined port.
+        Uses CRLF line endings and waits for !ENDMSG!.
         """
+        attempts: list[tuple[int, list[bytes]]] = []
         try:
-            with self._open() as s:
-                cmd = f"OCH,{root}\n".encode("utf-8")  # placeholder command
-                s.sendall(cmd)
-                raw = self._collect_until_end(s)
+            # Build command variants: include explicit pc (both puts/calls) and bare root
+            cmd_variants = [
+                f"OCH,{root},pc\r\n".encode("utf-8"),
+                f"OCH,{root}\r\n".encode("utf-8"),
+            ]
+            ports = [self.cfg.port_lookup]
+            if self.cfg.port_level1 not in ports:
+                ports.append(self.cfg.port_level1)
+
+            collected: list[str] = []
+            for p in ports:
+                try:
+                    with self._open(p) as s:
+                        for cmd in cmd_variants:
+                            try:
+                                s.sendall(cmd)
+                                raw = self._collect_until_end(s)
+                                if raw:
+                                    collected = raw
+                                    break
+                            except Exception:
+                                continue
+                    if collected:
+                        break
+                except Exception:  # pragma: no cover - network
+                    continue
+
             symbols: List[str] = []
-            for line in raw:
+            for line in collected:
                 if line.startswith("!END") or line.startswith("!ENDMSG"):
                     break
                 sym = self.parse_chain_line(line)
                 if sym:
                     symbols.append(sym)
-            return symbols
+            # Deduplicate while preserving order
+            seen = set()
+            deduped: List[str] = []
+            for s in symbols:
+                if s not in seen:
+                    seen.add(s)
+                    deduped.append(s)
+            return deduped
         except Exception as exc:  # noqa: BLE001
             self.log.warning("request_chain failed: %s", exc)
             return []

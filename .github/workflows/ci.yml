@@ -34,3 +34,22 @@ jobs:
         run: |
           . .venv/bin/activate
           pytest -q
+
+  iv-surface-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run IV surface tests
+        run: |
+          . .venv/bin/activate
+          pytest -q tests/test_iv_surface.py tests/test_cli_iv_surface_metrics.py

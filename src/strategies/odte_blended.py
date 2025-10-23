@@ -7,6 +7,7 @@ Combines technical + contextual factors into a composite normalized score:
   - Bollinger band z-position
   - VWAP deviation
   - Optional option skew factor (expected in market_ctx['skew_norm'] in [-1,1])
+    - Optional greeks factor (expected in market_ctx['greeks_norm'] in [-1,1])
   - Regime filters (choppiness / volatility) passed via market_ctx
   - Seasonality bias (market_ctx['seasonality_bias'] additive or multiplicative)
 
@@ -53,7 +54,7 @@ class ODTEBlendedStrategy:
         Scaling denominator for VWAP deviation normalization.
     mode : str
         'meanrev' or 'momentum' interpretation of RSI component.
-    skew_weight, rsi_weight, bb_weight, vwap_weight : float
+    skew_weight, greeks_weight, rsi_weight, bb_weight, vwap_weight : float
         Component weights (will be re-normalized if sum != 1).
     entry_threshold : float
         Score >= threshold => long; <= -threshold => short.
@@ -73,7 +74,8 @@ class ODTEBlendedStrategy:
         rsi_weight: float = 0.25,
         bb_weight: float = 0.25,
         vwap_weight: float = 0.25,
-        skew_weight: float = 0.25,
+        skew_weight: float = 0.0,
+        greeks_weight: float = 0.0,
         entry_threshold: float = 0.6,
         exit_threshold: float = 0.25,
         clip_score: bool = True,
@@ -91,11 +93,15 @@ class ODTEBlendedStrategy:
         self.mode = mode.lower()
         if self.mode not in ("meanrev", "momentum"):
             raise ValueError("mode must be 'meanrev' or 'momentum'")
-        weights = np.array([rsi_weight, bb_weight, vwap_weight, skew_weight], dtype=float)
+        weights = np.array([rsi_weight, bb_weight, vwap_weight, skew_weight, greeks_weight], dtype=float)
         if (weights < 0).any():
             raise ValueError("Weights must be non-negative")
         s = weights.sum()
-        self.weights = weights / s if s > 0 else np.array([0.25, 0.25, 0.25, 0.25])
+        if s > 0:
+            self.weights = weights / s
+        else:
+            # Default back to equal weights for first 4, zero for greeks if nothing provided
+            self.weights = np.array([0.25, 0.25, 0.25, 0.25, 0.0])
         self.entry_threshold = entry_threshold
         self.exit_threshold = exit_threshold
         self.clip_score = clip_score
@@ -145,7 +151,10 @@ class ODTEBlendedStrategy:
         skew_c = float(market_ctx.get("skew_norm", 0.0))
         skew_c = max(-1.0, min(1.0, skew_c))
 
-        components = np.array([rsi_c, bb_c, vwap_c, skew_c])
+        greeks_c = float(market_ctx.get("greeks_norm", 0.0))
+        greeks_c = max(-1.0, min(1.0, greeks_c))
+
+        components = np.array([rsi_c, bb_c, vwap_c, skew_c, greeks_c])
         raw_score = float(np.dot(self.weights, components))
 
         # Regime / seasonality adjustments
@@ -169,6 +178,7 @@ class ODTEBlendedStrategy:
             "bb_component": bb_c,
             "vwap_component": vwap_c,
             "skew_component": skew_c,
+            "greeks_component": greeks_c,
             "weights": self.weights.tolist(),
             "raw_score": raw_score,
             "price": price,

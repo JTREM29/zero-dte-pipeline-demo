@@ -15,7 +15,21 @@ class OpenAIWrapper:
         self.api_key = api_key
         self._client = None
         if api_key and OpenAI is not None:
-            self._client = OpenAI(api_key=api_key)
+            # Support project-scoped keys. If a project is provided, do NOT send organization
+            # header to avoid mismatches with project-scoped API keys.
+            project = os.getenv("OPENAI_PROJECT") or os.getenv("OPENAI_PROJECT_ID")
+            organization = os.getenv("OPENAI_ORG") or os.getenv("OPENAI_ORGANIZATION")
+            try:
+                if project:
+                    # Prefer project-only construction for project-scoped keys
+                    self._client = OpenAI(api_key=api_key, project=project)
+                elif organization:
+                    self._client = OpenAI(api_key=api_key, organization=organization)
+                else:
+                    self._client = OpenAI(api_key=api_key)
+            except TypeError:
+                # Older SDKs may not accept project/org; fall back
+                self._client = OpenAI(api_key=api_key)
 
     def summarize_signals(self, signals: Sequence[dict]) -> str:
         if not self._client:
@@ -79,3 +93,49 @@ class OpenAIWrapper:
                 last_err = exc
                 attempt += 1
         return f"OpenAI summary error: {last_err}" if last_err else "Summary failed"
+
+    def sentiment_score(self, text: str, *, retries: int = 1) -> float:
+        """Classify sentiment and return a numeric score in [-1, 1].
+
+        Uses a constrained prompt to elicit only a JSON with a numeric score field.
+        Returns 0.0 if the client is disabled or parsing fails.
+        """
+        if not self._client:
+            return 0.0
+        system = (
+            "You are a sentiment classifier for financial text. "
+            "Return ONLY a JSON object with a numeric field 'score' strictly between -1 and 1, "
+            "where -1 is very negative, 0 is neutral, and 1 is very positive."
+        )
+        user = f"Text: {text}"
+        last_err: Exception | None = None
+        for _ in range(max(1, retries)):
+            try:
+                completion = self._client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=0.0,
+                    max_tokens=16,
+                )
+                content = completion.choices[0].message.content  # type: ignore[attr-defined]
+                if isinstance(content, str):
+                    # Try to extract number from JSON-like content
+                    import json as _json
+                    try:
+                        data = _json.loads(content)
+                        val = float(data.get("score", 0.0))
+                    except Exception:
+                        # Fallback: regex number search
+                        import re as _re
+                        m = _re.search(r"-?\d+(?:\.\d+)?", content)
+                        val = float(m.group(0)) if m else 0.0
+                    # clamp
+                    if not (val == val):  # NaN check
+                        val = 0.0
+                    return float(max(-1.0, min(1.0, val)))
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+        return 0.0

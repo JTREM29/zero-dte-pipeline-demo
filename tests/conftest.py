@@ -1,10 +1,11 @@
+from __future__ import annotations
+import sys
+from pathlib import Path
+
 """Pytest configuration to ensure `src` is importable without editable install.
 
 Adds the project root and the `src` directory to sys.path early in test collection.
 """
-from __future__ import annotations
-import sys
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"

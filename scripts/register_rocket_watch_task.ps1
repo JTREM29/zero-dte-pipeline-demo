@@ -55,6 +55,18 @@ if (-not $RecordTicks -or $RecordTicks.Trim().Length -eq 0) {
 $psArgs += @('-RecordTicks', ('"' + $RecordTicks + '"'))
 if ($Notify) { $psArgs += @('-Notify') }
 
+# Use robust defaults tuned for live: directional + regime-aware + rescue on sharp downtrends during RTH
+$psArgs += @('-LooseDirectional')
+$psArgs += @('-AutoSelectRegime')
+$psArgs += @('-AutoRescueDowntrend')
+$psArgs += @('-RescueThresholdBp', '20')
+$psArgs += @('-IncludeHours', '"09:30-16:00"')
+$psArgs += @('-PreflightIQFeed')
+$psArgs += @('-UsePolygonQuotes')
+$psArgs += @('-MinDayVolume', '0')
+# Enforce agent-only routing after the watcher completes
+$psArgs += @('-AgentOnly')
+
 $argString = ($psArgs -join ' ')
 
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argString -WorkingDirectory $RepoPath

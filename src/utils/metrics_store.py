@@ -11,18 +11,18 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 
-def _dated_dir(base: Path, category: str) -> Path:
-    date = time.strftime("%Y-%m-%d", time.gmtime())
+def _dated_dir(base: Path, category: str, date: str | None = None) -> Path:
+    date = date or time.strftime("%Y-%m-%d", time.gmtime())
     p = base / "metrics" / category / f"date={date}"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def append_metric(base_dir: str | Path, category: str, record: Dict[str, Any]) -> Path:
+def append_metric(base_dir: str | Path, category: str, record: Dict[str, Any], *, date: str | None = None, ts: float | None = None) -> Path:
     base = Path(base_dir)
-    d = _dated_dir(base, category)
+    d = _dated_dir(base, category, date)
     path = d / "metrics.log"
-    enriched = {"ts": time.time(), **record}
+    enriched = {"ts": (float(ts) if ts is not None else time.time()), **record}
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(enriched) + "\n")
     return path

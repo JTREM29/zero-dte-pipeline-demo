@@ -10,12 +10,18 @@ from typing import Optional
 
 class Settings(BaseSettings):
     polygon_api_key: Optional[str] = Field(default=None, alias="POLYGON_API_KEY")
+    polygon_index_fallback: str = Field(default="SPY", alias="POLYGON_INDEX_FALLBACK")
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     data_dir: str = Field(default="data", alias="DATA_DIR")
-    default_symbols: Optional[str] = Field(default=None, alias="DEFAULT_SYMBOLS")  # comma-separated
+    # Comma-separated default symbols used for watchlists (equities/ETFs). Override via env.
+    # Defaults to the core trio requested: SPY, QQQ, IWM
+    default_symbols: Optional[str] = Field(default="SPY,QQQ,IWM", alias="DEFAULT_SYMBOLS")  # comma-separated
     bar_interval_sec: float = Field(default=1.0, alias="BAR_INTERVAL_SEC")
     risk_free_rate: float = Field(default=0.0, alias="RISK_FREE_RATE")  # annualized decimal
+    # Lottos scalper feature flags
+    lottos_enabled: bool = Field(default=False, alias="LOTTOS_ENABLED")
+    lottos_clearance_bp: float = Field(default=5.0, alias="LOTTOS_CLEARANCE_BP")
 
     model_config = {
         "extra": "ignore",

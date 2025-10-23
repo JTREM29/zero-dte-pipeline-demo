@@ -2,7 +2,11 @@ param(
     [string]$Time = '08:55',
     [switch]$Weekdays,
     [switch]$RequireAdmin,
-    [int]$ExecutionTimeLimitSec = 900  # 15 minutes default guardrail
+    [int]$ExecutionTimeLimitSec = 900,  # 15 minutes default guardrail
+    [switch]$NoNews,
+    [switch]$PostToDiscord,
+    [string]$DiscordWebhookUrl,
+    [string]$DiscordUsername = 'ZeroDTE-Morning'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,7 +19,16 @@ $ps1 = Join-Path $scriptDir 'run_morning_brief.ps1'
 if (-not (Test-Path -LiteralPath $ps1)) { throw "Missing $ps1" }
 
 # Build the action to run PowerShell with ExecutionPolicy Bypass
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ps1`""
+# Build action, optionally embedding Discord params
+$psArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$ps1`""
+if ($PostToDiscord -or $DiscordWebhookUrl -or $env:DISCORD_WEBHOOK_URL) {
+    $psArgs += ' -PostToDiscord'
+    $hook = if ($DiscordWebhookUrl) { $DiscordWebhookUrl } elseif ($env:DISCORD_WEBHOOK_URL) { $env:DISCORD_WEBHOOK_URL } else { $null }
+    if ($hook) { $psArgs += " -DiscordWebhookUrl `"$hook`"" }
+    if ($DiscordUsername) { $psArgs += " -DiscordUsername `"$DiscordUsername`"" }
+}
+if ($NoNews) { $psArgs += ' -NoNews' }
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $psArgs
 
 # Build the trigger
 $now = Get-Date
