@@ -92,15 +92,19 @@ class CandidateAutotune:
         self,
         config_path: Optional[Path] = None,
         aggressive: bool = False,
+        random_seed: int = 42,
     ):
         """Initialize autotune.
         
         Args:
             config_path: Path to config file for updates
             aggressive: Whether to use more aggressive optimization
+            random_seed: Seed for random number generation (reproducibility)
         """
         self.config_path = config_path
         self.aggressive = aggressive
+        self.random_seed = random_seed
+        self._rng = np.random.RandomState(random_seed)
         
         # Adjust bounds for aggressive mode
         if aggressive:
@@ -270,8 +274,8 @@ class CandidateAutotune:
                         },
                     })
         
-        # Shuffle for random exploration
-        np.random.shuffle(combinations)
+        # Shuffle for random exploration (using seeded RNG for reproducibility)
+        self._rng.shuffle(combinations)
         
         return combinations
     
