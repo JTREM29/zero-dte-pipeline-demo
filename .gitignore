@@ -31,6 +31,14 @@ env/
 .vscode/
 *.swp
 *.swo
+
+# Runtime artifacts
+db/
+tmp/
+analysis/
+src/
+*.db
+*.sqlite
 *~
 
 # Environment
@@ -40,6 +48,15 @@ env/
 # Logs
 *.log
 logs/
+
+# One-off scripts
+verify_iqfeed.py
+temp_check_env.py
+iqfeed_fix.reg
+
+# Local run helpers
+run_*.ps1
+run_*.cmd
 
 # Data
 data/

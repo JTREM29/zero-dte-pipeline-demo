@@ -146,7 +146,7 @@ class CandidateScorer:
     
     def __init__(
         self,
-        min_confidence: float = 0.3,  # Reduced from 0.5 for less strict gating
+        min_confidence: float = 0.25,  # Allow slightly lower confidence before rejection
         iv_threshold: float = 0.2,
         direction_weight: float = 0.30,
         regime_weight: float = 0.20,

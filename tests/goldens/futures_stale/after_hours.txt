@@ -1,0 +1,21 @@
+🌙 **After Hours Rundown**
+ET date/time: 2025-12-17 15:23
+
+📊 Futures Context — **@ES#**
+• Futures context unavailable: stale (1440 min old)
+
+📊 Coverage:
+• Monitoring SPY, QQQ into tomorrow.
+
+📈 Regime Snapshot:
+• Balance with buyers defending ON mid.
+
+📐 Levels To Review:
+• SPY 4820: ON low cluster.
+• QQQ 415: Weekly value area high.
+
+📝 Options Flow:
+• SPX 4800c: OI build; watch gamma flip.
+• QQQ 420p: Hedging flow picking up.
+
+_Not financial advice._

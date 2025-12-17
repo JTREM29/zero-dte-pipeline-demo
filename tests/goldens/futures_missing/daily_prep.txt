@@ -1,0 +1,33 @@
+📌 **Daily Prep (RTH pivots + regime + plan)**
+Market Status: **ACTIVE**
+🧭 **Directional Confirmation (VIX + SQQQ)**
+• TF: 1m | VIX trend: **down** | SQQQ dir: **down**
+• 🟢 Bias confirm: **BULLISH** — Fixture bias: VIX easing with SQQQ lower
+
+⏱ Timeframes:
+• Execution: 5m
+• Structure: 60m
+• Context: 1D
+
+🧭 Regime:
+TRANSITION (confirm at key levels)
+
+
+📊 Futures Context — **@ES#**
+• Futures context unavailable: missing
+
+📐 Key Levels (RTH):
+• **SPY**: P 4832.25 | R1 4846.25 | S1 4818.25
+• **QQQ**: P 415.10 | R1 417.25 | S1 412.95
+
+🧠 How Pros Would Trade It:
+• Use TREND playbook only on break + retest at Pivot / S1 / R1
+• Use RANGE rules only if price holds inside S1–R1 (avoid mid-range)
+• Defined risk only; reduce size if conviction is LOW or confirmation is NEUTRAL
+
+🚫 Do Nothing If:
+• Directional confirmation is NEUTRAL/UNKNOWN and price chops around Pivot
+• High-impact macro window is imminent (if you add macro banners)
+
+ET: 2025-12-17 15:23 ET
+_Not financial advice._

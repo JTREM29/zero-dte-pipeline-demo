@@ -27,6 +27,12 @@ class PolygonConnector(DataConnector):
     """Polygon.io data connector."""
     
     BASE_URL = "https://api.polygon.io"
+    _SYMBOL_ALIASES = {
+        "VIX": "C:VIX",
+        "SPX": "C:SPX",
+        "NDX": "C:NDX",
+        "DJX": "C:DJX",
+    }
     
     def __init__(
         self,
@@ -109,6 +115,13 @@ class PolygonConnector(DataConnector):
         except asyncio.TimeoutError:
             self._last_error = "Request timed out"
             raise TimeoutError(self._last_error)
+
+    def _normalize_symbol(self, symbol: str) -> str:
+        """Map logical tickers to Polygon's namespace."""
+        if not symbol:
+            return symbol
+        key = symbol.upper()
+        return self._SYMBOL_ALIASES.get(key, key)
     
     async def test_connection(self) -> Dict[str, Any]:
         """Test Polygon connection."""
@@ -142,7 +155,8 @@ class PolygonConnector(DataConnector):
     
     async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get current quote for a symbol."""
-        data = await self._request(f"/v2/last/trade/{symbol}")
+        mapped = self._normalize_symbol(symbol)
+        data = await self._request(f"/v2/last/trade/{mapped}")
         
         if not data or data.get("status") != "OK":
             return None
@@ -160,7 +174,8 @@ class PolygonConnector(DataConnector):
     
     async def get_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get full market snapshot for a symbol."""
-        data = await self._request(f"/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}")
+        mapped = self._normalize_symbol(symbol)
+        data = await self._request(f"/v2/snapshot/locale/us/markets/stocks/tickers/{mapped}")
         
         if not data or data.get("status") != "OK":
             return None
@@ -270,7 +285,8 @@ class PolygonConnector(DataConnector):
         start_str = start.strftime("%Y-%m-%d")
         end_str = end.strftime("%Y-%m-%d")
         
-        endpoint = f"/v2/aggs/ticker/{symbol}/range/{multiplier}/{multiplier_str}/{start_str}/{end_str}"
+        mapped = self._normalize_symbol(symbol)
+        endpoint = f"/v2/aggs/ticker/{mapped}/range/{multiplier}/{multiplier_str}/{start_str}/{end_str}"
         
         params = {
             "adjusted": "true",

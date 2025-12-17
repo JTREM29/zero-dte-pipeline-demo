@@ -17,6 +17,7 @@ from zero_dte_pipeline.candidates.scoring import (
     Regime,
     SignalAlignment,
 )
+from zero_dte_pipeline.config import config
 from zero_dte_pipeline.data_connectors.unified import UnifiedDataConnector
 from zero_dte_pipeline.profiler.market_profiler import MarketProfiler, MarketProfile
 from zero_dte_pipeline.utils.logging import get_logger
@@ -78,24 +79,31 @@ class MorningReport:
     - Parallel data fetching where possible
     """
     
-    DEFAULT_TIMEOUT = 30  # seconds per operation
-    TOTAL_TIMEOUT = 120   # seconds for entire report
+    DEFAULT_TIMEOUT = config.default_timeout  # seconds per operation
+    TOTAL_TIMEOUT = config.get_int("MORNING_REPORT_TOTAL_TIMEOUT_SECONDS", 180)
     
     def __init__(
         self,
         data_connector: UnifiedDataConnector,
         timeout: int = DEFAULT_TIMEOUT,
         total_timeout: int = TOTAL_TIMEOUT,
+        underlyings: Optional[List[str]] = None,
+        primary_expiration: Optional[datetime] = None,
     ):
         self.data_connector = data_connector
         self.timeout = timeout
         self.total_timeout = total_timeout
+        self.underlyings = underlyings
+        self.primary_expiration = primary_expiration
         
         # Initialize components
         self.profiler = MarketProfiler(data_connector)
         self.generator = CandidateGenerator(data_connector)
         self.scorer = CandidateScorer()
-        self.gating = GatingManager()
+        gating_overrides = config.gating_overrides()
+        self.gating = GatingManager(
+            custom_settings=gating_overrides if gating_overrides else None
+        )
     
     async def generate(self) -> MorningReportResult:
         """Generate the morning report.
@@ -338,7 +346,11 @@ class MorningReport:
         
         try:
             candidates = await with_timeout(
-                self.generator.generate_all_candidates(signals),
+                self.generator.generate_all_candidates(
+                    signals,
+                    underlyings=self.underlyings,
+                    primary_expiration=self.primary_expiration,
+                ),
                 timeout=self.timeout * 2,  # Allow more time for candidate generation
                 default=[],
                 operation_name="candidate_generation",

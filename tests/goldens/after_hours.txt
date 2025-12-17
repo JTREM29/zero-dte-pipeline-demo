@@ -1,0 +1,2 @@
+This file moved to tests/goldens/baseline/after_hours.txt.
+

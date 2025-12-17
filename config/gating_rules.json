@@ -1,0 +1,15 @@
+{
+  "min_score": 0.78,
+  "quality_threshold": 0.78,
+  "max_total": 40,
+  "max_per_side": 20,
+  "max_per_underlying": 15,
+  "credit": {
+    "min": 0.8,
+    "max": 3.0
+  },
+  "distance_from_spot": {
+    "min_pct": 0.01,
+    "max_pct": 0.05
+  }
+}

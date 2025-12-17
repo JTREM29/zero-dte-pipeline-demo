@@ -3,6 +3,7 @@
 Generates trading candidates based on market conditions and
 options chain data.
 """
+import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -15,11 +16,15 @@ from zero_dte_pipeline.candidates.scoring import (
     SignalAlignment,
     Strategy,
 )
+from zero_dte_pipeline.config import config
 from zero_dte_pipeline.data_connectors.unified import UnifiedDataConnector
 from zero_dte_pipeline.utils.logging import get_logger
 from zero_dte_pipeline.utils.timeout import with_timeout
 
 logger = get_logger(__name__)
+
+CHAIN_TIMEOUT_SECONDS = config.options_chain_timeout_seconds
+CHAIN_FALLBACK_TIMEOUT_SECONDS = config.options_chain_fallback_timeout_seconds
 
 
 class CandidateGenerator:
@@ -66,6 +71,7 @@ class CandidateGenerator:
         underlying: str,
         signals: SignalAlignment,
         include_0dte_plus_1: bool = True,
+        primary_expiration: Optional[datetime] = None,
     ) -> List[Candidate]:
         """Generate trading candidates for an underlying.
         
@@ -84,11 +90,14 @@ class CandidateGenerator:
         candidates = []
         
         # Get 0DTE options
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if primary_expiration is not None:
+            today = primary_expiration.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         
         chain_0dte = await with_timeout(
             self.data_connector.get_options_chain(underlying, today),
-            timeout=30,
+            timeout=CHAIN_TIMEOUT_SECONDS,
             default=None,
             operation_name=f"get_options_chain_{underlying}_0dte",
         )
@@ -106,15 +115,33 @@ class CandidateGenerator:
             
             chain_1dte = await with_timeout(
                 self.data_connector.get_options_chain(underlying, tomorrow),
-                timeout=30,
+                timeout=CHAIN_TIMEOUT_SECONDS,
                 default=None,
                 operation_name=f"get_options_chain_{underlying}_1dte",
             )
+            
+            if chain_1dte is None:
+                logger.warning(
+                    "Primary providers missing 1DTE chain for %s; retrying via polygon fallback",
+                    underlying,
+                )
+                chain_1dte = await with_timeout(
+                    self.data_connector.get_options_chain(
+                        underlying,
+                        tomorrow,
+                        providers=["polygon"],
+                    ),
+                    timeout=CHAIN_FALLBACK_TIMEOUT_SECONDS,
+                    default=None,
+                    operation_name=f"get_options_chain_{underlying}_1dte_polygon",
+                )
             
             if chain_1dte is not None:
                 candidates.extend(
                     self._generate_from_chain(underlying, chain_1dte, signals, tomorrow)
                 )
+            else:
+                logger.warning("No 1DTE chain available for %s via any provider", underlying)
         
         self.metrics["generated"] += len(candidates)
         
@@ -152,20 +179,37 @@ class CandidateGenerator:
         if liquid.empty:
             return candidates
         
-        # Filter by delta range
+        # Filter by delta range (only if usable delta data is present)
         if "delta" in liquid.columns:
-            delta_mask = (
-                (liquid["delta"].abs() >= self.delta_range[0]) &
-                (liquid["delta"].abs() <= self.delta_range[1])
-            )
-            liquid = liquid[delta_mask]
-            self.metrics["filtered_delta"] += filtered_count - len(liquid)
+            numeric_delta = pd.to_numeric(liquid["delta"], errors="coerce")
+            liquid = liquid.assign(delta=numeric_delta)
+            if numeric_delta.notna().any():
+                before_delta_filter = len(liquid)
+                delta_mask = (
+                    (liquid["delta"].abs() >= self.delta_range[0]) &
+                    (liquid["delta"].abs() <= self.delta_range[1])
+                )
+                liquid = liquid[delta_mask & liquid["delta"].notna()]
+                self.metrics["filtered_delta"] += before_delta_filter - len(liquid)
         
-        # Filter by spread
+        # Filter by spread (only when both bid/ask are available)
         if "bid" in liquid.columns and "ask" in liquid.columns:
-            liquid["spread_pct"] = (liquid["ask"] - liquid["bid"]) / liquid["ask"]
-            spread_mask = liquid["spread_pct"] <= self.max_spread_percent
-            liquid = liquid[spread_mask]
+            with_quotes = (
+                liquid["bid"].notna() & liquid["ask"].notna() &
+                (liquid["ask"] != 0)
+            )
+            if with_quotes.any():
+                liquid.loc[with_quotes, "spread_pct"] = (
+                    (liquid.loc[with_quotes, "ask"] - liquid.loc[with_quotes, "bid"]) /
+                    liquid.loc[with_quotes, "ask"]
+                )
+                before_spread = len(liquid)
+                spread_mask = (
+                    (~with_quotes) |
+                    (liquid["spread_pct"] <= self.max_spread_percent)
+                )
+                liquid = liquid[spread_mask]
+                self.metrics["filtered_spread"] += before_spread - len(liquid)
         
         # Determine direction preference
         direction_pref = signals.direction if signals.direction != Direction.UNKNOWN else Direction.NEUTRAL
@@ -289,6 +333,9 @@ class CandidateGenerator:
                     "iv": option.get("iv"),
                     "volume": option.get("volume"),
                     "open_interest": option.get("open_interest"),
+                    "underlying_price": option.get("underlying_price"),
+                    "bid": option.get("bid"),
+                    "ask": option.get("ask"),
                 },
             )
         except Exception as e:
@@ -299,6 +346,7 @@ class CandidateGenerator:
         self,
         signals: SignalAlignment,
         underlyings: Optional[List[str]] = None,
+        primary_expiration: Optional[datetime] = None,
     ) -> List[Candidate]:
         """Generate candidates for all supported underlyings.
         
@@ -314,7 +362,11 @@ class CandidateGenerator:
         all_candidates = []
         
         for underlying in underlyings:
-            candidates = await self.generate_candidates(underlying, signals)
+            candidates = await self.generate_candidates(
+                underlying,
+                signals,
+                primary_expiration=primary_expiration,
+            )
             all_candidates.extend(candidates)
             logger.info(f"Generated {len(candidates)} candidates for {underlying}")
         
@@ -332,3 +384,61 @@ class CandidateGenerator:
             "filtered_delta": 0,
             "filtered_spread": 0,
         }
+
+
+async def _generate_0dte_candidates_async(
+    underlying: str,
+    max_structures: int,
+    include_0dte_plus_1: bool = True,
+    primary_expiration: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Internal helper to produce basic candidate dictionaries asynchronously."""
+
+    async with UnifiedDataConnector() as connector:
+        generator = CandidateGenerator(connector)
+
+        signals = SignalAlignment(
+            direction=Direction.NEUTRAL,
+            direction_confidence=0.5,
+            regime=Regime.RANGING,
+            regime_confidence=0.5,
+            iv_signal=0.0,
+            order_flow_signal=0.0,
+        )
+
+        candidates = await generator.generate_candidates(
+            underlying,
+            signals,
+            include_0dte_plus_1=include_0dte_plus_1,
+            primary_expiration=primary_expiration,
+        )
+
+    trimmed = candidates[:max_structures] if max_structures else candidates
+    return [candidate.to_dict() for candidate in trimmed]
+
+
+def generate_0dte_candidates(
+    underlying: str,
+    max_structures: int = 40,
+    include_0dte_plus_1: bool = True,
+    primary_expiration: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Convenience wrapper that synchronously returns 0DTE candidate dictionaries."""
+
+    async def _run() -> List[Dict[str, Any]]:
+        return await _generate_0dte_candidates_async(
+            underlying=underlying,
+            max_structures=max_structures,
+            include_0dte_plus_1=include_0dte_plus_1,
+            primary_expiration=primary_expiration,
+        )
+
+    try:
+        return asyncio.run(_run())
+    except RuntimeError:
+        # If an event loop is already running, fall back to create a new one.
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()

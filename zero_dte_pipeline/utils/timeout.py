@@ -4,6 +4,8 @@ Provides timeout wrappers to prevent stalling on external calls.
 """
 import asyncio
 import functools
+import threading
+import _thread
 from typing import Any, Callable, Optional, TypeVar
 
 from zero_dte_pipeline.config import config
@@ -17,6 +19,41 @@ T = TypeVar("T")
 class TimeoutError(Exception):
     """Operation timed out."""
     pass
+
+
+class Timeout:
+    """Context manager that interrupts the main thread after a deadline.
+
+    Uses ``threading.Timer`` plus ``_thread.interrupt_main`` so it works on
+    both Windows and Unix platforms without relying on ``signal.alarm``.
+    """
+
+    def __init__(self, seconds: float, operation_name: str = "operation") -> None:
+        self.seconds = max(0.0, float(seconds))
+        self.operation_name = operation_name
+        self._timer: Optional[threading.Timer] = None
+        self._timed_out = False
+
+    def _trigger(self) -> None:
+        self._timed_out = True
+        logger.warning("Timeout after %.2fs for %s", self.seconds, self.operation_name)
+        _thread.interrupt_main()
+
+    def __enter__(self) -> "Timeout":
+        if self.seconds > 0:
+            self._timer = threading.Timer(self.seconds, self._trigger)
+            self._timer.daemon = True
+            self._timer.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._timer:
+            self._timer.cancel()
+
+        if not self._timed_out:
+            return False
+
+        raise TimeoutError(f"Timeout after {self.seconds:.2f}s for {self.operation_name}") from None
 
 
 async def with_timeout(

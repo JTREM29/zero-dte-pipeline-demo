@@ -15,7 +15,7 @@ from zero_dte_pipeline.data_connectors.base import (
     DataConnectorError,
     TimeoutError,
 )
-from zero_dte_pipeline.data_connectors.iqfeed import IQFeedConnector
+from data import iqfeed_client
 from zero_dte_pipeline.data_connectors.polygon import PolygonConnector
 from zero_dte_pipeline.utils.logging import get_logger
 
@@ -33,22 +33,28 @@ class UnifiedDataConnector:
     
     # Supported providers
     PROVIDERS: Dict[str, Type[DataConnector]] = {
-        "iqfeed": IQFeedConnector,
         "polygon": PolygonConnector,
     }
+
+    if iqfeed_client.IQFEED_ENABLED:
+        try:
+            PROVIDERS["iqfeed"] = iqfeed_client.get_connector_class()
+        except RuntimeError:
+            logger.info("IQFeed disabled via configuration; provider not registered")
     
     def __init__(
         self,
         priority: Optional[List[str]] = None,
-        timeout: int = 30,
+        timeout: Optional[int] = None,
+        lazy_providers: Optional[List[str]] = None,
     ):
         """Initialize the unified connector.
         
         Args:
             priority: List of provider names in priority order
-            timeout: Default timeout for operations
+            timeout: Default timeout for operations (defaults to config value)
         """
-        self.timeout = timeout
+        self.timeout = timeout or config.default_timeout
         self.priority = priority or config.data_source_priority
         
         # Filter to only supported providers
@@ -56,34 +62,80 @@ class UnifiedDataConnector:
         
         if not self.priority:
             self.priority = ["polygon"]  # Default fallback
+
+        configured_lazy = lazy_providers or config.lazy_data_sources
+        self.lazy_providers = {
+            p for p in configured_lazy if p in self.priority and p in self.PROVIDERS
+        }
+        if len(self.lazy_providers) == len(self.priority):
+            # Ensure at least one provider connects eagerly
+            self.lazy_providers.clear()
         
         # Provider instances
         self._connectors: Dict[str, DataConnector] = {}
         self._connected_providers: List[str] = []
+        self._provider_locks: Dict[str, asyncio.Lock] = {}
     
     async def connect(self) -> bool:
         """Connect to data providers in priority order."""
+        connected_any = False
         for provider_name in self.priority:
+            if provider_name in self.lazy_providers:
+                logger.debug(
+                    "Deferring connection for %s (lazy provider)",
+                    provider_name,
+                )
+                continue
+            connected_any = await self._connect_provider(provider_name) or connected_any
+        
+        if connected_any:
+            return True
+        if self.lazy_providers:
+            logger.info(
+                "All providers deferred; will connect lazily on first data request"
+            )
+            return True
+        return False
+
+    async def _connect_provider(self, provider_name: str) -> bool:
+        """Connect to a specific provider if not already connected."""
+        if provider_name not in self.PROVIDERS:
+            return False
+        lock = self._get_provider_lock(provider_name)
+        async with lock:
+            if provider_name in self._connected_providers:
+                return True
             connector_class = self.PROVIDERS.get(provider_name)
             if not connector_class:
-                continue
-            
+                return False
             try:
                 connector = connector_class(timeout=self.timeout)
                 connected = await connector.connect()
-                
                 if connected:
                     self._connectors[provider_name] = connector
                     self._connected_providers.append(provider_name)
                     logger.info(f"Connected to {provider_name}")
-                else:
-                    logger.warning(
-                        f"Failed to connect to {provider_name}: {connector.last_error}"
-                    )
-            except Exception as e:
-                logger.warning(f"Error connecting to {provider_name}: {e}")
-        
-        return len(self._connected_providers) > 0
+                    return True
+                logger.warning(
+                    "Failed to connect to %s: %s",
+                    provider_name,
+                    getattr(connector, "last_error", "unknown error"),
+                )
+            except Exception as exc:
+                logger.warning(f"Error connecting to {provider_name}: {exc}")
+            return False
+
+    async def _ensure_provider_connected(self, provider_name: str) -> bool:
+        if provider_name in self._connected_providers:
+            return True
+        return await self._connect_provider(provider_name)
+
+    def _get_provider_lock(self, provider_name: str) -> asyncio.Lock:
+        lock = self._provider_locks.get(provider_name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._provider_locks[provider_name] = lock
+        return lock
     
     async def disconnect(self) -> None:
         """Disconnect from all providers."""
@@ -95,6 +147,13 @@ class UnifiedDataConnector:
         
         self._connectors.clear()
         self._connected_providers.clear()
+
+    async def __aenter__(self) -> "UnifiedDataConnector":
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.disconnect()
     
     async def test_all_connections(self) -> Dict[str, Any]:
         """Test connectivity to all configured providers.
@@ -147,6 +206,7 @@ class UnifiedDataConnector:
         self,
         method_name: str,
         *args,
+        providers: Optional[List[str]] = None,
         **kwargs,
     ) -> Optional[Any]:
         """Execute a method with fallback support.
@@ -162,8 +222,11 @@ class UnifiedDataConnector:
             Result from the first successful provider or None.
         """
         errors = []
+        provider_order = providers or self.priority
         
-        for provider_name in self._connected_providers:
+        for provider_name in provider_order:
+            if not await self._ensure_provider_connected(provider_name):
+                continue
             connector = self._connectors.get(provider_name)
             if not connector:
                 continue
@@ -189,18 +252,30 @@ class UnifiedDataConnector:
         
         return None
     
-    async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+    async def get_quote(
+        self,
+        symbol: str,
+        providers: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Get quote with automatic fallback."""
-        return await self._execute_with_fallback("get_quote", symbol)
+        return await self._execute_with_fallback(
+            "get_quote",
+            symbol,
+            providers=providers,
+        )
     
     async def get_options_chain(
         self,
         symbol: str,
         expiration: Optional[datetime] = None,
+        providers: Optional[List[str]] = None,
     ) -> Optional[pd.DataFrame]:
         """Get options chain with automatic fallback."""
         return await self._execute_with_fallback(
-            "get_options_chain", symbol, expiration
+            "get_options_chain",
+            symbol,
+            expiration,
+            providers=providers,
         )
     
     async def get_historical_bars(
@@ -209,10 +284,16 @@ class UnifiedDataConnector:
         start: datetime,
         end: datetime,
         timeframe: str = "1d",
+        providers: Optional[List[str]] = None,
     ) -> Optional[pd.DataFrame]:
         """Get historical bars with automatic fallback."""
         return await self._execute_with_fallback(
-            "get_historical_bars", symbol, start, end, timeframe
+            "get_historical_bars",
+            symbol,
+            start,
+            end,
+            timeframe,
+            providers=providers,
         )
     
     @property
