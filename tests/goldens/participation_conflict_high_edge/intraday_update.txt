@@ -1,11 +1,12 @@
 ⚡ **Intraday Update**
 ET stamp: 2025-12-17 15:23
-Stand-Down: **OFF** — tape is tradable.
+Stand-Down: **ON** — Market participation conflict: defensive leadership vs bias. Invalidation: breadth recovers.
 
 📊 **Market Participation (Smart Market IQ)**
-• Regime: **RISK_ON** | Quality: **OK** | Gate: **ALLOW** (CONFIRM)
+• Regime: **DEFENSIVE** | Quality: **OK** | Gate: **STAND_DOWN** (CONFLICT)
 • Leaders: NVDA, AMD, TSLA
 • Laggards: XLU, PG, KO
+• Reason: Market participation conflict: defensive leadership vs bias.
 
 📊 Futures Context — **@ES#**
 • ON VWAP 4826.50 (latest price pending).

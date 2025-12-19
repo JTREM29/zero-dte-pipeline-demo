@@ -1,0 +1,25 @@
+🌅 **Pre-Market Briefing**
+ET date/time: 2025-12-17 15:23
+
+📊 Futures Context — **@ES#**
+• ON range: H 4835.25 / L 4818.75 / VWAP 4826.50
+• RTH: H 4848.00 / L 4804.25
+• Prior RTH: H 4862.25 / L 4795.50 / Close 4832.75
+• Posture: Overnight holding inside prior RTH range.
+• Updated: 2025-12-17 | 2025-12-17 15:23:09 ET
+
+🎯 Opening Watch:
+• Primary symbols: SPY, QQQ
+
+📈 Regime Snapshot:
+• Still balanced; watch for break of ON range.
+
+📐 Key Levels For The Open:
+• SPY 4820: ON low cluster.
+• QQQ 415: Weekly value area high.
+
+📝 Options Flow Highlights:
+• SPX 4800c: OI build; watch gamma flip.
+• QQQ 420p: Hedging flow picking up.
+
+_Not financial advice._

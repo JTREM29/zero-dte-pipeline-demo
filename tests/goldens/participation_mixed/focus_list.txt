@@ -1,14 +1,17 @@
 🎯 **Focus List — Next RTH**
 ET stamp: 2025-12-17 15:23
-Stand-Down: **ON** — Futures context stale (1440 min old). Invalidation: breadth recovers.
+Stand-Down: **OFF** — focus list live.
+⚠️ Participation caution: Breadth mixed; confirm bias before adds. Invalidation: breadth rebuilds.
 
 📊 **Market Participation (Smart Market IQ)**
-• Regime: **RISK_ON** | Quality: **OK** | Gate: **ALLOW** (CONFIRM)
+• Regime: **MIXED** | Quality: **OK** | Gate: **CAUTION** (NEUTRAL)
 • Leaders: NVDA, AMD, TSLA
 • Laggards: XLU, PG, KO
+• Reason: Breadth mixed; confirm bias before adds.
 
 📊 Futures Context — **@ES#**
-• Futures context unavailable: stale (1440 min old)
+• ON range: H 4835.25 / L 4818.75 / VWAP 4826.50
+• Posture: ON holding inside prior RTH range.
 
 📈 Regime Snapshot:
 • Focus on relative strength groups vs ON range.
@@ -17,7 +20,6 @@ Stand-Down: **ON** — Futures context stale (1440 min old). Invalidation: bread
 • SPY: monitor relative strength vs ON range.
 • QQQ: monitor relative strength vs ON range.
 • IWM: monitor relative strength vs ON range.
-• (Paused) Hold entries until futures context refreshes.
 
 📐 Levels In Play:
 • SPY 4820: ON low cluster.

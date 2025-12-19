@@ -1,6 +1,6 @@
 📌 **Daily Prep — Plan of Record**
 ET stamp: 2025-12-17 15:23 | Session: RTH
-Status: **STAND DOWN** | Bias: **BULLISH** | Edge: 0.13
+Status: **ACTIVE** | Bias: **BULLISH** | Edge: 0.13
 
 💵 **Last Price**
 • SPY: 678.47 (stale; last 1m close @ 16:51 ET)
@@ -9,8 +9,10 @@ Status: **STAND DOWN** | Bias: **BULLISH** | Edge: 0.13
 • TF: 1m | VIX trend: **down** | SQQQ dir: **down**
 • 🟢 Bias confirm: **BULLISH** — Fixture bias: VIX easing with SQQQ lower
 
-🚫 Stand-Down Triggers:
-• Futures context missing.
+✅ Playbook Focus:
+• Participation caution: Breadth mixed; confirm bias before adds.
+• Work with clean breaks/retests at Pivot, S1, or R1.
+• Size down if confirmation softens mid-session.
 
 ⏱ Timeframes:
 • Execution: 5m
@@ -21,18 +23,22 @@ Status: **STAND DOWN** | Bias: **BULLISH** | Edge: 0.13
 • Transitioning at key levels — wait for cash tape confirmation.
 
 📊 Futures Context — **@ES#**
-• Futures context unavailable: missing
+• ON range: H 4835.25 / L 4818.75 / VWAP 4826.50
+• RTH: H 4848.00 / L 4804.25
+• Prior RTH: H 4862.25 / L 4795.50 / Close 4832.75
+• Posture: Overnight holding inside prior RTH range.
+• Updated: 2025-12-17 | 2025-12-17 15:23:09 ET
 
 📐 Key Levels (RTH):
 • **SPY**: P 4832.25 | R1 4846.25 | S1 4818.25
 • **QQQ**: P 415.10 | R1 417.25 | S1 412.95
 
 🧠 How Pros Would Trade It:
-• Stand-down: wait for futures context to refresh and bias to reconfirm before deploying risk.
-• Alternate: keep prep manual; let confirmation + liquidity rebuild before re-engaging.
+• Trend setup: break + hold above Pivot/S1/R1 before adding risk.
+• Range setup: fade edges only with confirmation plus volume agreement.
 
 🛡 Risk Controls:
-• Invalidation: stay sidelined until futures context refreshes and bias reconfirms.
+• Invalidation: lose Pivot/S1 with momentum or bias flips NEUTRAL/UNKNOWN.
 
 🚫 Do Nothing If:
 • Confirmation flips NEUTRAL/UNKNOWN around Pivot.

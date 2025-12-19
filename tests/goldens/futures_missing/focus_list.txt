@@ -1,13 +1,23 @@
 🎯 **Focus List — Next RTH**
-ET date/time: 2025-12-17 15:23
+ET stamp: 2025-12-17 15:23
+Stand-Down: **ON** — Futures context missing. Invalidation: breadth recovers.
+
+📊 **Market Participation (Smart Market IQ)**
+• Regime: **UNKNOWN** | Quality: **MISSING** | Gate: **UNKNOWN** (UNKNOWN)
+• Leaders: n/a
+• Laggards: n/a
+
+📊 Futures Context — **@ES#**
+• Futures context unavailable: missing
 
 📈 Regime Snapshot:
 • Focus on relative strength groups vs ON range.
 
 🔭 Focus Symbols:
-• SPY: setup placeholder.
-• QQQ: setup placeholder.
-• IWM: setup placeholder.
+• SPY: monitor relative strength vs ON range.
+• QQQ: monitor relative strength vs ON range.
+• IWM: monitor relative strength vs ON range.
+• (Paused) Hold entries until futures context refreshes.
 
 📐 Levels In Play:
 • SPY 4820: ON low cluster.
@@ -16,5 +26,9 @@ ET date/time: 2025-12-17 15:23
 📝 Options Focus:
 • SPX 4800c: OI build; watch gamma flip.
 • QQQ 420p: Hedging flow picking up.
+
+🚫 No-Trade Guardrails:
+• Skip adds if bias flips or focus name loses VWAP.
+• Drop tickers if overnight range breaks against plan.
 
 _Not financial advice._
