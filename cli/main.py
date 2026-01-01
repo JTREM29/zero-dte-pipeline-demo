@@ -548,6 +548,74 @@ def get_candidates(ctx, underlying):
         sys.exit(1)
 
 
+@main.command(name="last-ticks")
+@click.option(
+    "--symbol",
+    "symbols",
+    multiple=True,
+    default=("I:SPX", "I:VIX"),
+    show_default=True,
+    help="Symbol(s) to show from SQLite last_ticks (repeatable)",
+)
+@click.option("--db-path", default=None, help="Override SQLite path (defaults to DB_PATH or db/tnt.db)")
+@click.pass_context
+def last_ticks_cmd(ctx, symbols, db_path):
+    """Show latest WebSocket/REST tick cache rows from SQLite.
+
+    This is a quick smoke check that the Polygon WS collector is writing into `last_ticks`.
+    """
+
+    import sqlite3
+
+    syms = [str(s).strip().upper() for s in (symbols or ()) if str(s or "").strip()]
+    if not syms:
+        syms = ["I:SPX", "I:VIX"]
+
+    path = db_path or os.getenv("DB_PATH", "db/tnt.db")
+
+    with sqlite3.connect(path, timeout=10) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS last_ticks (
+                symbol TEXT PRIMARY KEY,
+                price REAL,
+                ts TEXT,
+                source TEXT,
+                recv_ts TEXT
+            )
+            """
+        )
+
+        placeholders = ",".join(["?"] * len(syms))
+        rows = cur.execute(
+            f"SELECT symbol, price, ts, source, recv_ts FROM last_ticks WHERE symbol IN ({placeholders}) ORDER BY symbol",
+            tuple(syms),
+        ).fetchall()
+
+    payload = {
+        "db_path": path,
+        "symbols": syms,
+        "rows": [
+            {"symbol": r[0], "price": r[1], "ts": r[2], "source": r[3], "recv_ts": r[4]}
+            for r in (rows or [])
+        ],
+    }
+
+    if ctx.obj.get("json_output"):
+        click.echo(json.dumps(payload, indent=2, default=str))
+        return
+
+    click.echo(f"DB: {path}")
+    if not payload["rows"]:
+        click.echo("No last_ticks rows found for requested symbols.")
+        click.echo("Hint: run the task 'Polygon WS collector: indices (bg)' and wait a few seconds.")
+        return
+
+    for r in payload["rows"]:
+        click.echo(f"{r['symbol']}: price={r['price']} ts={r['ts']} source={r['source']} recv_ts={r['recv_ts']}")
+
+
 @click.command("morning-brief")
 @click.option(
     "--symbol",
@@ -627,7 +695,10 @@ def test_openai_model_available():
     if not key:
         pytest.skip("OPENAI_API_KEY not set")
     wrapper = OpenAIClient(api_key=key)
-    out = wrapper.complete(system="Say OK.", prompt="test")
+    from delivery.state_builder import build_tnt_state
+
+    tnt_state = build_tnt_state(["SPY"], mode="ON_DEMAND")
+    out = wrapper.complete(system="Say OK.", prompt="test", tnt_state=tnt_state)
     assert "OK" in out
 
 if __name__ == "__main__":

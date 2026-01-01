@@ -1,28 +1,24 @@
-⚡ **Intraday Update**
-ET stamp: 2025-12-17 15:23
-Stand-Down: **OFF** — tape is tradable.
+⏱ Intraday Update (RTH) — 2025-12-17 15:23 ET
+💵 Last: SPY 678.98, QQQ 614.89, IWM 251.27
 
-📊 **Market Participation (Smart Market IQ)**
-• Regime: **RISK_ON** | Quality: **OK** | Gate: **ALLOW** (CONFIRM)
-• Leaders: NVDA, AMD, TSLA
-• Laggards: XLU, PG, KO
+🧭 Posture: BULL | Regime: RISK_ON | Conv: HIGH
+🚦 Permissions: Aggression **REDUCED** | Stand-down: OFF | Momentum-only: false | No-trade: false
+Reason(s): n/a
 
-📊 Futures Context — **@ES#**
-• ON VWAP 4826.50 (latest price pending).
+📐 Key Levels
+SPY: P 679.00 / R1 681.00 / S1 677.00
+QQQ: P 615.10 / R1 617.25 / S1 612.95
 
-📈 Regime Shift Watch:
-• Monitoring for VWAP hold to confirm bias.
+🟦 Futures Alignment: ALIGNED
+Event Risk: NONE
 
-📐 Levels In Play:
-• SPY 4820: ON low cluster.
-• QQQ 415: Weekly value area high.
+✅ Allowed
+• Observe posture; reduce participation until confirmation.
 
-📝 Options Signals:
-• SPX 4800c: OI build; watch gamma flip.
-• QQQ 420p: Hedging flow picking up.
+🚫 Prohibited
+• Escalating aggression when posture is not confirmed.
+• Any action during degraded inputs.
 
-🚫 Do Nothing If:
-• Futures context stays stale/missing through next scan.
-• Bias flips hard against the trade with no volume confirmation.
+Invalidation: posture degrades or data becomes stale/degraded.
 
-_Not financial advice._
+TNT charts are posture & behavior only. No execution guidance.

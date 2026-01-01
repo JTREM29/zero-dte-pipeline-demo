@@ -1,62 +1,73 @@
-"""Tests for the OpenAI client wrapper."""
+"""Tests for the OpenAI client compatibility wrapper."""
 from __future__ import annotations
-
-from types import SimpleNamespace
 
 from zero_dte_pipeline.openai_client import OpenAIClient
 
 
-class _DummyResponse:
-    """Simple OpenAI response stub used for unit testing."""
-
-    def __init__(self, content: str) -> None:
-        message = SimpleNamespace(content=content)
-        choice = SimpleNamespace(message=message)
-        self.choices = [choice]
-
-
-class _DummyCompletions:
-    def __init__(self, owner: "_DummyOpenAI", content: str) -> None:
-        self._owner = owner
-        self._content = content
-
-    def create(self, **kwargs):  # type: ignore[override]
-        self._owner.last_kwargs = kwargs
-        return _DummyResponse(self._content)
-
-
-class _DummyOpenAI:
-    """Minimal stub that mimics the OpenAI client surface we rely on."""
-
-    def __init__(self, *, api_key: str, content: str = "OK"):
-        self.api_key = api_key
-        self.last_kwargs: dict | None = None
-        completions = _DummyCompletions(self, content)
-        self.chat = SimpleNamespace(completions=completions)
+def _sample_tnt_state(symbol: str = "SPY") -> dict:
+    return {
+        "meta": {
+            "schema_version": "1.0",
+            "generated_at_et": "2025-01-01T09:30:00-05:00",
+            "data_freshness_sec": None,
+            "data_health": "DOWN",
+            "data_integrity": {"ok": False, "reason": "TEST"},
+            "source": {"provider": "TEST", "mode": "TEST"},
+        },
+        "context": {
+            "symbol": symbol,
+            "asset_class": "EQUITY",
+            "session": "UNKNOWN",
+            "timeframes": {"execution": "5m", "structure": "60m", "context": "1D"},
+        },
+        "price": {"last": None},
+        "posture": {
+            "bias": "NEUTRAL",
+            "conviction": "LOW",
+            "regime": "COMPRESSION",
+            "mode": "NORMAL",
+            "rationale_tags": [],
+        },
+        "levels": {
+            "decision_zones": [],
+            "support": [],
+            "resistance": [],
+            "pivots_rth": {"P": None, "R1": None, "S1": None, "R2": None, "S2": None},
+        },
+        "permissions": {
+            "aggression": "PROHIBITED",
+            "momentum_only": False,
+            "no_trade": True,
+            "reasons": ["DATA_HEALTH"],
+        },
+        "events": [],
+        "chart": {"recommended_template": "BALANCED", "template_params": None},
+    }
 
 
 def test_pro_model_available(monkeypatch):
-    """Ensure the wrapper targets the pro model and surfaces the response content."""
+    """Ensure the wrapper forwards model selection and returns text."""
 
     # Provide deterministic configuration.
     monkeypatch.setenv("OPENAI_MODEL_NAME", "gpt-5.1-pro")
     monkeypatch.setenv("OPENAI_TIMEOUT_SECONDS", "15")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
-    # Swap the real OpenAI client for the stub so no network call occurs.
-    created_clients: list[_DummyOpenAI] = []
+    captured: dict = {}
 
-    def _fake_openai(api_key: str) -> _DummyOpenAI:
-        client = _DummyOpenAI(api_key=api_key)
-        created_clients.append(client)
-        return client
+    def _fake_call_tnt_agent(**kwargs):
+        captured.update(kwargs)
+        return type(
+            "_Res",
+            (),
+            {"text": "OK", "model": kwargs.get("model"), "prompt_sha256": "p", "tnt_state_sha256": "s"},
+        )()
 
-    monkeypatch.setattr("zero_dte_pipeline.openai_client.OpenAI", _fake_openai)
+    monkeypatch.setattr("zero_dte_pipeline.openai_client.call_tnt_agent", _fake_call_tnt_agent)
 
     wrapper = OpenAIClient()
-    result = wrapper.generate("test system", "Say OK.")
+    result = wrapper.generate("test system", "Say OK.", tnt_state=_sample_tnt_state())
 
     assert result == "OK"
-    assert created_clients
-    assert created_clients[0].last_kwargs is not None
-    assert created_clients[0].last_kwargs["model"] == "gpt-5.1-pro"
+    assert captured
+    assert captured["model"] == "gpt-5.1-pro"

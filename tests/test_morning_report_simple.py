@@ -27,7 +27,7 @@ def test_build_morning_report_dict(monkeypatch):
         candidates=[{"description": "test structure", "score": 0.9}],
     )
 
-    monkeypatch.setattr(mr, "_build_context", lambda symbol: context)
+    monkeypatch.setattr(mr, "_build_context", lambda symbol, primary_expiration=None: context)
     monkeypatch.setattr(
         mr,
         "get_openai_client",

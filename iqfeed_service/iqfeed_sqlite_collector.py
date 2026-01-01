@@ -7,7 +7,48 @@ from datetime import datetime
 HOST = "localhost"     # handles IPv4/IPv6 on Windows
 PORT = 5009
 
-SYMBOLS = ["@ES#", "SPX"]
+
+def _default_symbol_map():
+    return {
+        "@ES#": os.getenv("IQFEED_ES_SYMBOL", "@ES#"),
+        "SPX": os.getenv("IQFEED_SPX_SYMBOL", "SPX.XO"),
+    }
+
+
+def _parse_symbol_map() -> dict:
+    raw = os.getenv("IQFEED_SYMBOLS", "")
+    mapping: dict[str, str] = {}
+
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    for token in tokens:
+        alias = token
+        feed = token
+        if "=" in token:
+            alias, feed = token.split("=", 1)
+        elif "->" in token:
+            alias, feed = token.split("->", 1)
+        else:
+            feed = token
+            alias = token.split(".", 1)[0] or token
+
+        alias = alias.strip()
+        feed = feed.strip()
+        if not alias or not feed:
+            continue
+
+        alias_norm = alias.upper()
+        mapping[alias_norm] = feed.upper()
+
+    if mapping:
+        return mapping
+
+    defaults = _default_symbol_map()
+    return {alias.upper(): value.upper() for alias, value in defaults.items() if value}
+
+
+SYMBOL_MAP = _parse_symbol_map()
+SUBSCRIBE_SYMBOLS = list(dict.fromkeys(SYMBOL_MAP.values()))
+REVERSE_SYMBOL_MAP = {iq: alias for alias, iq in SYMBOL_MAP.items()}
 DB_PATH = os.path.join(os.path.dirname(__file__), "market_iqfeed.db")
 
 RECONNECT_DELAY = 3
@@ -84,9 +125,12 @@ def main():
                 send("S,SELECT UPDATE FIELDS,Symbol,Last,Bid,Ask\r\n")
                 send("S,SET CLIENT NAME,TNT_IQFEED_SQLITE\r\n")
 
-                for sym in SYMBOLS:
+                for sym in SUBSCRIBE_SYMBOLS:
                     send(f"w{sym}\r\n")
-                print(f"[IQFeed] Subscribed: {', '.join(SYMBOLS)}")
+                pretty = ", ".join(
+                    f"{alias}->{iq}" if alias != iq else alias for alias, iq in SYMBOL_MAP.items()
+                )
+                print(f"[IQFeed] Subscribed: {pretty}")
 
                 while True:
                     data = s.recv(65536)
@@ -114,6 +158,8 @@ def main():
                             last = safe_float(parts[1].strip()) if len(parts) >= 2 else None
                             bid = safe_float(parts[2].strip()) if len(parts) >= 3 else None
                             ask = safe_float(parts[3].strip()) if len(parts) >= 4 else None
+
+                        sym = REVERSE_SYMBOL_MAP.get(sym, sym)
 
                         now = time.time()
                         if now - last_write >= WRITE_EVERY_SEC:

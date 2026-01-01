@@ -4,11 +4,15 @@ Handles IQFeed connectivity with proper authentication,
 including fixes for the authentication loop and credential loading.
 """
 import asyncio
+import json
 import os
 import socket
 import struct
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -45,6 +49,8 @@ class IQFeedConnector(DataConnector):
         "SPX": ["SPXW", "SPX"],
     }
 
+    HEALTH_STALE_TICK_SECONDS = 60
+
     def __init__(
         self,
         host: Optional[str] = None,
@@ -70,6 +76,11 @@ class IQFeedConnector(DataConnector):
         self._client_version = self._sanitize_credential(config.iqfeed_version) or "ZeroDTE-pipeline/1.0"
         self._autostart_enabled = config.iqfeed_autostart_enabled
         self._headless_login_enabled = config.iqfeed_headless_login_enabled
+        self._health_file = Path(config.get("IQFEED_HEALTH_FILE", "iqfeed_health.json")).expanduser()
+        self._connection_events: List[datetime] = []
+        self._last_tick_timestamp: Optional[datetime] = None
+        self._symbols_ok = False
+        self._status = "DOWN"
         
         # Scrub registry values first so manual IQConnect UI stops inheriting stray quotes
         self._clean_registry_credentials()
@@ -181,6 +192,74 @@ class IQFeedConnector(DataConnector):
             return float(value)
         except ValueError:
             return None
+
+    def _register_connection_event(self, reference_time: Optional[datetime] = None) -> None:
+        """Track successful connection times to compute reconnect counts."""
+        now = reference_time or datetime.now()
+        self._connection_events.append(now)
+        self._prune_connection_events(now)
+
+    def _prune_connection_events(self, reference_time: datetime) -> None:
+        cutoff = reference_time - timedelta(hours=24)
+        self._connection_events = [ts for ts in self._connection_events if ts >= cutoff]
+
+    def _write_health_snapshot(self, reference_time: datetime) -> None:
+        if self._last_tick_timestamp:
+            last_tick_age = max((reference_time - self._last_tick_timestamp).total_seconds(), 0.0)
+        else:
+            last_tick_age = None
+
+        try:
+            timestamp = datetime.now(ZoneInfo("America/New_York")).isoformat()
+        except Exception:
+            timestamp = reference_time.isoformat()
+
+        reconnects = max(len(self._connection_events) - 1, 0)
+        payload = {
+            "status": self._status,
+            "last_tick_age_sec": last_tick_age,
+            "reconnects_24h": reconnects,
+            "symbols_ok": self._symbols_ok,
+            "timestamp": timestamp,
+        }
+
+        try:
+            if self._health_file.parent and not self._health_file.parent.exists():
+                self._health_file.parent.mkdir(parents=True, exist_ok=True)
+            self._health_file.write_text(json.dumps(payload, indent=2))
+        except Exception as exc:
+            logger.debug("Failed to write IQFeed health snapshot: %s", exc)
+
+    def _update_health_state(
+        self,
+        *,
+        tick_received: bool = False,
+        symbol_ok: Optional[bool] = None,
+        status: Optional[str] = None,
+        reference_time: Optional[datetime] = None,
+    ) -> None:
+        now = reference_time or datetime.now()
+        if tick_received:
+            self._last_tick_timestamp = now
+        if symbol_ok is not None:
+            self._symbols_ok = symbol_ok
+
+        if status:
+            self._status = status
+        else:
+            if not self._connected:
+                self._status = "DOWN"
+            else:
+                age_ok = False
+                if self._last_tick_timestamp:
+                    age_ok = (now - self._last_tick_timestamp).total_seconds() <= self.HEALTH_STALE_TICK_SECONDS
+                if self._symbols_ok and age_ok:
+                    self._status = "OK"
+                else:
+                    self._status = "DEGRADED"
+
+        self._prune_connection_events(now)
+        self._write_health_snapshot(now)
     
     async def connect(self) -> bool:
         """Establish connection to IQFeed.
@@ -188,6 +267,7 @@ class IQFeedConnector(DataConnector):
         Returns:
             True if connection successful, False otherwise.
         """
+        was_connected = self._connected
         try:
             # Check if IQConnect.exe is running
             if not await self._check_iqconnect_running():
@@ -199,17 +279,23 @@ class IQFeedConnector(DataConnector):
                         "IQConnect.exe not detected and autostart disabled; please start IQFeed manually"
                     )
                     self._last_error = "IQConnect not running (autostart disabled)"
+                    self._connected = False
+                    self._update_health_state(status="DOWN", symbol_ok=False)
                     return False
             
             # Connect to admin port first
             self._admin_socket = await self._connect_socket(self.admin_port)
             if not self._admin_socket:
                 self._last_error = "Failed to connect to IQFeed admin port"
+                self._connected = False
+                self._update_health_state(status="DOWN", symbol_ok=False)
                 return False
             
             # Authenticate
             if not await self._authenticate():
                 self._last_error = "Authentication failed"
+                self._connected = False
+                self._update_health_state(status="DOWN", symbol_ok=False)
                 return False
             
             # Connect to data ports
@@ -218,18 +304,25 @@ class IQFeedConnector(DataConnector):
             
             if not self._level1_socket or not self._lookup_socket:
                 self._last_error = "Failed to connect to IQFeed data ports"
+                self._connected = False
+                self._update_health_state(status="DOWN", symbol_ok=False)
                 return False
 
             # Ensure lookup socket negotiates protocol before use
             await self._initialize_lookup_socket()
             
             self._connected = True
+            if not was_connected:
+                self._register_connection_event()
+            self._update_health_state()
             logger.info("Successfully connected to IQFeed")
             return True
             
         except Exception as e:
             self._last_error = str(e)
             logger.error(f"IQFeed connection error: {e}")
+            self._connected = False
+            self._update_health_state(status="DOWN", symbol_ok=False)
             return False
     
     async def _check_iqconnect_running(self) -> bool:
@@ -458,6 +551,7 @@ class IQFeedConnector(DataConnector):
         self._connected = False
         self._authenticated = False
         logger.info("Disconnected from IQFeed")
+        self._update_health_state(status="DOWN", symbol_ok=False)
     
     async def test_connection(self) -> Dict[str, Any]:
         """Test IQFeed connection."""
@@ -502,6 +596,7 @@ class IQFeedConnector(DataConnector):
     async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get current quote for a symbol."""
         if not self._connected or not self._level1_socket:
+            self._update_health_state(status="DOWN", symbol_ok=False)
             return None
         
         try:
@@ -512,6 +607,7 @@ class IQFeedConnector(DataConnector):
             # Parse response
             fields = response.strip().split(",")
             if len(fields) < 10:
+                self._update_health_state(symbol_ok=False)
                 return None
             
             numeric: Dict[str, Optional[float]] = {}
@@ -528,6 +624,7 @@ class IQFeedConnector(DataConnector):
                         label,
                         symbol,
                     )
+                    self._update_health_state(symbol_ok=False)
                     return None
                 numeric[label] = price
 
@@ -541,18 +638,27 @@ class IQFeedConnector(DataConnector):
                         fields[4],
                         symbol,
                     )
+                    self._update_health_state(symbol_ok=False)
                     return None
 
-            return {
+            now = datetime.now()
+            quote = {
                 "symbol": symbol,
                 "bid": numeric.get("bid"),
                 "ask": numeric.get("ask"),
                 "last": numeric.get("last"),
                 "volume": volume,
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": now.isoformat(),
             }
+            self._update_health_state(
+                tick_received=True,
+                symbol_ok=True,
+                reference_time=now,
+            )
+            return quote
         except Exception as e:
             logger.error(f"Error getting quote for {symbol}: {e}")
+            self._update_health_state(symbol_ok=False)
             return None
     
     async def get_options_chain(

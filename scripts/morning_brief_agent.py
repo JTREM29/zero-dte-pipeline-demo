@@ -235,7 +235,7 @@ def build_market_snapshot(symbol: str = "SPX") -> MarketSnapshot:
     try:
         polygon_news = _run_async(lambda: _fetch_polygon_news(symbol)) or []
     except Exception as exc:  # pragma: no cover - defensive path
-        notes.append(f"Polygon news unavailable: {exc}")
+        notes.append(f"News feed unavailable: {exc}")
         polygon_news = []
 
     spot = quote.get("last")
@@ -289,7 +289,7 @@ def build_market_snapshot(symbol: str = "SPX") -> MarketSnapshot:
     news_headlines = [item["headline"] for item in news_items]
     news_sentiment, news_risk_comment = _summarize_news(news_items)
     if not news_items:
-        notes.append("No news items returned from Massive/Polygon")
+        notes.append("No news items returned from the news feed")
 
     data_quality = ", ".join(notes) if notes else None
     spot_value = float(spot or 0.0)
@@ -418,6 +418,8 @@ def _fallback_brief(snapshot: MarketSnapshot) -> str:
 def render_brief_with_openai(
     sections: Dict[str, Any],
     model: str = "gpt-4.1-mini",
+    *,
+    symbol: str = "SPX",
 ) -> str:
     serialized = json.dumps(sections, indent=2, default=str)
     system = "You are a financial analyst. Return ONLY valid JSON."
@@ -435,7 +437,10 @@ def render_brief_with_openai(
         f"JSON:\n```json\n{serialized}\n```"
     )
     client = OpenAIClient()
-    return client.complete(system=system, prompt=user_prompt, model=model)
+    from delivery.state_builder import build_tnt_state
+
+    tnt_state = build_tnt_state([symbol.upper()], mode="ON_DEMAND")
+    return client.complete(system=system, prompt=user_prompt, tnt_state=tnt_state, model=model)
 
 
 def _compute_agent_sentiment(symbols: Sequence[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
@@ -474,7 +479,7 @@ def build_morning_brief(
 
     if use_openai:
         try:
-            brief_md = render_brief_with_openai(sections)
+            brief_md = render_brief_with_openai(sections, symbol=primary)
         except OpenAIError as exc:
             ai_error = str(exc)
 
@@ -561,7 +566,7 @@ async def _fetch_polygon_news(symbol: str, limit: int = 8) -> List[Dict[str, Any
             {
                 "headline": item.get("headline"),
                 "summary": item.get("description"),
-                "source": item.get("source") or "Polygon",
+                "source": item.get("source") or "News",
                 "published": item.get("published_utc"),
                 "url": item.get("article_url"),
             }
@@ -593,7 +598,7 @@ def _merge_news_entries(*sources: Sequence[Dict[str, Any]]) -> List[Dict[str, An
 
 def _summarize_news(entries: Sequence[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
     if not entries:
-        return (None, "No fresh headlines from Massive/Polygon")
+        return (None, "No fresh headlines from the news feed")
 
     pos_words = {"beat", "optimistic", "surge", "record", "upbeat"}
     neg_words = {"miss", "warning", "slump", "selloff", "downgrade", "fear"}

@@ -2,10 +2,13 @@ import json
 import os
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "market_iqfeed.db")
-OUT_DIR = os.path.join(os.path.dirname(__file__), "output")
-OUT_FILE = os.path.join(OUT_DIR, "futures_context.json")
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "market_iqfeed.db"
+DEFAULT_OUT_FILE = BASE_DIR / "output" / "futures_context.json"
+OUT_FILE = Path(os.getenv("FUTURES_CONTEXT_PATH", "") or DEFAULT_OUT_FILE).expanduser()
+OUT_DIR = OUT_FILE.parent
 
 
 def main() -> None:
@@ -32,8 +35,8 @@ def main() -> None:
             payload["ok"] = False
             payload["reason"] = "No session context yet."
 
-        tmp = OUT_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
+        tmp = OUT_FILE.with_suffix(OUT_FILE.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
         os.replace(tmp, OUT_FILE)
         print(f"[IQFeed] Wrote {OUT_FILE}")

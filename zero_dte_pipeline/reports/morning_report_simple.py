@@ -71,7 +71,7 @@ def _fetch_snapshot_from_providers(symbol: str, providers: List[str]) -> Dict[st
 
 
 def get_morning_snapshot(symbol: str) -> Dict[str, Any]:
-    """Fetch a snapshot that prefers IQFeed but falls back quickly to Polygon."""
+    """Fetch a snapshot that prefers IQFeed but falls back quickly to the secondary provider."""
 
     iqfeed_priority = ["iqfeed"]
     try:
@@ -85,13 +85,13 @@ def get_morning_snapshot(symbol: str) -> Dict[str, Any]:
     except TimeoutError as exc:
         logger.warning("IQFeed snapshot timed out for %s: %s", symbol, exc)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("IQFeed snapshot failed for %s: %s – falling back to Polygon", symbol, exc)
+        logger.warning("IQFeed snapshot failed for %s: %s – falling back to secondary provider", symbol, exc)
 
     polygon_priority = ["polygon"]
     try:
         fallback = _fetch_snapshot_from_providers(symbol, polygon_priority)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Polygon snapshot failed for %s: %s", symbol, exc)
+        logger.warning("Snapshot fetch failed for %s: %s", symbol, exc)
         return {"quote": {}, "snapshot_provenance": "polygon_only"}
 
     fallback["snapshot_provenance"] = fallback.get("snapshot_provenance", "polygon_only")

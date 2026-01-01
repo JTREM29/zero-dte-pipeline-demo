@@ -3,19 +3,91 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import json
+import hashlib
+import csv
+import shutil
 import math
 import os
+import heapq
+from collections import deque
 import re
 import sqlite3
 import subprocess
 import sys
+import time as time_lib
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
+import io
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
+import pandas as pd
+import aiohttp
+from zoneinfo import ZoneInfo
+from market_data.last_price import (
+    LastPrice as PriceSnapshot,
+    resolve_last_price as resolve_last_price_policy,
+    format_last_price_block,
+    market_state_label,
+)
+
+# Retain compatibility for scripts/tests expecting discord_bot.LastPrice
+LastPrice = PriceSnapshot
+
+SILENCE_NOTICE = (
+    "🔕 TNT STATUS\n"
+    "Market conditions unstable / low-confidence.\n"
+    "No Trade Context issued."
+)
+from zero_dte_pipeline.candidates.market_participation_gate import (
+    ParticipationGateResult,
+    apply_participation_gate,
+)
+from zero_dte_pipeline.tech.contracts import (
+    AUTOPOST_CONTRACT_VERSION,
+    ContractConstraints,
+    DEFAULT_MAX_CHARS_BY_PAYLOAD,
+    DEFAULT_MAX_CHARS_DEFAULT,
+    DEFAULT_MAX_EMOJI,
+    DEFAULT_MAX_LINES,
+    INSIGHTS_TECHNICAL_TERMS,
+    contract_violations,
+    validate_options_framework,
+)
+
+from delivery.options_framework import build_options_framework
+
+from delivery.tnt_prompt import load_tnt_system_prompt
+from delivery.tnt_state import build_tnt_state_from_analysis_payload, build_tnt_state_from_packet, enrich_tnt_state, format_tnt_state_block
+from delivery.tnt_chart_contract import FOOTER_DISCLAIMER, validate_chart_spec
+from delivery.options_chain_summary import summarize_options_chain
+
+
+
+
+ET = ZoneInfo("America/New_York")
+ET_TZ = ET
+
+# --- Health stats: Polygon options HTTP throttle ---
+_OPTIONS_HTTP_LOCK = asyncio.Lock()
+_OPTIONS_HTTP_ACTIVE = 0
+_OPTIONS_HTTP_PEAK = 0
+
+
+def get_options_http_stats() -> dict[str, int]:
+    """Best-effort health stats for Polygon options HTTP throttling."""
+    try:
+        configured_cap = int(os.getenv("TNT_MAX_POLYGON_OPTIONS_HTTP", "12"))
+    except Exception:
+        configured_cap = 12
+    return {
+        "cap": int(max(1, configured_cap)),
+        "active": int(_OPTIONS_HTTP_ACTIVE),
+        "peak_active": int(_OPTIONS_HTTP_PEAK),
+    }
 
 def _f(x, nd=2):
     try:
@@ -105,7 +177,1184 @@ def ladder_levels(price: float, levels: Dict[str, Optional[float]], nd: int = 2)
     return {"up": ups_valid, "down": dns_valid}
 
 
-def vix_sqqq_confirmation(vix_dir: Optional[str], sqqq_dir: Optional[str]) -> str:
+@dataclass(slots=True)
+class RenderedPost:
+    """Container for formatted text plus deterministic agent context."""
+
+    text: str
+    agent_payload: Optional[Dict[str, Any]] = None
+    files: Optional[list[tuple[str, bytes]]] = None
+
+    def __str__(self) -> str:  # pragma: no cover - utility for legacy call sites
+        return self.text
+
+
+@dataclass(slots=True)
+class _AnalyzeCacheEntry:
+    """Small holder for cached /analyze renders."""
+
+    render: RenderedPost
+    ts: float
+
+
+_ANALYZE_CACHE: dict[str, _AnalyzeCacheEntry] = {}
+
+
+@dataclass(slots=True)
+class _OptionsMicroCacheEntry:
+    """Small holder for cached options microstructure summaries."""
+
+    packet: dict[str, Any]
+    ts: float
+
+
+_OPTIONS_MICRO_CACHE: dict[str, _OptionsMicroCacheEntry] = {}
+
+
+@dataclass(slots=True)
+class _GroupedDailyCacheEntry:
+    """Cache holder for Polygon grouped daily bars by date."""
+
+    results: list[dict[str, Any]]
+    ts: float
+
+
+_GROUPED_DAILY_CACHE: dict[str, _GroupedDailyCacheEntry] = {}
+
+def _env_float(name: str, fallback: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return fallback
+    try:
+        return float(raw)
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+def _env_int(name: str, fallback: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return fallback
+    try:
+        return int(raw)
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+_ANALYZE_CACHE_TTL_SEC = _env_float("ANALYZE_CACHE_TTL_SEC", 86400.0)
+_ANALYZE_CACHE_MAX = _env_int("ANALYZE_CACHE_MAX", 32)
+
+_OPTIONS_MICRO_TTL_SEC = _env_float("OPTIONS_MICRO_TTL_SEC", 300.0)
+_OPTIONS_MICRO_MAX = _env_int("OPTIONS_MICRO_MAX", 16)
+
+_GROUPED_DAILY_TTL_SEC = _env_float("GROUPED_DAILY_TTL_SEC", 3600.0)
+_GROUPED_DAILY_CACHE_MAX = _env_int("GROUPED_DAILY_CACHE_MAX", 7)
+
+_ETF_CONSTITUENTS_TTL_SEC = _env_float("ETF_CONSTITUENTS_TTL_SEC", 21600.0)
+
+
+def _get_cached_options_micro(symbol: str) -> Optional[_OptionsMicroCacheEntry]:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+    entry = _OPTIONS_MICRO_CACHE.get(sym)
+    if not entry:
+        return None
+    if _OPTIONS_MICRO_TTL_SEC > 0:
+        now = time_lib.time()
+        if now - entry.ts > _OPTIONS_MICRO_TTL_SEC:
+            _OPTIONS_MICRO_CACHE.pop(sym, None)
+            return None
+    return entry
+
+
+def _set_cached_options_micro(symbol: str, packet: dict[str, Any], *, ts: Optional[float] = None) -> None:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return
+    timestamp = float(ts) if ts is not None else time_lib.time()
+    _OPTIONS_MICRO_CACHE[sym] = _OptionsMicroCacheEntry(packet=dict(packet), ts=timestamp)
+    if _OPTIONS_MICRO_MAX <= 0 or len(_OPTIONS_MICRO_CACHE) <= _OPTIONS_MICRO_MAX:
+        return
+    while len(_OPTIONS_MICRO_CACHE) > _OPTIONS_MICRO_MAX:
+        oldest_key = min(_OPTIONS_MICRO_CACHE.items(), key=lambda item: item[1].ts)[0]
+        _OPTIONS_MICRO_CACHE.pop(oldest_key, None)
+
+
+def _polygon_key_and_base() -> tuple[Optional[str], str, str]:
+    """Return (api_key, base_url, provider_label).
+
+    If Massive is enabled (key present + ZERO_DTE_USE_MASSIVE=1), prefer that key/base.
+    """
+
+    use_massive = os.getenv("ZERO_DTE_USE_MASSIVE", "0") == "1"
+    massive_key = (os.getenv("MASSIVE_API_KEY") or "").strip()
+    massive_base = (os.getenv("MASSIVE_BASE_URL") or "").strip().rstrip("/")
+    if use_massive and massive_key:
+        return massive_key, (massive_base or "https://api.polygon.io"), "massive"
+
+    try:
+        from zero_dte_pipeline.config import config
+
+        polygon_key = (config.polygon_api_key or "").strip()
+    except Exception:  # noqa: BLE001
+        polygon_key = (os.getenv("POLYGON_API_KEY") or "").strip()
+
+    return (polygon_key or None), "https://api.polygon.io", "polygon"
+
+
+@dataclass(slots=True)
+class _EtfConstituentsCacheEntry:
+    tickers: set[str]
+    ts: float
+
+
+_ETF_CONSTITUENTS_CACHE: dict[str, _EtfConstituentsCacheEntry] = {}
+
+
+def _get_cached_etf_constituents(composite_ticker: str) -> Optional[set[str]]:
+    key = (composite_ticker or "").strip().upper()
+    if not key:
+        return None
+    entry = _ETF_CONSTITUENTS_CACHE.get(key)
+    if not entry:
+        return None
+    if _ETF_CONSTITUENTS_TTL_SEC > 0:
+        now = time_lib.time()
+        if now - entry.ts > _ETF_CONSTITUENTS_TTL_SEC:
+            _ETF_CONSTITUENTS_CACHE.pop(key, None)
+            return None
+    return set(entry.tickers)
+
+
+def _set_cached_etf_constituents(composite_ticker: str, tickers: set[str], *, ts: Optional[float] = None) -> None:
+    key = (composite_ticker or "").strip().upper()
+    if not key:
+        return
+    timestamp = float(ts) if ts is not None else time_lib.time()
+    _ETF_CONSTITUENTS_CACHE[key] = _EtfConstituentsCacheEntry(tickers=set(tickers), ts=timestamp)
+
+
+def _with_api_key(url: str, api_key: str) -> str:
+    """Ensure apiKey is present in the query string."""
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["apiKey"] = api_key
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+async def _fetch_etf_constituents(composite_ticker: str) -> Optional[set[str]]:
+    """Fetch ETF constituents tickers for a composite ticker (e.g., SPY).
+
+    Uses Polygon ETF Global endpoint: GET /etf-global/v1/constituents?composite_ticker=SPY
+    """
+
+    sym = (composite_ticker or "").strip().upper()
+    if not sym:
+        return None
+
+    cached = _get_cached_etf_constituents(sym)
+    if cached is not None and cached:
+        return cached
+
+    api_key, base_url, _provider = _polygon_key_and_base()
+    if not api_key:
+        return None
+
+    # This endpoint may not be enabled on all Polygon plans; handle failures gracefully.
+    next_url: Optional[str] = f"{base_url}/etf-global/v1/constituents"
+    params: dict[str, Any] = {
+        "composite_ticker": sym,
+        "limit": 1000,
+        "apiKey": api_key,
+    }
+
+    out: set[str] = set()
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for _ in range(10):
+            if not next_url:
+                break
+            url = next_url
+            if url.startswith("/"):
+                url = f"{base_url}{url}"
+            if url.startswith("http") and "apiKey=" not in url:
+                url = _with_api_key(url, api_key)
+
+            try:
+                async with session.get(url, params=None if "?" in url else params) as resp:
+                    if resp.status != 200:
+                        return None
+                    payload = await resp.json()
+            except Exception:  # noqa: BLE001
+                return None
+
+            results = payload.get("results") if isinstance(payload, dict) else None
+            if isinstance(results, list):
+                for item in results:
+                    if not isinstance(item, dict):
+                        continue
+                    t = str(item.get("constituent_ticker") or "").strip().upper()
+                    if t:
+                        out.add(t)
+
+            nxt = payload.get("next_url") if isinstance(payload, dict) else None
+            if isinstance(nxt, str) and nxt.strip():
+                next_url = nxt.strip()
+                params = {"apiKey": api_key}
+                continue
+            break
+
+    if not out:
+        return None
+
+    _set_cached_etf_constituents(sym, out)
+    return out
+
+
+def _get_cached_grouped_daily(date_ymd: str) -> Optional[list[dict[str, Any]]]:
+    key = (date_ymd or "").strip()[:10]
+    if not key:
+        return None
+    entry = _GROUPED_DAILY_CACHE.get(key)
+    if not entry:
+        return None
+    if _GROUPED_DAILY_TTL_SEC > 0:
+        now = time_lib.time()
+        if now - entry.ts > _GROUPED_DAILY_TTL_SEC:
+            _GROUPED_DAILY_CACHE.pop(key, None)
+            return None
+    return entry.results
+
+
+def _set_cached_grouped_daily(date_ymd: str, results: list[dict[str, Any]], *, ts: Optional[float] = None) -> None:
+    key = (date_ymd or "").strip()[:10]
+    if not key:
+        return
+    timestamp = float(ts) if ts is not None else time_lib.time()
+    _GROUPED_DAILY_CACHE[key] = _GroupedDailyCacheEntry(results=list(results), ts=timestamp)
+    if _GROUPED_DAILY_CACHE_MAX <= 0 or len(_GROUPED_DAILY_CACHE) <= _GROUPED_DAILY_CACHE_MAX:
+        return
+    while len(_GROUPED_DAILY_CACHE) > _GROUPED_DAILY_CACHE_MAX:
+        oldest_key = min(_GROUPED_DAILY_CACHE.items(), key=lambda item: item[1].ts)[0]
+        _GROUPED_DAILY_CACHE.pop(oldest_key, None)
+
+
+async def _fetch_polygon_grouped_daily(date_ymd: str) -> Optional[list[dict[str, Any]]]:
+    """Fetch Polygon grouped daily bars (US stocks) for a specific date.
+
+    Endpoint: /v2/aggs/grouped/locale/us/market/stocks/{date}
+    Returns: list of per-ticker bars (dicts) or None.
+    """
+
+    date_key = (date_ymd or "").strip()[:10]
+    if not date_key:
+        return None
+
+    cached = _get_cached_grouped_daily(date_key)
+    if cached is not None:
+        return cached
+
+    api_key, base_url, _provider = _polygon_key_and_base()
+    if not api_key:
+        return None
+
+    url = f"{base_url}/v2/aggs/grouped/locale/us/market/stocks/{date_key}"
+    params = {
+        "adjusted": "true",
+        "include_otc": "false",
+        "apiKey": api_key,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json()
+        except Exception:  # noqa: BLE001
+            return None
+
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list) or not results:
+        return None
+
+    filtered: list[dict[str, Any]] = []
+    for item in results:
+        if isinstance(item, dict):
+            filtered.append(item)
+    if not filtered:
+        return None
+
+    _set_cached_grouped_daily(date_key, filtered)
+    return filtered
+
+
+def _is_volume_leader_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    # tolerate common typos like "voluime"
+    if "voluime" in q:
+        q = q.replace("voluime", "volume")
+
+    return bool(
+        re.search(r"\b(most|highest|top)\s+(volume|vol)\b", q)
+        or re.search(r"\b(volume|vol)\s+(leader|leaders|leadership)\b", q)
+    )
+
+
+def _wants_sp500_universe(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    # Common ways users specify the universe.
+    return bool(
+        re.search(r"\b(s\&p|s\s*and\s*p)\s*500\b", q)
+        or re.search(r"\bsp\s*500\b", q)
+        or re.search(r"\bsp500\b", q)
+    )
+
+
+def _is_market_session_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    return bool(
+        re.search(r"\bmarket\s+(open|closed|status|session)\b", q)
+        or re.search(r"\bis\s+the\s+market\s+open\b", q)
+        or re.search(r"\b(rth|premarket|pre\s*market|after\s*hours|ah)\b", q)
+    )
+
+
+def _answer_market_session_question() -> str:
+    now_et = _now_et()
+    session = market_session_et(now_et.astimezone(timezone.utc))
+    if session == "RTH":
+        detail = f"RTH (09:31–16:00 ET)"
+    elif session == "PRE":
+        detail = f"PRE (04:00–09:31 ET)"
+    elif session == "AH":
+        detail = f"AH (16:00–20:00 ET)"
+    elif session == "WEEKEND":
+        detail = "WEEKEND"
+    else:
+        detail = "CLOSED"
+    return f"Answer: Market session is {detail} as of {now_et.strftime('%Y-%m-%d %H:%M')} ET."
+
+
+def _is_watchlist_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    return bool(
+        re.search(r"\bwatch\s*list\b", q)
+        or re.search(r"\bwhat\s+are\s+we\s+watching\b", q)
+        or re.search(r"\bwhat\s+tickers\b", q)
+        or re.search(r"\bwhat\s+symbols\b", q)
+    )
+
+
+def _answer_watchlist_question() -> str:
+    try:
+        symbols = _fetch_watchlist_symbols()
+    except Exception:  # noqa: BLE001
+        symbols = []
+    if not symbols:
+        return "Answer: Watchlist is empty."
+    return f"Answer: Watchlist: {', '.join(symbols)}."
+
+
+def _is_trend_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    return bool(re.search(r"\b(trend|trending|daily\s+trend|last\s+\d+\s+(days|sessions))\b", q))
+
+
+def _is_key_levels_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    return bool(
+        re.search(r"\b(levels?|pivots?|pivot|support|resistance)\b", q)
+        or re.search(r"\b(s1|r1|s2|r2)\b", q)
+    )
+
+
+def _answer_key_levels_question(symbol: str, tnt_state: Mapping[str, Any]) -> Optional[str]:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+
+    meta = tnt_state.get("meta") if isinstance(tnt_state.get("meta"), dict) else {}
+    permissions = tnt_state.get("permissions") if isinstance(tnt_state.get("permissions"), dict) else {}
+    data_health = str(meta.get("data_health") or "UNKNOWN").upper()
+    if data_health != "OK" or bool(permissions.get("no_trade")):
+        return None
+
+    price = tnt_state.get("price") if isinstance(tnt_state.get("price"), dict) else {}
+    levels = tnt_state.get("levels") if isinstance(tnt_state.get("levels"), dict) else {}
+    piv = levels.get("pivots_rth") if isinstance(levels.get("pivots_rth"), dict) else {}
+
+    last = price.get("last")
+    p = piv.get("P")
+    s1 = piv.get("S1")
+    r1 = piv.get("R1")
+
+    if not isinstance(last, (int, float)):
+        return None
+    if not isinstance(p, (int, float)):
+        return None
+
+    last_f = float(last)
+    p_f = float(p)
+
+    s1_txt = fmt_money(float(s1)) if isinstance(s1, (int, float)) else "n/a"
+    r1_txt = fmt_money(float(r1)) if isinstance(r1, (int, float)) else "n/a"
+
+    snapshot = _build_coach_data_snapshot_line(tnt_state)
+
+    # Keep conditions simple and purely level-based.
+    bull_cond = f"Hold above Pivot {fmt_money(p_f)}"
+    if isinstance(r1, (int, float)):
+        bull_cond += f" and accept above R1 {r1_txt}"
+    bull_cond += "."
+
+    bear_cond = f"Lose Pivot {fmt_money(p_f)}"
+    if isinstance(s1, (int, float)):
+        bear_cond += f" and accept below S1 {s1_txt}"
+    bear_cond += "."
+
+    invalid = f"Any break one side of Pivot {fmt_money(p_f)} that immediately fails back through it."
+    idle = "Price chops around Pivot with no acceptance."
+
+    answer = (
+        f"Key levels for {sym}: last {fmt_money(last_f)} | P {fmt_money(p_f)} | S1 {s1_txt} | R1 {r1_txt}. "
+        f"({snapshot})"
+    )
+
+    return "\n".join(
+        [
+            f"Answer: {answer}",
+            "Bullish only if:",
+            f"- {bull_cond}",
+            "Bearish if:",
+            f"- {bear_cond}",
+            "Invalidation:",
+            f"- {invalid}",
+            "Do nothing if:",
+            f"- {idle}",
+        ]
+    )
+
+
+async def _volume_leaders_for_date(date_ymd: str, *, top_n: int = 5) -> Optional[list[tuple[str, int]]]:
+    results = await _fetch_polygon_grouped_daily(date_ymd)
+    if not results:
+        return None
+
+    heap: list[tuple[int, str]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        ticker = str(item.get("T") or "").strip().upper()
+        if not ticker:
+            continue
+        vol = item.get("v")
+        try:
+            vol_int = int(vol)
+        except Exception:  # noqa: BLE001
+            continue
+        if vol_int <= 0:
+            continue
+        heap.append((vol_int, ticker))
+
+    if not heap:
+        return None
+
+    top = heapq.nlargest(max(int(top_n), 1), heap, key=lambda it: it[0])
+    return [(ticker, vol) for (vol, ticker) in top]
+
+
+async def _volume_leaders_for_date_universe(
+    date_ymd: str,
+    *,
+    universe: set[str],
+    top_n: int = 5,
+) -> Optional[list[tuple[str, int]]]:
+    if not universe:
+        return None
+    results = await _fetch_polygon_grouped_daily(date_ymd)
+    if not results:
+        return None
+
+    heap: list[tuple[int, str]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        ticker = str(item.get("T") or "").strip().upper()
+        if not ticker or ticker not in universe:
+            continue
+        vol = item.get("v")
+        try:
+            vol_int = int(vol)
+        except Exception:  # noqa: BLE001
+            continue
+        if vol_int <= 0:
+            continue
+        heap.append((vol_int, ticker))
+
+    if not heap:
+        return None
+
+    top = heapq.nlargest(max(int(top_n), 1), heap, key=lambda it: it[0])
+    return [(ticker, vol) for (vol, ticker) in top]
+
+
+async def _volume_leaders_today(now_et: Optional[datetime] = None, *, lookback_days: int = 7) -> Optional[tuple[str, list[tuple[str, int]]]]:
+    now_local = now_et or _now_et()
+    base = now_local.date()
+    for i in range(max(int(lookback_days), 1)):
+        day = base - timedelta(days=i)
+        leaders = await _volume_leaders_for_date(day.isoformat(), top_n=5)
+        if leaders:
+            return day.isoformat(), leaders
+    return None
+
+
+async def _volume_leaders_today_sp500(now_et: Optional[datetime] = None, *, lookback_days: int = 7) -> Optional[tuple[str, list[tuple[str, int]]]]:
+    universe = await _fetch_etf_constituents("SPY")
+    if not universe:
+        return None
+
+    now_local = now_et or _now_et()
+    base = now_local.date()
+    for i in range(max(int(lookback_days), 1)):
+        day = base - timedelta(days=i)
+        leaders = await _volume_leaders_for_date_universe(day.isoformat(), universe=universe, top_n=5)
+        if leaders:
+            return day.isoformat(), leaders
+    return None
+
+
+async def _answer_volume_leader_question(question: str) -> Optional[str]:
+    now_et = _now_et()
+    api_key, _base_url, provider_label = _polygon_key_and_base()
+    if not api_key:
+        return "Answer: Data feed is unavailable (no market-data API key configured), so I can’t determine volume leadership today."
+
+    if _wants_sp500_universe(question):
+        found = await _volume_leaders_today_sp500(now_et)
+        if not found:
+            return (
+                "Answer: S&P 500 universe volume is unavailable right now (constituents feed not available), "
+                "so I can’t determine the S&P 500 volume leader today."
+            )
+    else:
+        found = await _volume_leaders_today(now_et)
+    if not found:
+        return "Answer: Volume data is unavailable right now (grouped daily bars not returned), so I can’t determine volume leadership today."
+
+    date_ymd, leaders = found
+    top_ticker, top_vol = leaders[0]
+    tail = ", ".join([f"{t} {v:,}" for (t, v) in leaders])
+
+    universe_label = "S&P 500" if _wants_sp500_universe(question) else "US stocks"
+    return f"Answer: {top_ticker} — highest reported share volume on {date_ymd} ({provider_label} grouped daily; {universe_label}). Top 5: {tail}."
+
+
+def _map_underlying_for_options(symbol: str) -> str:
+    sym = (symbol or "").strip().upper()
+    # SPX weeklies: treat underlying as SPX for Polygon's underlying_ticker.
+    if sym == "SPXW":
+        return "SPX"
+    return sym
+
+
+async def _fetch_polygon_options_chain_df(
+    symbol: str,
+    *,
+    expiration_ymd: Optional[str] = None,
+    strike_window_pct: float = 0.08,
+    max_contracts: int = 250,
+    concurrency: int = 8,
+) -> Optional[pd.DataFrame]:
+    """Fetch a *bounded* 0DTE-ish options chain for `symbol` via Polygon/Massive.
+
+    Uses:
+    - /v3/reference/options/contracts (bounded by strike window)
+    - /v3/snapshot/options/{underlying}/{ticker} for greeks/OI/IV
+    """
+
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+
+    api_key, base_url, _provider = _polygon_key_and_base()
+    if not api_key:
+        return None
+
+    underlying = _map_underlying_for_options(sym)
+
+    # Process-wide guard for Polygon options HTTP calls.
+    # Without this, bursts of /oi or /pcr across users can exceed plan limits quickly.
+    global _POLYGON_OPTIONS_HTTP_SEM
+    try:
+        _POLYGON_OPTIONS_HTTP_SEM  # type: ignore[name-defined]
+    except Exception:
+        _POLYGON_OPTIONS_HTTP_SEM = asyncio.Semaphore(max(int(os.getenv("TNT_MAX_POLYGON_OPTIONS_HTTP", "12")), 1))
+
+    # Determine expiration date (default: today ET).
+    now_et = _now_et()
+    exp = (expiration_ymd or now_et.date().isoformat())[:10]
+
+    # Get an approximate underlying price to bound strikes.
+    try:
+        price_snap = _get_last_price_snapshot(sym)
+        underlying_px = float(price_snap.px) if price_snap and price_snap.px is not None else None
+    except Exception:  # noqa: BLE001
+        underlying_px = None
+
+    strike_min = None
+    strike_max = None
+    if isinstance(underlying_px, (int, float)) and underlying_px and underlying_px > 0:
+        window = max(float(strike_window_pct), 0.0)
+        strike_min = underlying_px * (1.0 - window)
+        strike_max = underlying_px * (1.0 + window)
+
+    async def _get_json(session: aiohttp.ClientSession, path: str, params: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+        url = f"{base_url}{path}"
+        query = dict(params or {})
+        query["apiKey"] = api_key
+        await _POLYGON_OPTIONS_HTTP_SEM.acquire()
+        try:
+            async with _OPTIONS_HTTP_LOCK:
+                global _OPTIONS_HTTP_ACTIVE, _OPTIONS_HTTP_PEAK
+                _OPTIONS_HTTP_ACTIVE += 1
+                if _OPTIONS_HTTP_ACTIVE > _OPTIONS_HTTP_PEAK:
+                    _OPTIONS_HTTP_PEAK = _OPTIONS_HTTP_ACTIVE
+            async with session.get(url, params=query) as resp:
+                if resp.status != 200:
+                    return None
+                return await resp.json()
+        finally:
+            try:
+                async with _OPTIONS_HTTP_LOCK:
+                    _OPTIONS_HTTP_ACTIVE = max(0, int(_OPTIONS_HTTP_ACTIVE) - 1)
+            except Exception:
+                pass
+            try:
+                _POLYGON_OPTIONS_HTTP_SEM.release()
+            except Exception:
+                pass
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        params: dict[str, Any] = {
+            "underlying_ticker": underlying,
+            "expiration_date": exp,
+            "limit": int(max_contracts),
+        }
+        if strike_min is not None and strike_max is not None:
+            # Polygon expects strike_price.gte / strike_price.lte
+            params["strike_price.gte"] = f"{strike_min:.6f}"
+            params["strike_price.lte"] = f"{strike_max:.6f}"
+
+        contracts = await _get_json(session, "/v3/reference/options/contracts", params=params)
+        if not contracts or contracts.get("status") != "OK":
+            return None
+        results = contracts.get("results") or []
+        if not isinstance(results, list) or not results:
+            return None
+
+        tickers: list[dict[str, Any]] = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            ticker = str(item.get("ticker") or "").strip()
+            if not ticker:
+                continue
+            tickers.append(item)
+
+        if not tickers:
+            return None
+
+        sem = asyncio.Semaphore(max(int(concurrency), 1))
+        rows: list[dict[str, Any]] = []
+
+        async def _one(contract: dict[str, Any]) -> None:
+            ticker = str(contract.get("ticker") or "").strip()
+            if not ticker:
+                return
+            async with sem:
+                snap = await _get_json(session, f"/v3/snapshot/options/{underlying}/{ticker}")
+            if not snap or snap.get("status") != "OK":
+                return
+            res = snap.get("results") if isinstance(snap.get("results"), dict) else {}
+            greeks = res.get("greeks") if isinstance(res.get("greeks"), dict) else {}
+            under = res.get("underlying_asset") if isinstance(res.get("underlying_asset"), dict) else {}
+            day = res.get("day") if isinstance(res.get("day"), dict) else {}
+            prev_day = res.get("prev_day")
+            if not isinstance(prev_day, dict):
+                prev_day = res.get("prevDay")
+            prev_day = prev_day if isinstance(prev_day, dict) else {}
+
+            rows.append(
+                {
+                    "symbol": ticker,
+                    "strike": contract.get("strike_price"),
+                    "type": str(contract.get("contract_type") or "").lower(),
+                    "expiration": exp,
+                    "bid": day.get("bid"),
+                    "ask": day.get("ask"),
+                    "last": day.get("close"),
+                    "volume": day.get("volume"),
+                    "prev_volume": prev_day.get("volume"),
+                    "open_interest": res.get("open_interest"),
+                    "iv": res.get("implied_volatility"),
+                    "delta": greeks.get("delta"),
+                    "gamma": greeks.get("gamma"),
+                    "theta": greeks.get("theta"),
+                    "vega": greeks.get("vega"),
+                    "underlying_price": under.get("price"),
+                }
+            )
+
+        await asyncio.gather(*[_one(c) for c in tickers])
+
+    if not rows:
+        return None
+    return pd.DataFrame(rows)
+
+
+def _render_meta(render: RenderedPost) -> dict[str, Any]:
+    if not isinstance(render, RenderedPost):  # pragma: no cover - defensive
+        return {}
+    payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+    meta = payload.get("meta") if isinstance(payload, dict) else {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _render_is_limited(render: RenderedPost) -> bool:
+    meta = _render_meta(render)
+    missing = meta.get("missing_sections")
+    if isinstance(missing, (list, tuple)) and missing:
+        return True
+    if bool(meta.get("stand_down")):
+        return True
+    return False
+
+
+def _get_cached_analyze(symbol: str) -> Optional[_AnalyzeCacheEntry]:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+
+    entry = _ANALYZE_CACHE.get(sym)
+    if not entry:
+        return None
+
+    if _ANALYZE_CACHE_TTL_SEC > 0:
+        now = time_lib.time()
+        if now - entry.ts > _ANALYZE_CACHE_TTL_SEC:
+            _ANALYZE_CACHE.pop(sym, None)
+            return None
+    return entry
+
+
+def _set_cached_analyze(symbol: str, render: RenderedPost, *, ts: Optional[float] = None) -> None:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return
+
+    existing = _ANALYZE_CACHE.get(sym)
+    if existing and _render_is_limited(render) and not _render_is_limited(existing.render):
+        timestamp = float(ts) if ts is not None else time_lib.time()
+        existing.ts = timestamp
+        return
+
+    timestamp = float(ts) if ts is not None else time_lib.time()
+    _ANALYZE_CACHE[sym] = _AnalyzeCacheEntry(render=render, ts=timestamp)
+
+    if _ANALYZE_CACHE_MAX <= 0 or len(_ANALYZE_CACHE) <= _ANALYZE_CACHE_MAX:
+        return
+
+    # Drop the stalest entries first to bound memory.
+    while len(_ANALYZE_CACHE) > _ANALYZE_CACHE_MAX:
+        oldest_key = min(_ANALYZE_CACHE.items(), key=lambda item: item[1].ts)[0]
+        _ANALYZE_CACHE.pop(oldest_key, None)
+
+
+def _db_last_close(symbol: str, tf: str = "1m") -> tuple[Optional[float], Optional[datetime]]:
+    sym = (symbol or "").upper()
+    if not sym:
+        return None, None
+
+    db_path = Path(os.getenv("DB_PATH", "db/tnt.db"))
+    if not db_path.exists():
+        return None, None
+
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT close, ts
+                FROM prices
+                WHERE symbol = ? AND tf = ?
+                ORDER BY ts DESC
+                LIMIT 1
+                """,
+                (sym, tf),
+            )
+            row = cur.fetchone()
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    if not row:
+        return None, None
+
+    close, ts_raw = row
+    try:
+        price = float(close)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    ts_et: Optional[datetime]
+    if ts_raw is None:
+        ts_et = None
+    else:
+        try:
+            ts_et = parse_iso(str(ts_raw)).astimezone(ET)
+        except Exception:  # noqa: BLE001
+            ts_et = None
+
+    return price, ts_et
+
+
+def _fetch_polygon_snapshot_last_trade(sym: str) -> tuple[Optional[float], Optional[datetime]]:
+    try:
+        price, ts_iso, source = fetch_live_price(sym)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    # Accept any Polygon-derived price that has a timestamp.
+    # `fetch_live_price()` may fall back to aggs(1m).c or prevDay.c when `lastTrade` is missing
+    # (common when markets are closed), and we still want a useful last price.
+    if price is None or not ts_iso:
+        return None, None
+
+    try:
+        ts = parse_iso(ts_iso).astimezone(ET)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    try:
+        return float(price), ts
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _fetch_db_latest_1m_close(sym: str) -> tuple[Optional[float], Optional[datetime]]:
+    return _db_last_close(sym, "1m")
+
+
+def _fetch_db_latest_1d_close(sym: str) -> tuple[Optional[float], Optional[datetime]]:
+    return _db_last_close(sym, "1d")
+
+
+def _fetch_cached_analyze_price(sym: str) -> tuple[Optional[float], Optional[datetime]]:
+    cached = _get_cached_analyze(sym)
+    if not cached:
+        return None, None
+
+    last_price = _extract_last_price_from_bullets(cached.render.text)
+    if last_price is None:
+        return None, None
+
+    try:
+        ts = datetime.fromtimestamp(cached.ts, tz=timezone.utc).astimezone(ET)
+    except Exception:  # noqa: BLE001
+        ts = None
+
+    try:
+        price = float(last_price)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    return price, ts
+
+
+_LAST_PRICE_PROVIDER: Optional[Callable[[str], PriceSnapshot]] = None
+
+
+def _set_last_price_provider(provider: Optional[Callable[[str], PriceSnapshot]]) -> None:
+    global _LAST_PRICE_PROVIDER
+    _LAST_PRICE_PROVIDER = provider
+
+
+def _resolve_last_price(symbol: str, *, now_et: Optional[datetime] = None) -> PriceSnapshot:
+    now_local = now_et or _now_et()
+    return resolve_last_price_policy(
+        symbol,
+        now_et=now_local,
+        fetch_polygon_snapshot_last_trade=_fetch_polygon_snapshot_last_trade,
+        fetch_db_latest_1m_close=_fetch_db_latest_1m_close,
+        fetch_db_latest_1d_close=_fetch_db_latest_1d_close,
+        fetch_cached_analyze_price=_fetch_cached_analyze_price,
+        allow_stale_when_closed=True,
+        open_max_age_min=int(os.getenv("PRICE_MAX_AGE_OPEN_MIN", "10") or "10"),
+        closed_max_age_days=int(os.getenv("PRICE_MAX_AGE_CLOSED_DAYS", "7") or "7"),
+    )
+
+
+def _default_last_price_provider(symbol: str) -> PriceSnapshot:
+    return _resolve_last_price(symbol)
+
+
+def _get_last_price_snapshot(symbol: str) -> PriceSnapshot:
+    provider = _LAST_PRICE_PROVIDER or _default_last_price_provider
+    try:
+        result = provider(symbol)
+    except Exception:  # noqa: BLE001
+        return _resolve_last_price(symbol)
+    if not isinstance(result, PriceSnapshot):
+        return _resolve_last_price(symbol)
+    return result
+
+
+async def _fetch_on_demand_render(symbol: str, *, allow_cache: bool) -> tuple[RenderedPost, bool]:
+    sym = (symbol or "").strip().upper()
+    now = time_lib.time()
+    if allow_cache and sym:
+        cached = _get_cached_analyze(sym)
+        if cached:
+            return cached.render, True
+
+    render = await asyncio.to_thread(build_on_demand_analyze_render, symbol)
+    if sym:
+        _set_cached_analyze(sym, render, ts=now)
+    return render, False
+
+
+def _format_last_price_section(
+    symbols: Sequence[str],
+    *,
+    now_et: datetime,
+    session: str,
+    tf: str = "1m",
+) -> str:
+    def _session_state(session_code: str) -> str:
+        mapping = {
+            "RTH": "OPEN",
+            "PRE": "CLOSED_PRE",
+            "AH": "CLOSED_AFTER",
+            "WEEKEND": "CLOSED_WEEKEND",
+        }
+        return mapping.get((session_code or "").upper(), "UNKNOWN")
+
+    def _source_detail(source: str) -> str:
+        return {
+            "polygon_snapshot_lastTrade": "live snapshot",
+            "db_1m_close": "last 1m close",
+            "db_1d_close": "last daily close",
+            "cached_analyze": "cached analyze",
+            "none": "unavailable",
+        }.get(source, source or "unknown")
+
+    snapshots: list[tuple[str, PriceSnapshot]] = []
+    for raw_sym in symbols:
+        norm = str(raw_sym).upper() if raw_sym else "UNKNOWN"
+        snapshots.append((norm, _get_last_price_snapshot(norm)))
+
+    fallback_state = _session_state(session)
+    primary = None
+    for _, snap in snapshots:
+        if snap.ok:
+            primary = snap
+            break
+    if primary is None and snapshots:
+        primary = snapshots[0][1]
+
+    state_label = market_state_label(primary.market_state if primary else fallback_state)
+    detail = _source_detail(primary.source if primary else "none")
+    if primary and not primary.ok and primary.reason:
+        detail = f"{detail}; {primary.reason.replace('_', ' ')}"
+
+    lines: list[str] = [f"🧾 Data Mode: {state_label} ({detail})", "💵 **Last Price**"]
+
+    for sym, snapshot in snapshots or [("UNKNOWN", PriceSnapshot("UNKNOWN", None, None, "none", fallback_state, None, False, "no_symbol"))]:
+        if snapshot.price is None or snapshot.asof_et is None:
+            reason = snapshot.reason or "price unavailable"
+            lines.append(f"• {sym}: n/a ({reason.replace('_', ' ')})")
+            continue
+
+        block = format_last_price_block(snapshot)
+        parts = block.splitlines()
+        bullet_lines = parts[1:] if len(parts) > 1 else [parts[0]]
+        for entry in bullet_lines:
+            if entry.strip():
+                lines.append(entry)
+
+    return "\n".join(lines) + "\n"
+
+
+# --- Intraday compact helpers (keep under 900 chars) ---
+
+
+def _format_last_price_oneliner(
+    symbol_list: list[str],
+    *,
+    last_prices: dict[str, float | None],
+    stale_flags: dict[str, bool] | None = None,
+) -> str:
+    """Return a collapsed last-price summary for intraday updates."""
+
+    stale_flags = stale_flags or {}
+    parts: list[str] = []
+    for sym in symbol_list:
+        px = last_prices.get(sym)
+        if px is None:
+            continue
+        try:
+            parts.append(f"{sym} {float(px):.2f}")
+        except Exception:  # noqa: BLE001
+            continue
+
+    if not parts:
+        return "💵 Last Price: n/a"
+
+    line = "💵 Last Price: " + " | ".join(parts)
+    if any(stale_flags.get(sym, False) for sym in symbol_list):
+        line += " (stale)"
+    return line
+
+
+def _format_levels_oneliner(
+    *,
+    spy_levels: dict[str, float | None],
+    qqq_levels: dict[str, float | None] | None = None,
+    max_len: int = 900,
+    current_len: int = 0,
+) -> str:
+    """Render key levels on a single line, appending QQQ only if there is room."""
+
+    def _fmt_triplet(prefix: str, lv: dict[str, float | None]) -> str:
+        p_val = lv.get("P")
+        r1_val = lv.get("R1")
+        s1_val = lv.get("S1")
+
+        def _fmt(x: float | None) -> str:
+            try:
+                return f"{float(x):.2f}" if x is not None else "n/a"
+            except Exception:  # noqa: BLE001
+                return "n/a"
+
+        if p_val is None and r1_val is None and s1_val is None:
+            return f"{prefix} n/a"
+        return f"{prefix} P {_fmt(p_val)} / R1 {_fmt(r1_val)} / S1 {_fmt(s1_val)}"
+
+    line = f"📐 Key Levels: {_fmt_triplet('SPY', spy_levels)}"
+    if qqq_levels:
+        candidate = f"{line} | {_fmt_triplet('QQQ', qqq_levels)}"
+        if current_len + len(candidate) <= max_len:
+            return candidate
+    return line
+
+
+def _load_smart_market_iq() -> Dict[str, Any]:
+    """Load market participation snapshot without throwing."""
+    try:
+        if not SMART_MARKET_IQ_PATH.exists():
+            return {"data_quality": "MISSING", "regime": "UNKNOWN"}
+        raw = SMART_MARKET_IQ_PATH.read_text(encoding="utf-8")
+        if not raw.strip():
+            return {"data_quality": "MISSING", "regime": "UNKNOWN"}
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return {"data_quality": "MISSING", "regime": "UNKNOWN"}
+        return data
+    except Exception:  # noqa: BLE001 - downstream logic handles missing data
+        return {"data_quality": "MISSING", "regime": "UNKNOWN"}
+
+
+def _resolve_market_participation(
+    bias: Optional[str],
+    edge: Optional[float],
+) -> tuple[Dict[str, Any], ParticipationGateResult]:
+    smiq = _load_smart_market_iq()
+    regime = (smiq.get("regime") or "UNKNOWN") if isinstance(smiq, dict) else "UNKNOWN"
+    quality = (smiq.get("data_quality") or "UNKNOWN") if isinstance(smiq, dict) else "UNKNOWN"
+    pg = apply_participation_gate(
+        bias=bias,
+        model_edge=edge,
+        participation_regime=str(regime).strip().upper(),
+        participation_quality=str(quality).strip().upper(),
+    )
+    return smiq, pg
+
+
+def _summarize_participation_caution(bias: Optional[str], pg: ParticipationGateResult) -> str:
+    return "Breadth mixed; confirm bias before adds."
+
+
+def _summarize_participation_conflict(pg: ParticipationGateResult) -> str:
+    regime = getattr(pg, "regime", "UNKNOWN")
+    if regime == "DEFENSIVE":
+        return "Market participation conflict: defensive leadership vs bias."
+    if regime == "RISK_ON":
+        return "Market participation conflict: risk-on leadership vs bias."
+    return "Market participation conflict: leadership flow vs bias."
+
+
+def _gate_result_to_dict(pg: ParticipationGateResult) -> Dict[str, Any]:
+    if hasattr(pg, "to_dict") and callable(getattr(pg, "to_dict")):
+        try:
+            return pg.to_dict()  # type: ignore[return-value]
+        except Exception:  # noqa: BLE001 - fall back to attribute unpack below
+            pass
+    return {
+        "regime": getattr(pg, "regime", "UNKNOWN"),
+        "state": getattr(pg, "state", "UNKNOWN"),
+        "impact": getattr(pg, "impact", "UNKNOWN"),
+        "reason": getattr(pg, "reason", ""),
+        "authority": getattr(pg, "authority", "market_participation_gate"),
+        "data_quality": getattr(pg, "data_quality", "UNKNOWN"),
+    }
+
+
+def _format_participation_section(smiq: Dict[str, Any], pg: Dict[str, Any]) -> str:
+    regime = (smiq.get("regime") or "UNKNOWN") if isinstance(smiq, dict) else "UNKNOWN"
+    quality = (smiq.get("data_quality") or "UNKNOWN") if isinstance(smiq, dict) else "UNKNOWN"
+    gainers = smiq.get("top_gainers") if isinstance(smiq, dict) else None
+    losers = smiq.get("top_losers") if isinstance(smiq, dict) else None
+    gainers_fmt = ", ".join(str(t).upper() for t in (gainers or [])[:5]) if gainers else "n/a"
+    losers_fmt = ", ".join(str(t).upper() for t in (losers or [])[:5]) if losers else "n/a"
+
+    impact = (pg.get("impact") if isinstance(pg, dict) else "UNKNOWN") or "UNKNOWN"
+    state = (pg.get("state") if isinstance(pg, dict) else "UNKNOWN") or "UNKNOWN"
+
+    gate_label = str(impact).strip().upper()
+    if state and str(state).strip().upper() not in {"", "UNKNOWN"}:
+        gate_label = f"{gate_label}"
+
+    note = None
+    if impact in ("CAUTION", "STAND_DOWN"):
+        note = (pg.get("reason", "n/a") if isinstance(pg, dict) else "n/a")
+
+    lines = [
+        "📊 Market Participation (TNT)",
+        f"• Regime: **{regime}** | Quality: **{quality}** | Gate: **{gate_label}**",
+        f"• Leaders: {gainers_fmt}",
+        f"• Laggards: {losers_fmt}",
+        f"• Notes: {note or 'n/a'}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def vix_sqqq_confirmation_from_dirs(vix_dir: Optional[str], sqqq_dir: Optional[str]) -> str:
     """
     vix_dir / sqqq_dir expected: "up" / "down" / None
     """
@@ -119,6 +1368,369 @@ def vix_sqqq_confirmation(vix_dir: Optional[str], sqqq_dir: Optional[str]) -> st
     if v in ("up", "down") and q in ("up", "down"):
         return "MIXED"
     return "UNKNOWN"
+
+
+def _clamp01(x: float) -> float:
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
+def _pct_distance(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    """Percent distance between a and b, relative to a (in percent)."""
+
+    if a is None or b is None:
+        return None
+    denom = abs(a)
+    if denom <= 1e-9:
+        return None
+    return (abs(a - b) / denom) * 100.0
+
+
+def tnt_flip_triggers(payload: Mapping[str, Any]) -> Dict[str, str]:
+    """Return flip trigger lines (Bull/Bear/Neutral) based on pivots + confirmation."""
+
+    pivot = _coerce_float(payload.get("pivot"))
+    s1 = _coerce_float(payload.get("s1"))
+    confirm = str(payload.get("bias_confirm") or "UNKNOWN").upper().strip()
+
+    p_txt = fmt_money(pivot) if pivot is not None else "Pivot"
+    s1_txt = fmt_money(s1) if s1 is not None else "S1"
+
+    bull_confirm = "confirmation turns OK" if confirm != "BULLISH" else "confirmation OK"
+    bear_confirm = "confirmation turns OK" if confirm != "BEARISH" else "confirmation OK"
+
+    return {
+        "bull": f"Bull: reclaim + hold above {p_txt} AND {bull_confirm}",
+        "bear": f"Bear: break + hold below {s1_txt} AND {bear_confirm}",
+        "neutral": "If still NEUTRAL/UNKNOWN: wait",
+    }
+
+
+def tnt_why_payload(payload: Mapping[str, Any], gate: Optional[Mapping[str, Any]] = None) -> Dict[str, object]:
+    """Extract the 3–5 most important inputs that drove the TNT decision."""
+
+    tnt = payload.get("tnt") if isinstance(payload.get("tnt"), dict) else {}
+
+    confirm = str(payload.get("bias_confirm") or "UNKNOWN").upper().strip()
+    vix_trend = str(payload.get("vix_trend") or "unknown")
+    sqqq_dir = str(payload.get("sqqq_dir") or "unknown")
+
+    edge = _coerce_float(payload.get("edge"))
+    conviction = str(payload.get("conviction") or "UNKNOWN").upper().strip()
+
+    pct_to_pivot = tnt.get("pct_to_pivot")
+    pct_txt = "n/a"
+    if isinstance(pct_to_pivot, (int, float)):
+        pct_txt = f"{float(pct_to_pivot):.2f}%"
+
+    tech_state = None
+    dq = payload.get("data_quality") if isinstance(payload.get("data_quality"), dict) else None
+    if isinstance(dq, dict):
+        ts = dq.get("technical_state")
+        if isinstance(ts, str) and ts:
+            tech_state = ts.upper()
+    if tech_state is None:
+        tech_state = "UNKNOWN"
+
+    gate_mode = None
+    gate_reason = None
+    if isinstance(gate, Mapping):
+        gate_mode = str(gate.get("mode") or "").upper().strip() or None
+        gate_reason = str(gate.get("reason") or "").strip() or None
+    if not gate_mode:
+        gate_mode = str(payload.get("gate_mode") or "").upper().strip() or "UNKNOWN"
+    if not gate_reason:
+        gate_reason = str(payload.get("gate_reason") or "").strip() or "n/a"
+
+    edge_txt = "n/a" if edge is None else f"{edge:.3f}"
+
+    return {
+        "confirmation": {"state": confirm, "vix_trend": vix_trend, "sqqq_dir": sqqq_dir},
+        "distance_to_pivot": pct_txt,
+        "edge": edge_txt,
+        "conviction": conviction,
+        "vix_gate": {"mode": gate_mode, "reason": gate_reason},
+        "freshness": tech_state,
+        "tnt_reasons": list(tnt.get("reasons") or []),
+    }
+
+
+def tnt_no_trade_checklist(payload: Optional[Mapping[str, Any]] = None) -> str:
+    """Short checklist used when regime blocks trades/playbooks."""
+
+    flips = None
+    if payload is not None:
+        try:
+            flips = tnt_flip_triggers(payload)
+        except Exception:  # noqa: BLE001
+            flips = None
+
+    lines: list[str] = []
+    lines.append("🛑 **No-Trade Checklist (TNT)**")
+    lines.append("• Wait for confirmation to align (VIX + SQQQ)")
+    lines.append("• Stop trading the first spike — require break + retest")
+    lines.append("• Reduce size if near pivot / chop")
+    lines.append("• Do nothing during macro event windows")
+    if flips:
+        lines.append("")
+        lines.append("Flip Triggers:")
+        lines.append(f"• {flips.get('bull')}")
+        lines.append(f"• {flips.get('bear')}")
+        lines.append(f"• {flips.get('neutral')}")
+    lines.append("_Not financial advice._")
+    return "\n".join(lines)
+
+
+_last_regime_audit_ts: Dict[str, int] = {}
+
+
+def _maybe_append_regime_audit(payload: Mapping[str, Any], *, now_et: datetime) -> None:
+    """Opt-in jsonl logging for future regime scoring/marketing."""
+
+    if os.getenv("REGIME_AUDIT_ENABLED", "0").strip().lower() in {"0", "false", "off", "no"}:
+        return
+
+    sym = str(payload.get("symbol") or payload.get("display_symbol") or "").upper().strip()
+    if not sym:
+        sym = str(payload.get("trade_context_symbol") or "").upper().strip()
+    if not sym:
+        # fall back: do not log without a symbol
+        return
+
+    # Throttle per symbol (default 5m)
+    throttle_sec = _env_int("REGIME_AUDIT_THROTTLE_SEC", "300")
+    now_ts = int(now_et.timestamp())
+    last = _last_regime_audit_ts.get(sym)
+    if last is not None and (now_ts - last) < throttle_sec:
+        return
+    _last_regime_audit_ts[sym] = now_ts
+
+    tnt = payload.get("tnt") if isinstance(payload.get("tnt"), dict) else {}
+
+    row = {
+        "ts_et": now_et.isoformat(),
+        "symbol": sym,
+        "tnt_regime": tnt.get("regime"),
+        "tnt_posture": tnt.get("posture"),
+        "tnt_confidence": tnt.get("confidence"),
+        "pct_to_pivot": tnt.get("pct_to_pivot"),
+        "bias": payload.get("bias"),
+        "bias_confirm": payload.get("bias_confirm"),
+        "edge": payload.get("edge"),
+        "conviction": payload.get("conviction"),
+        "vix_trend": payload.get("vix_trend"),
+        "sqqq_dir": payload.get("sqqq_dir"),
+        "vix_level": payload.get("vix_level"),
+        "gate_mode": payload.get("gate_mode"),
+        "price": payload.get("last_price"),
+        "pivot": payload.get("pivot"),
+        "s1": payload.get("s1"),
+        "r1": payload.get("r1"),
+        "technical_state": (payload.get("data_quality") or {}).get("technical_state") if isinstance(payload.get("data_quality"), dict) else None,
+    }
+
+    try:
+        log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "regime_audit.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        return
+
+
+def tnt_regime_assess(payload: Mapping[str, Any], *, now_et: Optional[datetime] = None) -> Dict[str, object]:
+    """Rule-based TNT regime classifier used for automation + on-demand analysis.
+
+    Output is stable, deterministic, and derived only from the payload.
+    """
+
+    # Inputs (best-effort)
+    bias = str(payload.get("bias") or "NEUTRAL").upper().strip()
+    confirm = str(payload.get("bias_confirm") or "UNKNOWN").upper().strip()
+    session = str(payload.get("session") or "UNKNOWN").upper().strip()
+
+    price = None
+    try:
+        if isinstance(payload.get("last_price"), (int, float)):
+            price = float(payload["last_price"])
+    except Exception:  # noqa: BLE001
+        price = None
+
+    pivot = None
+    try:
+        if isinstance(payload.get("pivot"), (int, float)):
+            pivot = float(payload["pivot"])
+    except Exception:  # noqa: BLE001
+        pivot = None
+
+    edge = None
+    try:
+        if isinstance(payload.get("edge"), (int, float)):
+            edge = float(payload["edge"])
+    except Exception:  # noqa: BLE001
+        edge = None
+
+    macro_risk = payload.get("macro_risk")
+    macro_flag = bool(macro_risk)
+
+    # Derived
+    pct_to_pivot = _pct_distance(price, pivot)
+    near_pivot = (pct_to_pivot is not None) and (pct_to_pivot <= 0.15)
+
+    tech_state = None
+    dq = payload.get("data_quality") if isinstance(payload.get("data_quality"), dict) else None
+    if isinstance(dq, dict):
+        ts = dq.get("technical_state")
+        if isinstance(ts, str) and ts:
+            tech_state = ts.upper()
+    if tech_state is None:
+        tech_state = "UNKNOWN"
+
+    confirm_aligned = False
+    if bias == "BULL" and confirm == "BULLISH":
+        confirm_aligned = True
+    elif bias == "BEAR" and confirm == "BEARISH":
+        confirm_aligned = True
+
+    edge_strong = (edge is not None) and (edge >= 0.065)
+    edge_ok = (edge is not None) and (edge >= 0.055)
+
+    reasons: list[str] = []
+    if macro_flag:
+        reasons.append("macro window risk")
+    if confirm in {"UNKNOWN", "NEUTRAL"}:
+        reasons.append(f"confirmation={confirm}")
+    if near_pivot:
+        reasons.append("near pivot")
+    if pct_to_pivot is not None:
+        reasons.append(f"pivot_dist={pct_to_pivot:.2f}%")
+    if tech_state == "STALE":
+        reasons.append("data stale")
+    if edge is None:
+        reasons.append("edge unavailable")
+    elif edge_strong:
+        reasons.append("edge strong")
+    elif edge_ok:
+        reasons.append("edge ok")
+    else:
+        reasons.append("edge weak")
+
+    # Regime classification
+    regime: str
+    if macro_flag:
+        regime = "DO_NOTHING"
+    elif session in {"WEEKEND", "CLOSED"}:
+        regime = "DO_NOTHING"
+    elif confirm_aligned and edge_strong and (not near_pivot):
+        regime = "TREND"
+    elif near_pivot and confirm in {"UNKNOWN", "NEUTRAL"}:
+        regime = "RANGE"
+    else:
+        regime = "TRANSITION"
+
+    # Posture + permissions
+    if regime == "TREND":
+        posture = "STANDARD"
+        permissions = {
+            "trend_continuation": "ALLOW",
+            "pullbacks": "ALLOW",
+            "breakouts": "ALLOW",
+            "mean_reversion": "AVOID",
+            "countertrend": "AVOID",
+            "size": "STANDARD",
+        }
+    elif regime == "RANGE":
+        posture = "REDUCED"
+        permissions = {
+            "trend_continuation": "AVOID",
+            "pullbacks": "AVOID",
+            "breakouts": "AVOID",
+            "mean_reversion": "ALLOW",
+            "countertrend": "AVOID",
+            "size": "SMALL",
+        }
+    elif regime == "TRANSITION":
+        posture = "REDUCED"
+        permissions = {
+            "trend_continuation": "AVOID",
+            "pullbacks": "ALLOW",
+            "breakouts": "AVOID",
+            "mean_reversion": "AVOID",
+            "countertrend": "AVOID",
+            "size": "SMALL",
+        }
+    else:  # DO_NOTHING
+        posture = "STAND_DOWN"
+        permissions = {
+            "trend_continuation": "AVOID",
+            "pullbacks": "AVOID",
+            "breakouts": "AVOID",
+            "mean_reversion": "AVOID",
+            "countertrend": "AVOID",
+            "size": "NONE",
+        }
+
+    confidence = 0.50
+    if confirm_aligned:
+        confidence += 0.20
+    if edge_strong:
+        confidence += 0.15
+    elif edge_ok:
+        confidence += 0.05
+    if near_pivot:
+        confidence -= 0.10
+    if tech_state == "STALE":
+        confidence -= 0.20
+    if macro_flag:
+        confidence -= 0.25
+    confidence = _clamp01(confidence)
+
+    if now_et is not None:
+        try:
+            ts_iso = now_et.isoformat()
+        except Exception:  # noqa: BLE001
+            ts_iso = None
+    else:
+        ts_iso = None
+
+    return {
+        "regime": regime,
+        "posture": posture,
+        "permissions": permissions,
+        "reasons": reasons,
+        "confidence": confidence,
+        "pct_to_pivot": pct_to_pivot,
+        "confirm_aligned": confirm_aligned,
+        "asof_et": ts_iso,
+    }
+
+
+def tnt_regime_gate(payload: Mapping[str, Any], *, output_mode: str) -> tuple[bool, str]:
+    """Return (ok, reason) for autopost/analyze execution."""
+
+    mode = (output_mode or "strict").strip().lower()
+    if mode not in {"strict", "insights"}:
+        mode = "strict"
+
+    tnt_ctx = payload.get("tnt") if isinstance(payload.get("tnt"), dict) else None
+    if not tnt_ctx:
+        # Fail-open for missing TNT fields; legacy behavior.
+        return True, "tnt gate unavailable"
+
+    regime = str(tnt_ctx.get("regime") or "UNKNOWN").upper()
+    posture = str(tnt_ctx.get("posture") or "UNKNOWN").upper()
+
+    if regime == "DO_NOTHING" or posture == "STAND_DOWN":
+        return False, "TNT gate: STAND DOWN"
+
+    if regime == "TRANSITION" and mode == "strict":
+        return False, "TNT gate: TRANSITION (strict -> wait/reduce)"
+
+    return True, "OK"
 
 
 def fmt_last_price(symbol: str, last_price: Optional[float], ts_utc: Optional[str], tf: str = "1m") -> str:
@@ -215,7 +1827,7 @@ def _coerce_ai_string(value: Optional[object], *, max_len: int = 240) -> str:
     S1 = _f(piv.get("S1"))
     S2 = _f(piv.get("S2"))
 
-    confirm = vix_sqqq_confirmation(vix_dir, sqqq_dir)
+    confirm = vix_sqqq_confirmation_from_dirs(vix_dir, sqqq_dir)
 
     regime = detect_regime(price_f, P, R1, R2, S1, S2)
     d_pivot = _delta(price_f, P) if P is not None else None
@@ -275,21 +1887,35 @@ def _coerce_ai_string(value: Optional[object], *, max_len: int = 240) -> str:
     return "\n".join(msg)
 
 import discord
+from discord import app_commands
 import httpx
 import requests
 from discord.ext import commands
 from dotenv import load_dotenv
-from openai import OpenAI
 from zoneinfo import ZoneInfo
 
+from delivery.state_builder import build_tnt_state as build_canonical_tnt_state
+from delivery.tnt_llm import call_tnt_agent_async
+
 from delivery.on_demand_data import (
+    build_on_demand_analyze_render,
     fetch_live_price,
     is_fresh as data_is_fresh,
     symbol_supported_polygon,
 )
 from scripts import polygon_ingest
 
-load_dotenv()
+from zero_dte_pipeline.tech import build_agent_tech_package
+
+# NOTE: Keep tests deterministic. Golden/smoke tests should not change based on a
+# developer's local .env/.env.local.
+if "pytest" not in sys.modules:
+    for _env_path in (Path.cwd() / ".env.local", Path.cwd() / ".env"):
+        try:
+            if _env_path.exists():
+                load_dotenv(_env_path, override=False)
+        except Exception:  # noqa: BLE001
+            pass
 
 def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default) == "1"
@@ -308,12 +1934,1451 @@ def _env_float(name: str, default: str) -> float:
     except Exception:
         return float(default)
 
+def _positive_env_float(name: str, default: str) -> float:
+    try:
+        value = float(os.getenv(name, default))
+    except Exception:
+        value = float(default)
+    return value if value > 0 else float(default)
+
 
 QUALITY_GATE_ENABLED = os.getenv("QUALITY_GATE_ENABLED", "1") == "1"
 QUALITY_GATE_STRICT = os.getenv("QUALITY_GATE_STRICT", "1") == "1"
 QUALITY_GATE_FALLBACK_ENABLED = os.getenv("QUALITY_GATE_FALLBACK_ENABLED", "1") == "1"
 QUALITY_GATE_LOG_FAILS = os.getenv("QUALITY_GATE_LOG_FAILS", "1") == "1"
 QUALITY_GATE_DEBUG = os.getenv("DEBUG_GATE", "0") == "1"
+
+STRICT_CONTRACTS = os.getenv("STRICT_CONTRACTS", "1") == "1"
+DEV_ALLOW_VIOLATIONS = os.getenv("TNT_DEV_ALLOW_VIOLATIONS", "0") == "1"
+AUTOPOST_AUDIT_ROOT = Path(os.getenv("AUTOPOST_AUDIT_ROOT", str(Path("logs") / "autopost_audit")))
+AUTOPOST_CONTRACT_CONSTRAINTS = ContractConstraints(
+    max_lines=DEFAULT_MAX_LINES,
+    max_emoji=DEFAULT_MAX_EMOJI,
+    max_chars_default=DEFAULT_MAX_CHARS_DEFAULT,
+    max_chars_by_payload=dict(DEFAULT_MAX_CHARS_BY_PAYLOAD),
+    forbidden_technical_terms=INSIGHTS_TECHNICAL_TERMS,
+)
+
+ASK_AUDIT_ROOT = AUTOPOST_AUDIT_ROOT / "ask"
+
+AUTOPOST_AUDIT_RETENTION_DAYS = int(os.getenv("AUTOPOST_AUDIT_RETENTION_DAYS", "60") or "60")
+
+PRICE_STALE_LIMIT_RTH = _positive_env_float("PRICE_STALE_LIMIT_RTH", "5")
+PRICE_STALE_LIMIT_AH = _positive_env_float("PRICE_STALE_LIMIT_AH", "180")
+
+_GIT_SHA_CACHE: Optional[str] = None
+_LAST_AUDIT_PRUNE: Optional[date] = None
+
+
+class ContractViolationError(RuntimeError):
+    def __init__(self, label: str, violations: Sequence[str]):
+        self.label = label
+        self.violations = list(violations)
+        message = f"{label} contract violations: {', '.join(self.violations[:5])}"
+        super().__init__(message)
+
+
+def _git_sha() -> str:
+    global _GIT_SHA_CACHE
+    if _GIT_SHA_CACHE is not None:
+        return _GIT_SHA_CACHE
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        _GIT_SHA_CACHE = result.stdout.strip() or "unknown"
+    except Exception:
+        _GIT_SHA_CACHE = "unknown"
+    return _GIT_SHA_CACHE
+
+
+def _render_data_quality(render: RenderedPost) -> Optional[Any]:
+    payload = render.agent_payload
+    if not isinstance(payload, dict):
+        return None
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        return meta.get("data_quality")
+    return None
+
+
+def _render_meta(render: RenderedPost) -> Dict[str, Any]:
+    payload = render.agent_payload
+    if isinstance(payload, dict):
+        meta = payload.get("meta")
+        if isinstance(meta, dict):
+            return meta
+    return {}
+
+
+def _symbol_list_from_render(render: RenderedPost) -> list[str]:
+    meta = _render_meta(render)
+    symbols = meta.get("symbols")
+    if isinstance(symbols, (list, tuple)):
+        return [str(sym).upper() for sym in symbols if sym]
+    return []
+
+
+def _scenario_flags(render: RenderedPost) -> Dict[str, Any]:
+    meta = _render_meta(render)
+    flags: Dict[str, Any] = {}
+    if "stand_down" in meta:
+        flags["stand_down"] = bool(meta.get("stand_down"))
+    futures_status = meta.get("futures_status")
+    if isinstance(futures_status, str) and futures_status:
+        flags["futures_status"] = futures_status
+    dq = meta.get("data_quality")
+    if isinstance(dq, dict):
+        tech_state = dq.get("technical_state")
+        if isinstance(tech_state, str) and tech_state:
+            flags["tech_status"] = tech_state
+        price_state = dq.get("price")
+        if isinstance(price_state, str) and price_state:
+            flags["price_status"] = price_state
+    manual_flags = meta.get("scenario_flags")
+    if isinstance(manual_flags, dict):
+        for key, value in manual_flags.items():
+            if isinstance(value, bool):
+                if value:
+                    flags[key] = True
+            elif value is not None:
+                flags[key] = value
+    return flags
+
+
+def _prune_autopost_audit(asof_et: datetime) -> None:
+    global _LAST_AUDIT_PRUNE
+    if AUTOPOST_AUDIT_RETENTION_DAYS <= 0:
+        return
+
+    today = asof_et.date()
+    if _LAST_AUDIT_PRUNE == today:
+        return
+
+    AUTOPOST_AUDIT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    cutoff = today - timedelta(days=AUTOPOST_AUDIT_RETENTION_DAYS)
+    for child in AUTOPOST_AUDIT_ROOT.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            child_date = datetime.strptime(child.name, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if child_date < cutoff:
+            try:
+                shutil.rmtree(child)
+            except Exception:
+                pass
+
+    _LAST_AUDIT_PRUNE = today
+
+
+def _contract_violations_for_render(render: RenderedPost, *, label: str) -> list[str]:
+    violations = contract_violations(
+        render.text,
+        label=label,
+        context=render.agent_payload,
+        constraints=AUTOPOST_CONTRACT_CONSTRAINTS,
+    )
+
+    t = (render.text or "").lower()
+    if label in {"focus_list", "intraday_update"}:
+        if "smart market iq" in t:
+            violations.append("LEGACY_SECTION:SMART_MARKET_IQ")
+        if "options focus" in t:
+            violations.append("LEGACY_SECTION:OPTIONS_FOCUS")
+        if "iqfeed" in t:
+            violations.append("LEGACY_VENDOR:IQFEED")
+        if FOOTER_DISCLAIMER.lower() not in t:
+            violations.append("MISSING_FOOTER_DISCLAIMER")
+
+    if label == "intraday_update":
+        if "🚦 permissions" not in t and "permissions:" not in t:
+            violations.append("MISSING_PERMISSIONS_LINE")
+
+    if label == "focus_list":
+        if re.search(r"\b\d{2,6}\s*[cCpP]\b", render.text or ""):
+            violations.append("FORBIDDEN_TEXT:OPTIONS_CONTRACT_PATTERN")
+
+    return violations
+
+
+PREFLIGHT_INTEGRITY_STANDDOWN_TEXT = (
+    "Data integrity conflict detected (price/levels mismatch). TNT is in stand-down mode."
+)
+
+
+class PublishQueuedError(RuntimeError):
+    def __init__(self, *, wait_seconds: float, due_ts: float, key: str):
+        super().__init__(f"Queued for next window in ~{wait_seconds:.1f}s")
+        self.wait_seconds = float(wait_seconds)
+        self.due_ts = float(due_ts)
+        self.key = str(key)
+
+
+# --- Go-live cadence / rate limits (v1 defaults) ---
+_RATE_LABEL_MIN_SEC = float(os.getenv("TNT_RATE_LABEL_MIN_SEC", "300") or "300")
+_RATE_POSTURE_SYMBOL_MIN_SEC = float(os.getenv("TNT_RATE_POSTURE_SYMBOL_MIN_SEC", "1800") or "1800")
+_RATE_CHARTS_MAX_PER_HOUR = int(os.getenv("TNT_RATE_CHARTS_MAX_PER_HOUR", "12") or "12")
+_RATE_USER_CHART_MIN_SEC = float(os.getenv("TNT_RATE_USER_CHART_MIN_SEC", "600") or "600")
+_RATE_USER_TEXT_MIN_SEC = float(os.getenv("TNT_RATE_USER_TEXT_MIN_SEC", "20") or "20")
+_RATE_QUEUE_ENABLED = (os.getenv("TNT_RATE_QUEUE_ENABLED", "1") == "1")
+
+_OPS_CHANNEL_ID = int(os.getenv("TNT_OPS_CHANNEL_ID", "0") or "0") or int(os.getenv("BOT_ALERT_CHANNEL_ID", "0") or "0")
+
+_OPS_NOTICE_MIN_SEC = float(os.getenv("TNT_OPS_NOTICE_MIN_SEC", "900") or "900")
+_OPS_NOTICE_QUEUE_MIN_SEC = float(os.getenv("TNT_OPS_NOTICE_QUEUE_MIN_SEC", "900") or "900")
+_OPS_NOTICE_STALE_MIN_SEC = float(os.getenv("TNT_OPS_NOTICE_STALE_MIN_SEC", "900") or "900")
+
+_OPS_NOTICE_LOCK: "asyncio.Lock" = asyncio.Lock()
+_OPS_LAST_NOTICE_TS: dict[str, float] = {}
+
+_PUBLISH_RATE_LOCK: "asyncio.Lock" = asyncio.Lock()
+
+_LAST_BY_LABEL: dict[str, float] = {}
+_LAST_POSTURE_BY_SYMBOL: dict[str, float] = {}
+_CHART_SEND_TS: "deque[float]" = deque()
+_LAST_USER_CHART_TS: dict[int, float] = {}
+_LAST_USER_TEXT_TS: dict[int, float] = {}
+
+
+@dataclass
+class _QueuedPublish:
+    due_ts: float
+    created_ts: float
+    key: str
+    coro_factory: Any
+    # For observability only
+    label: str
+    symbol: str
+
+
+_QUEUE_HEAP: list[tuple[float, int, _QueuedPublish]] = []
+_QUEUE_BY_KEY: dict[str, _QueuedPublish] = {}
+_QUEUE_SEQ: int = 0
+_QUEUE_TASK: Optional[asyncio.Task] = None
+
+
+def _now_ts() -> float:
+    return float(time_lib.time())
+
+
+def _rate_group(label: str, request_kind: str) -> str:
+    kind = (request_kind or "").strip().lower()
+    label_norm = (label or "").strip().lower() or "unknown"
+    if kind == "on_demand_chart":
+        # Group by label so different commands/symbols don't block each other.
+        return f"on_demand_chart:{label_norm}"
+    if kind == "on_demand_text":
+        # Group by label so different commands/symbols don't block each other.
+        return f"on_demand_text:{label_norm}"
+    return label_norm
+
+
+def _looks_like_chart(render: "RenderedPost") -> bool:
+    payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+    if isinstance(payload.get("chart_spec"), dict) or isinstance(payload.get("chart"), dict):
+        return True
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    return bool(meta.get("chart"))
+
+
+def _is_posture_chart(label: str, render: "RenderedPost", request_kind: str) -> bool:
+    kind = (request_kind or "").strip().lower()
+    if kind == "on_demand_chart":
+        return True
+    return (label or "").strip().lower() in {"focus_list", "intraday_update"} or _looks_like_chart(render)
+
+
+def _compute_rate_wait_seconds(
+    *,
+    label: str,
+    symbol: str,
+    render: "RenderedPost",
+    requester_id: Optional[int],
+    request_kind: str,
+) -> tuple[float, list[str]]:
+    now = _now_ts()
+    reasons: list[str] = []
+    wait = 0.0
+
+    group = _rate_group(label, request_kind)
+    label_norm = (label or "").strip().lower() or "unknown"
+    kind_norm = (request_kind or "").strip().lower()
+
+    # Let /ask be responsive: don't apply the global label_min_interval to on-demand coach answers.
+    # Per-user text cooldown still applies via _RATE_USER_TEXT_MIN_SEC.
+    if not (kind_norm == "on_demand_text" and label_norm == "ask"):
+        last_label = _LAST_BY_LABEL.get(group)
+        if last_label is not None and _RATE_LABEL_MIN_SEC > 0:
+            delta = now - last_label
+            if delta < _RATE_LABEL_MIN_SEC:
+                wait = max(wait, _RATE_LABEL_MIN_SEC - delta)
+                reasons.append(f"label_min_interval:{int(_RATE_LABEL_MIN_SEC)}s")
+
+    is_posture = _is_posture_chart(label, render, request_kind)
+    sym = (symbol or "").strip().upper()
+    if is_posture and sym and _RATE_POSTURE_SYMBOL_MIN_SEC > 0:
+        last_sym = _LAST_POSTURE_BY_SYMBOL.get(sym)
+        if last_sym is not None:
+            delta = now - last_sym
+            if delta < _RATE_POSTURE_SYMBOL_MIN_SEC:
+                wait = max(wait, _RATE_POSTURE_SYMBOL_MIN_SEC - delta)
+                reasons.append(f"symbol_posture_min_interval:{int(_RATE_POSTURE_SYMBOL_MIN_SEC)}s")
+
+    is_chart = _looks_like_chart(render) or (request_kind or "").strip().lower() == "on_demand_chart" or is_posture
+    if is_chart and _RATE_CHARTS_MAX_PER_HOUR > 0:
+        cutoff = now - 3600.0
+        while _CHART_SEND_TS and _CHART_SEND_TS[0] < cutoff:
+            _CHART_SEND_TS.popleft()
+        if len(_CHART_SEND_TS) >= _RATE_CHARTS_MAX_PER_HOUR:
+            oldest = _CHART_SEND_TS[0]
+            wait = max(wait, (oldest + 3600.0) - now)
+            reasons.append(f"charts_global_max_per_hour:{_RATE_CHARTS_MAX_PER_HOUR}")
+
+    if requester_id is not None:
+        uid = int(requester_id)
+        kind = (request_kind or "").strip().lower()
+        if kind == "on_demand_chart" and _RATE_USER_CHART_MIN_SEC > 0:
+            last_u = _LAST_USER_CHART_TS.get(uid)
+            if last_u is not None:
+                delta = now - last_u
+                if delta < _RATE_USER_CHART_MIN_SEC:
+                    wait = max(wait, _RATE_USER_CHART_MIN_SEC - delta)
+                    reasons.append(f"user_chart_min_interval:{int(_RATE_USER_CHART_MIN_SEC)}s")
+        if kind == "on_demand_text" and _RATE_USER_TEXT_MIN_SEC > 0:
+            last_t = _LAST_USER_TEXT_TS.get(uid)
+            if last_t is not None:
+                delta = now - last_t
+                if delta < _RATE_USER_TEXT_MIN_SEC:
+                    wait = max(wait, _RATE_USER_TEXT_MIN_SEC - delta)
+                    reasons.append(f"user_text_min_interval:{int(_RATE_USER_TEXT_MIN_SEC)}s")
+
+    return max(0.0, float(wait)), reasons
+
+
+def _mark_rate_usage(*, label: str, symbol: str, render: "RenderedPost", requester_id: Optional[int], request_kind: str) -> None:
+    now = _now_ts()
+    group = _rate_group(label, request_kind)
+    _LAST_BY_LABEL[group] = now
+
+    if _is_posture_chart(label, render, request_kind):
+        sym = (symbol or "").strip().upper()
+        if sym:
+            _LAST_POSTURE_BY_SYMBOL[sym] = now
+
+    is_chart = _looks_like_chart(render) or (request_kind or "").strip().lower() == "on_demand_chart" or _is_posture_chart(label, render, request_kind)
+    if is_chart:
+        _CHART_SEND_TS.append(now)
+
+    if requester_id is not None:
+        uid = int(requester_id)
+        kind = (request_kind or "").strip().lower()
+        if kind == "on_demand_chart":
+            _LAST_USER_CHART_TS[uid] = now
+        elif kind == "on_demand_text":
+            _LAST_USER_TEXT_TS[uid] = now
+
+
+async def _notify_ops_quiet(*, client: Optional[object], message: str) -> None:
+    if not message:
+        return
+    channel_id = int(_OPS_CHANNEL_ID or 0)
+    if not channel_id or client is None:
+        return
+    try:
+        ch = client.get_channel(channel_id)
+        if ch is None:
+            return
+        await ch.send(message[:1800])
+    except Exception:
+        return
+
+
+async def _notify_ops_throttled(*, client: Optional[object], key: str, message: str, min_sec: float) -> None:
+    if not message:
+        return
+    if min_sec <= 0:
+        await _notify_ops_quiet(client=client, message=message)
+        return
+    k = (key or "").strip().lower()
+    if not k:
+        await _notify_ops_quiet(client=client, message=message)
+        return
+
+    now = _now_ts()
+    async with _OPS_NOTICE_LOCK:
+        last = _OPS_LAST_NOTICE_TS.get(k)
+        if last is not None and (now - last) < float(min_sec):
+            return
+        _OPS_LAST_NOTICE_TS[k] = now
+
+    await _notify_ops_quiet(client=client, message=message)
+
+
+def _ops_contract_versions(contracts: object) -> tuple[Optional[str], Optional[str]]:
+    if not isinstance(contracts, dict):
+        return None, None
+    agent_v = contracts.get("agent")
+    chart_v = contracts.get("chart")
+    agent_s = str(agent_v) if agent_v is not None else None
+    chart_s = str(chart_v) if chart_v is not None else None
+    return agent_s, chart_s
+
+
+def _ops_short_hash(value: Optional[str], *, max_len: int = 12) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    return v[:max_len]
+
+
+def _ops_relpath(path: Optional[Path]) -> str:
+    if path is None:
+        return "n/a"
+    try:
+        root = Path(__file__).resolve().parents[1]
+        return path.resolve().relative_to(root).as_posix()
+    except Exception:
+        try:
+            return path.as_posix()
+        except Exception:
+            return str(path)
+
+
+def _extract_tnt_hashes_from_payload(agent_payload: object) -> tuple[Optional[str], Optional[str]]:
+    if not isinstance(agent_payload, dict):
+        return None, None
+    pkt = agent_payload.get("analysis_packet") or agent_payload.get("trade_context_packet")
+    if not isinstance(pkt, dict):
+        return None, None
+    prompt_sha = pkt.get("tnt_prompt_sha256")
+    state_sha = pkt.get("tnt_state_sha256")
+    return (
+        _ops_short_hash(prompt_sha),
+        _ops_short_hash(state_sha),
+    )
+
+
+def _format_ops_event(
+    *,
+    tag: str,
+    label: str,
+    symbols: Sequence[str],
+    status: str,
+    contracts: Optional[dict] = None,
+    prompt_sha256: Optional[str] = None,
+    tnt_state_sha256: Optional[str] = None,
+    violations: Optional[Sequence[str]] = None,
+    audit_path: Optional[Path] = None,
+) -> str:
+    sym_csv = ",".join([s for s in (symbols or []) if isinstance(s, str) and s.strip()][:8]) or "n/a"
+    agent_v, chart_v = _ops_contract_versions(contracts)
+    parts: list[str] = []
+    parts.append(f"[{tag}] label={label or 'n/a'} symbols={sym_csv} status={status or 'n/a'}")
+    if agent_v:
+        parts.append(f"v(agent)={agent_v}")
+    if chart_v:
+        parts.append(f"v(chart)={chart_v}")
+    p_sha = _ops_short_hash(prompt_sha256)
+    s_sha = _ops_short_hash(tnt_state_sha256)
+    if p_sha:
+        parts.append(f"prompt={p_sha}")
+    if s_sha:
+        parts.append(f"state={s_sha}")
+    if violations:
+        v = [str(x) for x in violations if x][:3]
+        if v:
+            parts.append("violations=" + ", ".join(v))
+    parts.append(f"audit={_ops_relpath(audit_path)}")
+    return " ".join(parts)[:1800]
+
+
+def _queue_key(*, label: str, symbol: str, request_kind: str) -> str:
+    group = _rate_group(label, request_kind)
+    sym = (symbol or "").strip().upper() or ""
+    kind = (request_kind or "").strip().lower()
+    return f"{kind}:{group}:{sym}"
+
+
+def start_burst_queue_loop() -> None:
+    global _QUEUE_TASK
+    if _QUEUE_TASK is not None and not _QUEUE_TASK.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _QUEUE_TASK = loop.create_task(_burst_queue_pump())
+
+
+async def _burst_queue_pump() -> None:
+    # Periodically attempt to flush queued publishes.
+    while True:
+        try:
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            return
+
+        now = _now_ts()
+        item: Optional[_QueuedPublish] = None
+        seq = None
+
+        async with _PUBLISH_RATE_LOCK:
+            while _QUEUE_HEAP:
+                due_ts, seq_val, candidate = _QUEUE_HEAP[0]
+                if due_ts > now:
+                    candidate = None
+                    break
+                heapq.heappop(_QUEUE_HEAP)
+                # Skip stale/replaced entries
+                current = _QUEUE_BY_KEY.get(candidate.key)
+                if current is None or current is not candidate:
+                    continue
+                item = candidate
+                seq = seq_val
+                del _QUEUE_BY_KEY[candidate.key]
+                break
+
+        if item is None:
+            continue
+
+        try:
+            await item.coro_factory()
+        except Exception:
+            # If it still fails, drop it silently; audit/ops will capture failures.
+            continue
+
+
+def _preflight_text_violations(text: str) -> list[str]:
+    if not text:
+        return []
+
+    raw = text
+    t = raw.lower()
+    v: list[str] = []
+
+    # Substring checks for multi-word / headings / vendor.
+    forbidden_substrings: tuple[str, ...] = (
+        "iqfeed",
+        "smart market iq",
+        "options focus",
+        "take profit",
+        "best strike",
+        "best expiration",
+        "best expiry",
+    )
+    for s in forbidden_substrings:
+        if s and s in t:
+            v.append(f"FORBIDDEN_TEXT:{s}")
+
+    # Word-boundary checks to avoid false positives like "buyers" containing "buy".
+    forbidden_words: tuple[str, ...] = (
+        # execution
+        "buy",
+        "sell",
+        "entry",
+        "enter",
+        "exit",
+        "target",
+        "stop",
+        "tp",
+        "sl",
+        "long",
+        "short",
+        # options contract language
+        "call",
+        "put",
+        "strike",
+        "expiry",
+        "expiration",
+        "0dte",
+        "dte",
+    )
+    for w in forbidden_words:
+        if not w:
+            continue
+        if re.search(rf"\\b{re.escape(w)}\\b", raw, flags=re.IGNORECASE):
+            v.append(f"FORBIDDEN_TEXT:{w}")
+
+    # catches "4800c", "420p", "190 C", "190c"
+    forbidden_contract_re = re.compile(r"\\b(\\d{2,6})\\s*([cCpP])\\b")
+    if forbidden_contract_re.search(raw):
+        v.append("FORBIDDEN_TEXT:OPTIONS_CONTRACT_PATTERN")
+
+    return v
+
+
+def _extract_chart_spec_from_context(context: object) -> Optional[Mapping[str, Any]]:
+    if not isinstance(context, Mapping):
+        return None
+    direct = context.get("chart_spec")
+    if isinstance(direct, Mapping):
+        return direct
+    sections = context.get("sections")
+    if isinstance(sections, Mapping):
+        candidate = sections.get("chart_spec")
+        if isinstance(candidate, Mapping):
+            return candidate
+    return None
+
+
+def _preflight_chart_spec_violations(context: object) -> list[str]:
+    if not isinstance(context, Mapping):
+        return []
+
+    chart = context.get("chart_spec")
+    if not isinstance(chart, Mapping):
+        chart = context.get("chart")
+    if not isinstance(chart, Mapping):
+        # ok: not every post has a chart
+        return []
+
+    # Keep the base contract check (structure) and add strict v1 whitelist validation.
+    base_ok, base_msg = validate_chart_spec(chart)
+    violations: list[str] = []
+    if not base_ok:
+        violations.append(f"CHART_SPEC:BASE_CONTRACT:{base_msg}")
+
+    allowed_labels_by_template: dict[str, set[str]] = {
+        "DECISION_ZONE": {
+            "Support zone",
+            "Resistance zone",
+            "Pivot",
+            "Bullish posture permitted only above acceptance",
+            "Bearish posture permitted only below breakdown",
+            "Neutral posture inside range",
+        },
+        "NO_TRADE_COMPRESSION": {
+            "No-trade zone",
+            "Stand down (low expectancy)",
+            "Momentum required",
+        },
+        "MOMENTUM_ACCEPTANCE": {
+            "Acceptance band",
+            "Wait for acceptance",
+            "Aggression prohibited",
+            "Momentum required",
+            "Support zone",
+            "Resistance zone",
+        },
+        "EVENT_RISK_OVERLAY": {
+            "Event risk: structure unreliable",
+            "Reduced participation",
+            "Stand down (low expectancy)",
+            "Bullish posture permitted only above acceptance",
+            "Bearish posture permitted only below breakdown",
+        },
+        "POST_EVENT_REENGAGEMENT": {
+            "Wait for acceptance",
+            "Reduced participation",
+            "Support zone",
+            "Resistance zone",
+            "Bullish posture permitted only above acceptance",
+            "Bearish posture permitted only below breakdown",
+        },
+    }
+
+    template_required_fields: dict[str, list[str]] = {
+        "DECISION_ZONE": ["timeframe", "zones", "gates"],
+        "NO_TRADE_COMPRESSION": ["timeframe", "no_trade_box", "breakout_triggers"],
+        "MOMENTUM_ACCEPTANCE": ["timeframe", "acceptance_band"],
+        "EVENT_RISK_OVERLAY": ["timeframe", "event", "gates", "behavior_banner"],
+        "POST_EVENT_REENGAGEMENT": ["timeframe", "event_marker", "post_event_structure", "gates"],
+    }
+
+    hard_caps = {
+        "max_lines": 5,
+        "max_zones": 3,
+        "max_labels": 8,
+        "max_gates": 2,
+    }
+
+    forbidden_label_tokens: tuple[str, ...] = (
+        "buy",
+        "sell",
+        "long",
+        "short",
+        "entry",
+        "enter",
+        "exit",
+        "target",
+        "stop",
+        "take profit",
+        "tp",
+        "sl",
+        "call",
+        "put",
+        "strike",
+        "expiry",
+        "expiration",
+        "0dte",
+        "dte",
+        "p&l",
+        "profit",
+        "gain",
+        "win",
+        "loss",
+        "guarantee",
+        "rsi",
+        "macd",
+        "ema",
+        "sma",
+        "vwap",
+        "bollinger",
+        "stochastic",
+    )
+
+    contract_re = re.compile(r"\\b(\\d{2,6})\\s*([cCpP])\\b")
+
+    template = chart.get("template")
+    if template not in allowed_labels_by_template:
+        violations.append("CHART_SPEC:UNKNOWN_TEMPLATE")
+        return violations
+
+    for f in template_required_fields.get(str(template), []):
+        if f not in chart or chart.get(f) in (None, "", []):
+            violations.append(f"CHART_SPEC:MISSING_FIELD:{f}")
+
+    labels: list[str] = []
+
+    def _collect_label(x: object) -> None:
+        if isinstance(x, Mapping):
+            lab = x.get("label")
+            if isinstance(lab, str) and lab.strip():
+                labels.append(lab.strip())
+
+    for z in (chart.get("zones") or []) if isinstance(chart.get("zones"), list) else []:
+        _collect_label(z)
+
+    gates = chart.get("gates") or {}
+    if isinstance(gates, Mapping):
+        for g in gates.values():
+            _collect_label(g)
+
+    _collect_label(chart.get("no_trade_box") or {})
+    for trg in (chart.get("breakout_triggers") or []) if isinstance(chart.get("breakout_triggers"), list) else []:
+        _collect_label(trg)
+    _collect_label(chart.get("acceptance_band") or {})
+    _collect_label(chart.get("event") or {})
+    _collect_label(chart.get("event_marker") or {})
+    for s in (chart.get("post_event_structure") or []) if isinstance(chart.get("post_event_structure"), list) else []:
+        _collect_label(s)
+    for s in (chart.get("structure") or []) if isinstance(chart.get("structure"), list) else []:
+        _collect_label(s)
+    for p in (chart.get("prohibitions") or []) if isinstance(chart.get("prohibitions"), list) else []:
+        _collect_label(p)
+
+    if len(labels) > hard_caps["max_labels"]:
+        violations.append("CHART_SPEC:TOO_MANY_LABELS")
+
+    allowed = allowed_labels_by_template[str(template)]
+    for lab in labels:
+        low = lab.lower()
+
+        if contract_re.search(lab):
+            violations.append("CHART_SPEC:FORBIDDEN_OPTIONS_CONTRACT_PATTERN")
+
+        for tok in forbidden_label_tokens:
+            if tok and tok in low:
+                violations.append(f"CHART_SPEC:FORBIDDEN_LABEL_TOKEN:{tok}")
+
+        if lab not in allowed:
+            violations.append(f"CHART_SPEC:INVALID_LABEL:{lab}")
+
+    if isinstance(gates, Mapping) and len(gates) > hard_caps["max_gates"]:
+        violations.append("CHART_SPEC:TOO_MANY_GATES")
+
+    zone_count = 0
+    if isinstance(chart.get("zones"), list):
+        zone_count += len(chart.get("zones") or [])
+    if chart.get("no_trade_box"):
+        zone_count += 1
+    if chart.get("acceptance_band"):
+        zone_count += 1
+    if isinstance(chart.get("post_event_structure"), list):
+        zone_count += len(chart.get("post_event_structure") or [])
+    if zone_count > hard_caps["max_zones"]:
+        violations.append("CHART_SPEC:TOO_MANY_ZONES")
+
+    line_count = 0
+    if isinstance(gates, Mapping):
+        line_count += len(gates)
+    if isinstance(chart.get("optional_lines"), list):
+        line_count += len(chart.get("optional_lines") or [])
+    if isinstance(chart.get("breakout_triggers"), list):
+        line_count += len(chart.get("breakout_triggers") or [])
+    if line_count > hard_caps["max_lines"]:
+        violations.append("CHART_SPEC:TOO_MANY_LINES")
+
+    if template == "MOMENTUM_ACCEPTANCE":
+        if ("Wait for acceptance" not in labels) and ("Aggression prohibited" not in labels):
+            violations.append("CHART_SPEC:MOMENTUM_ACCEPTANCE_MISSING_DIRECTIVE")
+
+    return violations
+
+
+def _preflight_price_levels_conflict(symbols: Sequence[str]) -> tuple[bool, str]:
+    """Detect symbol/scale mismatch between last price and pivot levels."""
+
+    for sym in [str(s).upper() for s in (symbols or []) if s]:
+        snap = _get_last_price_snapshot(sym)
+        last_px = getattr(snap, "px", None)
+        dp = get_latest_daily_pivots(sym)
+        pivot = None
+        if dp and isinstance(dp.get("piv"), dict):
+            pivot = dp["piv"].get("P")
+
+        try:
+            lp = float(last_px) if last_px is not None else None
+            pv = float(pivot) if pivot is not None else None
+        except Exception:  # noqa: BLE001
+            lp, pv = None, None
+
+        if lp is None or pv is None or lp <= 0 or pv <= 0:
+            continue
+
+        rel = abs(lp - pv) / max(lp, pv)
+        if rel > 0.20 and abs(lp - pv) > 10.0:
+            detail = f"{sym} last={lp:.2f} pivot={pv:.2f}"
+            return True, detail
+
+    return False, "ok"
+
+
+def _build_contract_violation_fallback(label: str, violations: Sequence[str]) -> str:
+    lines = [
+        "⚠️ **AutoPost Stand-Down — Data Incomplete**",
+        f"Contract: {AUTOPOST_CONTRACT_VERSION} | Builder: {label}",
+        "",
+        "Blocked because:",
+    ]
+    for reason in violations[:3]:
+        lines.append(f"• {reason}")
+    if len(violations) > 3:
+        lines.append(f"• (+{len(violations) - 3} more)")
+    lines.extend(
+        [
+            "",
+            "No automated briefing will publish until inputs refresh.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _write_autopost_audit(
+    *,
+    render: RenderedPost,
+    builder: str,
+    label: str,
+    channel,
+    asof_et: datetime,
+    status: str,
+    symbol: str,
+    context_mode: str,
+    context_output_mode: str,
+    violations: Sequence[str],
+    message_id: Optional[int] = None,
+    latency_ms: Optional[float] = None,
+    fallback_text: Optional[str] = None,
+) -> Path:
+    _prune_autopost_audit(asof_et)
+    channel_id = getattr(channel, "id", "unknown")
+    try:
+        channel_str = str(int(channel_id))
+    except Exception:
+        channel_str = str(channel_id)
+    asof_token = asof_et.strftime("%H%M%S")
+    text_hash = hashlib.sha1(render.text.encode("utf-8", "ignore")).hexdigest()[:10]
+    date_dir = AUTOPOST_AUDIT_ROOT / asof_et.strftime("%Y-%m-%d")
+    filename = f"{label}_{channel_str}_{asof_token}_{text_hash}.json"
+    date_dir.mkdir(parents=True, exist_ok=True)
+    symbol_list = _symbol_list_from_render(render)
+    scenario_flags = _scenario_flags(render)
+    latency_value = round(latency_ms, 2) if latency_ms is not None else None
+    data_quality = _render_data_quality(render)
+    metadata: Dict[str, Any] = {
+        "symbol_list": symbol_list,
+        "scenario_flags": scenario_flags,
+        "data_quality": data_quality,
+    }
+
+    contracts = {
+        "agent": AUTOPOST_CONTRACT_VERSION,
+        "chart": "1.0",
+    }
+    metadata["contracts"] = contracts
+    msg_id_serialized: Optional[int]
+    try:
+        msg_id_serialized = int(message_id) if message_id is not None else None
+    except Exception:
+        msg_id_serialized = None
+    agent_payload = render.agent_payload
+    if isinstance(agent_payload, dict):
+        agent_payload = dict(agent_payload)
+        meta_dict = agent_payload.get("meta")
+        if not isinstance(meta_dict, dict):
+            meta_dict = {}
+        meta_dict = dict(meta_dict)
+        meta_dict.setdefault("contracts", contracts)
+        agent_payload["meta"] = meta_dict
+
+        # Optional: propagate deterministic TNT_STATE hash into audit metadata.
+        pkt = agent_payload.get("analysis_packet") or agent_payload.get("trade_context_packet")
+        if isinstance(pkt, dict):
+            tnt_sha = pkt.get("tnt_state_sha256")
+            if isinstance(tnt_sha, str) and tnt_sha.strip():
+                metadata["tnt_state_sha256"] = tnt_sha.strip()
+            prompt_sha = pkt.get("tnt_prompt_sha256")
+            if isinstance(prompt_sha, str) and prompt_sha.strip():
+                metadata["tnt_prompt_sha256"] = prompt_sha.strip()
+
+    payload: Dict[str, Any] = {
+        "builder": builder,
+        "post_type": label,
+        "channel": {
+            "id": channel_id,
+            "name": getattr(channel, "name", None),
+        },
+        "channel_id": channel_str,
+        "message_id": msg_id_serialized,
+        "symbol": symbol,
+        "symbol_list": symbol_list,
+        "trade_context_mode": context_mode,
+        "trade_context_output_mode": context_output_mode,
+        "asof_et": asof_et.isoformat(),
+        "git_sha": _git_sha(),
+        "contract_version": AUTOPOST_CONTRACT_VERSION,
+        "strict_contracts": STRICT_CONTRACTS,
+        "status": status,
+        "violations": list(violations),
+        "data_quality": data_quality,
+        "scenario_flags": scenario_flags,
+        "latency_ms": latency_value,
+        "short_hash": text_hash,
+        "text": render.text,
+        "agent_payload": agent_payload,
+        "metadata": metadata,
+    }
+    # Legacy fields retained temporarily for downstream compatibility.
+    payload["analysis_mode"] = context_mode
+    payload["output_mode"] = context_output_mode
+    if fallback_text is not None:
+        payload["fallback_text"] = fallback_text
+    audit_path = date_dir / filename
+    with audit_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    return audit_path
+
+
+def _write_ask_audit(
+    *,
+    question: str,
+    symbol: str,
+    status: str,
+    cache_hit: bool,
+    coach_text: str,
+    render: RenderedPost,
+    channel,
+    latency_ms: float,
+    message_id: Optional[int],
+) -> Path:
+    asof_et = _now_et()
+    ASK_AUDIT_ROOT.mkdir(parents=True, exist_ok=True)
+    date_dir = ASK_AUDIT_ROOT / asof_et.strftime("%Y-%m-%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        channel_id_raw = getattr(channel, "id", None)
+    except Exception:
+        channel_id_raw = None
+    try:
+        channel_id_int = int(channel_id_raw) if channel_id_raw is not None else None
+    except Exception:
+        channel_id_int = None
+
+    coach_hash = hashlib.sha1(coach_text.encode("utf-8", "ignore")).hexdigest()[:10]
+    analyze_hash = hashlib.sha1(render.text.encode("utf-8", "ignore")).hexdigest()[:10]
+    asof_token = asof_et.strftime("%H%M%S")
+    filename = f"ask_{symbol.upper()}_{asof_token}_{coach_hash}.json"
+    try:
+        message_id_value = int(message_id) if message_id is not None else None
+    except Exception:
+        message_id_value = message_id
+
+    payload: Dict[str, Any] = {
+        "command": "ask",
+        "question": question,
+        "symbol": symbol.upper(),
+        "status": status,
+        "cache_hit": cache_hit,
+        "latency_ms": round(float(latency_ms), 2),
+        "asof_et": asof_et.isoformat(),
+        "channel_id": channel_id_int,
+        "trade_context_short_hash": analyze_hash,
+        "trade_context_text": render.text,
+        "trade_context_payload": render.agent_payload,
+        "coach_short_hash": coach_hash,
+        "coach_text": coach_text,
+        "message_id": message_id_value,
+        "git_sha": _git_sha(),
+    }
+    payload["analysis_short_hash"] = analyze_hash
+    payload["analysis_text"] = render.text
+    payload["analysis_payload"] = render.agent_payload
+
+    # Optional: stable TNT_STATE fingerprint for replay.
+    try:
+        tnt_state = build_tnt_state_from_analysis_payload(payload.get("analysis_payload") or {}).state
+        payload["tnt_state_sha256"] = hashlib.sha256(
+            json.dumps(tnt_state, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    except Exception:  # noqa: BLE001
+        payload["tnt_state_sha256"] = None
+
+    audit_path = date_dir / filename
+    with audit_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+    return audit_path
+
+
+async def _publish_autopost_render(
+    channel,
+    render: RenderedPost,
+    *,
+    builder: str,
+    label: str,
+    symbol: str,
+    requester_id: Optional[int] = None,
+    request_kind: str = "autopost",
+    client: Optional[object] = None,
+    queue_mode: str = "silent",
+    _from_queue: bool = False,
+    context_mode: Optional[str] = None,
+    context_output_mode: Optional[str] = None,
+    strict_contracts: Optional[bool] = None,
+    allow_contract_violations: bool = False,
+    analysis_mode: Optional[str] = None,
+    output_mode: Optional[str] = None,
+) -> None:
+    start_ts = time_lib.perf_counter()
+    asof_et = _now_et()
+    if strict_contracts is None:
+        strict_contracts = STRICT_CONTRACTS
+
+    # Production-safe defaults: only allow relaxing contracts in explicit dev runs.
+    if strict_contracts is False and not DEV_ALLOW_VIOLATIONS:
+        strict_contracts = True
+    if allow_contract_violations and not DEV_ALLOW_VIOLATIONS:
+        allow_contract_violations = False
+
+    if context_mode is None:
+        context_mode = (analysis_mode or "db").strip().lower() if isinstance(analysis_mode, str) else "db"
+    if context_mode not in {"db", "on_demand"}:
+        context_mode = "db"
+
+    if context_output_mode is None:
+        context_output_mode = (output_mode or "strict").strip().lower() if isinstance(output_mode, str) else "strict"
+    if context_output_mode not in VALID_MODES:
+        context_output_mode = "strict"
+
+    # If channel is None (unit tests / dry-runs), do not apply cadence/queue.
+    if channel is not None:
+        # Kick off the queue pump when the publish choke-point is first used.
+        start_burst_queue_loop()
+
+    if not _from_queue and channel is not None:
+        async with _PUBLISH_RATE_LOCK:
+            wait_s, reasons = _compute_rate_wait_seconds(
+                label=label,
+                symbol=symbol,
+                render=render,
+                requester_id=requester_id,
+                request_kind=request_kind,
+            )
+            if wait_s > 0.001:
+                key = _queue_key(label=label, symbol=symbol, request_kind=request_kind)
+                due_ts = _now_ts() + wait_s
+                if _RATE_QUEUE_ENABLED:
+                    global _QUEUE_SEQ
+                    qp = _QueuedPublish(
+                        due_ts=due_ts,
+                        created_ts=_now_ts(),
+                        key=key,
+                        coro_factory=lambda: _publish_autopost_render(
+                            channel,
+                            render,
+                            builder=builder,
+                            label=label,
+                            symbol=symbol,
+                            requester_id=requester_id,
+                            request_kind=request_kind,
+                            client=client,
+                            queue_mode=queue_mode,
+                            _from_queue=True,
+                            context_mode=context_mode,
+                            context_output_mode=context_output_mode,
+                            strict_contracts=strict_contracts,
+                            allow_contract_violations=allow_contract_violations,
+                            analysis_mode=analysis_mode,
+                            output_mode=output_mode,
+                        ),
+                        label=label,
+                        symbol=symbol,
+                    )
+                    _QUEUE_SEQ += 1
+                    _QUEUE_BY_KEY[key] = qp
+                    heapq.heappush(_QUEUE_HEAP, (qp.due_ts, _QUEUE_SEQ, qp))
+
+                    audit_path: Optional[Path] = None
+
+                    try:
+                        elapsed_ms = (time_lib.perf_counter() - start_ts) * 1000.0
+                        audit_path = _write_autopost_audit(
+                            render=render,
+                            builder=builder,
+                            label=label,
+                            channel=channel,
+                            asof_et=asof_et,
+                            status="queued_rate_limit",
+                            symbol=symbol,
+                            context_mode=context_mode,
+                            context_output_mode=context_output_mode,
+                            violations=[f"RATE_LIMIT:{r}" for r in reasons] or ["RATE_LIMIT"],
+                            message_id=None,
+                            latency_ms=elapsed_ms,
+                            fallback_text=None,
+                        )
+                    except Exception:
+                        pass
+
+                    try:
+                        payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+                        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+                        contracts = meta.get("contracts") if isinstance(meta, dict) else None
+                        prompt_sha, state_sha = _extract_tnt_hashes_from_payload(payload)
+                        msg = _format_ops_event(
+                            tag="queued",
+                            label=label,
+                            symbols=_symbol_list_from_render(render) or ([symbol.upper()] if symbol else []),
+                            status="queued_rate_limit",
+                            contracts=contracts if isinstance(contracts, dict) else None,
+                            prompt_sha256=prompt_sha,
+                            tnt_state_sha256=state_sha,
+                            violations=[f"RATE_LIMIT:{r}" for r in reasons] or ["RATE_LIMIT"],
+                            audit_path=audit_path,
+                        )
+                        await _notify_ops_throttled(
+                            client=(client or bot),
+                            key=f"queued_rate_limit:{(label or 'n/a').strip().lower()}:{(symbol or 'n/a').strip().upper()}",
+                            message=msg,
+                            min_sec=_OPS_NOTICE_QUEUE_MIN_SEC,
+                        )
+                    except Exception:
+                        pass
+
+                    if (queue_mode or "").lower() == "raise":
+                        raise PublishQueuedError(wait_seconds=wait_s, due_ts=due_ts, key=key)
+                    return
+
+                if (queue_mode or "").lower() == "raise":
+                    raise PublishQueuedError(wait_seconds=wait_s, due_ts=due_ts, key=key)
+                return
+
+    symbols_for_preflight = _symbol_list_from_render(render) or ([symbol.upper()] if symbol else [])
+
+    integrity_conflict, integrity_detail = _preflight_price_levels_conflict(symbols_for_preflight)
+    if integrity_conflict:
+        # Non-negotiable: post only the mandated stand-down sentence.
+        stand_text = PREFLIGHT_INTEGRITY_STANDDOWN_TEXT
+        payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        meta = dict(meta)
+        meta.update(
+            {
+                "stand_down": True,
+                "stand_reason": stand_text,
+                "data_health": "DEGRADED",
+                "data_integrity_conflict": True,
+                "data_integrity_detail": integrity_detail,
+            }
+        )
+        new_payload = dict(payload)
+        new_payload["meta"] = meta
+        stand_render = RenderedPost(text=stand_text, agent_payload=new_payload)
+
+        status = "stand_down_integrity_posted"
+        message = None
+        audit_path = None
+        try:
+            message = await safe_send(
+                channel,
+                stand_render.text,
+                kind="status",
+                symbol=symbol,
+                pivots=None,
+                analysis_mode=context_mode,
+                output_mode=context_output_mode,
+                label=label,
+                files=stand_render.files,
+            )
+            _mark_rate_usage(
+                label=label,
+                symbol=symbol,
+                render=stand_render,
+                requester_id=requester_id,
+                request_kind=request_kind,
+            )
+        except Exception:
+            status = "stand_down_integrity_send_failed"
+            raise
+        finally:
+            elapsed_ms = (time_lib.perf_counter() - start_ts) * 1000.0
+            audit_path = _write_autopost_audit(
+                render=stand_render,
+                builder=builder,
+                label=label,
+                channel=channel,
+                asof_et=asof_et,
+                status=status,
+                symbol=symbol,
+                context_mode=context_mode,
+                context_output_mode=context_output_mode,
+                violations=["DATA_INTEGRITY_CONFLICT"],
+                message_id=getattr(message, "id", None),
+                latency_ms=elapsed_ms,
+                fallback_text=None,
+            )
+            contracts = (new_payload.get("meta") or {}).get("contracts") if isinstance(new_payload.get("meta"), dict) else None
+            contract_str = None
+            if isinstance(contracts, dict):
+                contract_str = ", ".join(f"{k}:{v}" for k, v in contracts.items())
+            ops_msg = (
+                _format_ops_event(
+                    tag="stand_down",
+                    label=label,
+                    symbols=symbols_for_preflight or ([symbol.upper()] if symbol else []),
+                    status="DATA_INTEGRITY_CONFLICT",
+                    contracts=contracts if isinstance(contracts, dict) else None,
+                    prompt_sha256=None,
+                    tnt_state_sha256=None,
+                    violations=["DATA_INTEGRITY_CONFLICT"],
+                    audit_path=audit_path,
+                )
+            )
+            await _notify_ops_quiet(client=(client or bot), message=ops_msg)
+        return
+
+    violations = []
+    violations.extend(_contract_violations_for_render(render, label=label))
+    violations.extend(_preflight_text_violations(render.text))
+    violations.extend(_preflight_chart_spec_violations(render.agent_payload))
+    # De-dup while preserving order
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for v in violations:
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        deduped.append(v)
+    violations = deduped
+    if violations:
+        if strict_contracts:
+            elapsed_ms = (time_lib.perf_counter() - start_ts) * 1000.0
+            audit_path = _write_autopost_audit(
+                render=render,
+                builder=builder,
+                label=label,
+                channel=channel,
+                asof_et=asof_et,
+                status="blocked",
+                symbol=symbol,
+                context_mode=context_mode,
+                context_output_mode=context_output_mode,
+                violations=violations,
+                message_id=None,
+                latency_ms=elapsed_ms,
+                fallback_text=None,
+            )
+            contracts = None
+            payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+            meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+            if isinstance(meta, dict):
+                contracts = meta.get("contracts")
+            contract_str = None
+            if isinstance(contracts, dict):
+                contract_str = ", ".join(f"{k}:{v}" for k, v in contracts.items())
+            ops_msg = (
+                _format_ops_event(
+                    tag="blocked",
+                    label=label,
+                    symbols=_symbol_list_from_render(render) or ([symbol.upper()] if symbol else []),
+                    status="blocked",
+                    contracts=contracts if isinstance(contracts, dict) else None,
+                    prompt_sha256=None,
+                    tnt_state_sha256=None,
+                    violations=violations,
+                    audit_path=audit_path,
+                )
+            )
+            await _notify_ops_quiet(client=(client or bot), message=ops_msg)
+            raise ContractViolationError(label, violations)
+
+        if allow_contract_violations:
+            status = "posted_with_violations"
+            message = None
+            try:
+                message = await safe_send(
+                    channel,
+                    render.text,
+                    kind="analysis",
+                    symbol=symbol,
+                    pivots=None,
+                    analysis_mode=context_mode,
+                    output_mode=context_output_mode,
+                    label=label,
+                    files=render.files,
+                )
+            except Exception:
+                status = "send_failed"
+                raise
+            finally:
+                elapsed_ms = (time_lib.perf_counter() - start_ts) * 1000.0
+                _write_autopost_audit(
+                    render=render,
+                    builder=builder,
+                    label=label,
+                    channel=channel,
+                    asof_et=asof_et,
+                    status=status,
+                    symbol=symbol,
+                    context_mode=context_mode,
+                    context_output_mode=context_output_mode,
+                    violations=violations,
+                    message_id=getattr(message, "id", None),
+                    latency_ms=elapsed_ms,
+                    fallback_text=None,
+                )
+            return
+
+        fallback_text = _build_contract_violation_fallback(label, violations)
+        status = "fallback_posted"
+        message = None
+        try:
+            message = await safe_send(
+                channel,
+                fallback_text,
+                kind="status",
+                symbol=symbol,
+                pivots=None,
+                analysis_mode=context_mode,
+                output_mode=context_output_mode,
+                label=label,
+                files=render.files,
+            )
+        except Exception:
+            status = "fallback_send_failed"
+            raise
+        finally:
+            elapsed_ms = (time_lib.perf_counter() - start_ts) * 1000.0
+            _write_autopost_audit(
+                render=render,
+                builder=builder,
+                label=label,
+                channel=channel,
+                asof_et=asof_et,
+                status=status,
+                symbol=symbol,
+                context_mode=context_mode,
+                context_output_mode=context_output_mode,
+                violations=violations,
+                message_id=getattr(message, "id", None),
+                latency_ms=elapsed_ms,
+                fallback_text=fallback_text,
+            )
+        return
+
+    status = "posted"
+    message = None
+    try:
+        message = await safe_send(
+            channel,
+            render.text,
+            kind="analysis",
+            symbol=symbol,
+            pivots=None,
+            analysis_mode=context_mode,
+            output_mode=context_output_mode,
+            label=label,
+            files=render.files,
+        )
+        _mark_rate_usage(
+            label=label,
+            symbol=symbol,
+            render=render,
+            requester_id=requester_id,
+            request_kind=request_kind,
+        )
+    except Exception:
+        status = "send_failed"
+        raise
+    finally:
+        elapsed_ms = (time_lib.perf_counter() - start_ts) * 1000.0
+        _write_autopost_audit(
+            render=render,
+            builder=builder,
+            label=label,
+            channel=channel,
+            asof_et=asof_et,
+            status=status,
+            symbol=symbol,
+            context_mode=context_mode,
+            context_output_mode=context_output_mode,
+            violations=[],
+            message_id=getattr(message, "id", None),
+            latency_ms=elapsed_ms,
+            fallback_text=None,
+        )
+
+
+def _trade_context_meta_from_render(
+    render: RenderedPost,
+    default_symbol: str,
+) -> tuple[str, str, str, Dict[str, Any]]:
+    payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+
+    symbol_val = payload.get("symbol") if isinstance(payload.get("symbol"), str) else None
+    if not symbol_val:
+        symbols_meta = meta.get("symbols") if isinstance(meta, dict) else None
+        if isinstance(symbols_meta, (list, tuple)) and symbols_meta:
+            symbol_val = str(symbols_meta[0]).upper()
+    if not symbol_val:
+        symbol_val = (default_symbol or "").strip().upper() or "N/A"
+
+    context_mode = "api"
+    if isinstance(meta, dict):
+        raw_mode = meta.get("trade_context_mode") or meta.get("analysis_mode") or "api"
+        context_mode = str(raw_mode)
+    context_output_mode = "strict"
+    if isinstance(meta, dict):
+        raw_output = meta.get("trade_context_output_mode") or meta.get("analysis_output_mode") or "strict"
+        context_output_mode = str(raw_output)
+
+    return symbol_val.upper() or "N/A", context_mode, context_output_mode, meta if isinstance(meta, dict) else {}
+
+
+_analysis_meta_from_render = _trade_context_meta_from_render
+
 
 REQUIRED_SECTIONS = [
     "— Trade Context",
@@ -363,6 +3428,10 @@ if not STARTUP_SYMBOLS:
     STARTUP_SYMBOLS = [sym.strip().upper() for sym in _STARTUP_DEFAULT.split(",") if sym.strip()]
 _STARTUP_SYMBOL_SET = set(STARTUP_SYMBOLS)
 
+DEFAULT_DAILY_PREP_SYMBOLS = [sym for sym in STARTUP_SYMBOLS if sym in {"SPY", "QQQ"}]
+if not DEFAULT_DAILY_PREP_SYMBOLS:
+    DEFAULT_DAILY_PREP_SYMBOLS = ["SPY", "QQQ"]
+
 
 def _filter_startup_symbols(symbols: Iterable[str]) -> list[str]:
     if not _STARTUP_SYMBOL_SET:
@@ -392,36 +3461,125 @@ def _extract_first_float(pattern: str, text: str) -> Optional[float]:
         return None
 
 
-def validate_analysis_message(text: str) -> Tuple[bool, str]:
-    """
-    Returns (ok, reason).
-    Blocks:
-      - Missing last price
-      - Missing pivot
-      - Targets that are invalid (e.g., downside above current price)
-      - Contradictory confirmation vs bias (hard contradictions only)
-    """
+def _normalize_section_token(value: str) -> str:
+    cleaned = (value or "").lower()
+    cleaned = re.sub(r"\*\*", "", cleaned)
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
 
-    if not text or len(text.strip()) < 60:
+
+def _extract_last_price_from_bullets(text: str) -> Optional[float]:
+    lines = text.splitlines()
+    header_idx: Optional[int] = None
+    for idx, raw_line in enumerate(lines):
+        if "last price" in raw_line.lower():
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        return None
+
+    for raw_line in lines[header_idx + 1 :]:
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("•"):
+            # Accept both:
+            #   • SPY: 123.45 (...)
+            #   • SPY 123.45 (...)
+            match = re.search(r"(?::\s*|\s+)\*{0,2}([0-9]+(?:\.[0-9]+)?)", stripped)
+            if match:
+                try:
+                    return float(match.group(1))
+                except Exception:  # noqa: BLE001
+                    return None
+            continue
+        break
+
+    return None
+
+
+def validate_analysis_message(text: str, label: Optional[str] = None) -> Tuple[bool, str]:
+    """Validate outbound Discord content for Trade Context or legacy formats."""
+
+    stripped = (text or "").strip()
+    if not stripped:
+        return False, "empty"
+
+    canonical_silence = SILENCE_NOTICE.strip()
+    if stripped.replace("\r", "").startswith(canonical_silence.replace("\r", "")):
+        return True, "silence"
+
+    # On-demand stand-down messages are deterministic and are allowed to post even if
+    # data sections (pivots/levels) are unavailable.
+    if stripped.lstrip().upper().startswith("⚠️ STAND DOWN"):
+        return True, "stand_down"
+
+    is_trade_context = "TNT TRADE CONTEXT" in stripped
+    if is_trade_context:
+        required_tokens = [
+            "🧠 TNT TRADE CONTEXT",
+            "Market State:",
+            "Risk Bias:",
+            "Psychological Risk:",
+            "TRADE ENVELOPE",
+            "✅ Allowed:",
+            "⚠️ Caution:",
+            "⛔ Avoid:",
+            "DEFAULT ACTION:",
+        ]
+        for token in required_tokens:
+            if token not in text:
+                return False, f"missing token: {token}"
+        return True, "OK"
+
+    if len(stripped) < 60:
         return False, "too short"
 
-    required_substrings = [
-        "Last Price",
-        "Key Levels",
-        "How Pros Would Trade It",
-        "Do Nothing If",
-    ]
+    label_lower = (label or "").lower()
+    on_demand = label_lower.startswith("analyze")
+
+    if on_demand:
+        # On-demand renders are deterministic and may use different headings.
+        # Do NOT require an exact "Last Price" section header; instead require that
+        # we can parse a last price and a pivot.
+        required_tokens: list[str] = []
+    else:
+        required_tokens = [
+            "Last Price",
+            "Key Levels",
+            "How Pros Would Trade It",
+            "Do Nothing If",
+        ]
+
     lowered = text.lower()
+    normalized_text = _normalize_section_token(text)
+
+    def _has_token(token: str) -> bool:
+        token_norm = _normalize_section_token(token)
+        return bool(token_norm and token_norm in normalized_text)
 
     banned_words = ["guaranteed", "sure thing", "100% win", "insider", "front-run"]
     for token in banned_words:
         if token in lowered:
             return False, f"banned:{token}"
-    for token in required_substrings:
-        if token.lower() not in lowered:
+    for token in required_tokens:
+        if not _has_token(token):
             return False, f"Missing section: {token}"
 
+    if on_demand:
+        # Accept: "Pivots", "Key Levels", or deterministic "Reference Levels" block.
+        if not (_has_token("Pivots") or _has_token("Key Levels") or _has_token("Reference Levels")):
+            return False, "Missing section: Levels"
+
+        # Accept: legacy trade-context blocks OR on-demand "Coach Reminder".
+        if not (_has_token("Trade Context") or _has_token("TNT STATUS") or _has_token("Coach Reminder")):
+            return False, "Missing section: Context"
+
     last_px = _extract_first_float(r"(?:Last Price|Last price):\s*\*{0,2}\s*([0-9]+(?:\.[0-9]+)?)", text)
+    if last_px is None:
+        last_px = _extract_last_price_from_bullets(text)
     pivot = _extract_first_float(r"\bP(?:ivot)?:\s*\*{0,2}\s*([0-9]+(?:\.[0-9]+)?)", text) or _extract_first_float(
         r"\bP\s*([0-9]+(?:\.[0-9]+)?)",
         text,
@@ -472,7 +3630,11 @@ def validate_analysis_message(text: str) -> Tuple[bool, str]:
 
 
 def validate_output(text: str, *, mode: str) -> tuple[bool, str]:
-    return validate_analysis_message(text)
+    # Route known modes through the same validator, but with a label that
+    # matches the expected format. This prevents legacy requirements (like a
+    # literal "Last Price" header) from blocking on-demand formats.
+    label = "analyze" if (mode or "").lower().startswith("on_demand") else None
+    return validate_analysis_message(text, label=label)
 
 
 def _extract_first_number_after(label: str, text: str) -> Optional[float]:
@@ -488,64 +3650,106 @@ def _extract_first_number_after(label: str, text: str) -> Optional[float]:
 
 
 def build_safe_fallback(symbol: str, pivots: Optional[dict], note: str = "") -> str:
-    """Return a minimal, human-readable fallback when gating blocks analysis."""
+    sym_raw = (symbol or "").strip().upper()
+    sym_norm = _normalize_symbol_token(sym_raw) if sym_raw else None
+    sym_key = sym_norm or "".join(ch for ch in sym_raw if ch.isalnum())
+    sym_display = sym_key or sym_raw or "N/A"
 
-    sym = (symbol or "UNKNOWN").strip().upper() or "UNKNOWN"
-    header: list[str] = [
-        f"⚠️ **{sym} analysis unavailable**",
-        "Automated response withheld. Minimal context below.",
-    ]
-
-    if note:
-        header.append(f"Reason: {note}")
-
-    def _coerce_float(val: Optional[object]) -> Optional[float]:
+    def _fmt_pivot(val: Optional[object]) -> str:
         try:
-            return float(val) if val is not None else None
-        except Exception:  # noqa: BLE001 - fallback must never raise
-            return None
-
-    last_px: Optional[float] = None
-    last_ts: Optional[str] = None
-    try:
-        live_px, live_ts, _ = fetch_live_price(sym)
-        if live_px is not None:
-            last_px = float(live_px)
-            last_ts = live_ts
-    except Exception:  # noqa: BLE001 - network issues should not break fallback
-        pass
-
-    if last_px is None or last_ts is None:
-        try:
-            price_info = get_latest_price(sym)
+            return f"{float(val):.2f}"
         except Exception:  # noqa: BLE001
-            price_info = None
-        if price_info:
-            last_px, last_ts = price_info
+            return "n/a"
+
+    # Best-effort enrichment so standby messages still show something useful.
+    try:
+        snap = _get_last_price_snapshot(sym_key)
+    except Exception:  # noqa: BLE001
+        snap = None
+
+    last_price_line = "• n/a"
+    if snap is not None and getattr(snap, "price", None) is not None and getattr(snap, "asof_et", None) is not None:
+        try:
+            px = float(getattr(snap, "price"))
+            asof_et = getattr(snap, "asof_et")
+            asof_str = asof_et.strftime("%Y-%m-%d %H:%M ET") if hasattr(asof_et, "strftime") else "n/a"
+            src = getattr(snap, "source", "n/a")
+            state = market_state_label(getattr(snap, "market_state", "UNKNOWN"))
+            last_price_line = f"• {sym_display}: {px:.2f} ({src} | {asof_str} | {state})"
+        except Exception:  # noqa: BLE001
+            last_price_line = "• n/a"
 
     pivots_dict = pivots if isinstance(pivots, dict) else {}
-    payload = {
-        "bias": "NEUTRAL",
-        "bias_confirm": "UNKNOWN",
-        "conviction": "LOW",
-        "regime": "UNKNOWN",
-        "tf_exec": "5m",
-        "tf_struct": "60m",
-        "tf_ctx": "1D",
-        "pivot": _coerce_float(pivots_dict.get("P")),
-        "r1": _coerce_float(pivots_dict.get("R1")),
-        "r2": _coerce_float(pivots_dict.get("R2")),
-        "s1": _coerce_float(pivots_dict.get("S1")),
-        "s2": _coerce_float(pivots_dict.get("S2")),
-        "vix_trend": "unknown",
-        "sqqq_dir": "unknown",
-        "last_price": last_px,
-        "last_price_ts": last_ts,
-        "price_tf": PRICE_TF_LABEL,
-    }
+    if not pivots_dict:
+        try:
+            piv_info = get_latest_daily_pivots(sym_key)
+        except Exception:  # noqa: BLE001
+            piv_info = None
+        if isinstance(piv_info, dict) and isinstance(piv_info.get("piv"), dict):
+            pivots_dict = piv_info["piv"]  # type: ignore[assignment]
 
-    body = format_signal_clean(sym, payload, verbose=False)
-    return "\n\n".join(["\n".join(header), body])
+    pivot_line = _fmt_pivot(pivots_dict.get("P")) if pivots_dict else "n/a"
+
+    rth_line = None
+    try:
+        sess = get_last_rth_session_hlc(sym_key)
+    except Exception:  # noqa: BLE001
+        sess = None
+    if sess:
+        try:
+            session_date, high, low, close, _last_ts = sess
+            rth_line = f"• Last RTH: H {float(high):.2f} | L {float(low):.2f} | C {float(close):.2f} ({session_date})"
+        except Exception:  # noqa: BLE001
+            rth_line = None
+
+    details = (note or "").replace("_", " ").strip()
+
+    lines: list[str] = []
+    lines.append(f"🔍 On-Demand Analyze — {sym_display} (Standby)")
+    lines.append("")
+    if snap is not None and getattr(snap, "market_state", None):
+        try:
+            state = market_state_label(getattr(snap, "market_state", "UNKNOWN"))
+        except Exception:  # noqa: BLE001
+            state = "UNKNOWN"
+        if getattr(snap, "ok", False):
+            lines.append(f"🧾 Data Mode: {state} (snapshot)")
+        else:
+            reason = getattr(snap, "reason", None) or "no recent validated price available"
+            lines.append(f"🧾 Data Mode: {state} — {reason}")
+    else:
+        lines.append("🧾 Data Mode: CLOSED — no recent validated price available")
+    if details:
+        lines.append(f"• Detail: {details}")
+    lines.append("")
+    lines.append("💵 **Last Price**")
+    lines.append(last_price_line)
+    lines.append("")
+    lines.append("📐 Reference Levels (last confirmed session)")
+    lines.append(f"• Pivot: {pivot_line}")
+    if rth_line:
+        lines.append(rth_line)
+    lines.append("")
+    lines.append("🧭 Coach Reminder")
+    # If the market is open and we have a validated snapshot, this fallback is almost
+    # always a formatting/contract issue (not "live pricing is down").
+    try:
+        is_open = snap is not None and getattr(snap, "ok", False) and market_state_label(getattr(snap, "market_state", "UNKNOWN")) == "OPEN"
+    except Exception:  # noqa: BLE001
+        is_open = False
+
+    if is_open:
+        lines.append("• Market is live — re-run /analyze now for actionable triggers")
+        lines.append("• Use Pivot reclaim/loss as the first decision filter")
+        lines.append("• This standby card means the full analysis contract failed, not that pricing is paused")
+    else:
+        lines.append("• Re-run /analyze at the open for actionable triggers")
+        lines.append("• Watch for reclaim or loss of the primary pivot before taking risk")
+        lines.append("• Treat this as informational only until live pricing resumes")
+    lines.append("")
+    lines.append("_Not financial advice._")
+
+    return "\n".join(lines)
 
 
 def build_deterministic_analysis(
@@ -556,7 +3760,7 @@ def build_deterministic_analysis(
 ) -> str:
     """Produce a static analysis stub using only deterministic data."""
 
-    symbol = (sym or "UNKNOWN").strip().upper() or "UNKNOWN"
+    symbol = (sym or "N/A").strip().upper() or "N/A"
     price_text = "n/a" if last_price is None else f"{last_price:.2f}"
     ts_text = last_ts or "n/a"
 
@@ -593,7 +3797,7 @@ def build_deterministic_analysis(
         "🧭 Regime:",
         "• Needs fresh 1m data + signals to classify.",
         "",
-        "🧠 How Pros Would Trade It:",
+        "🧠 How Pros Would Trade It",
         "• Above Pivot tilt bullish toward R1.",
         "• Below Pivot tilt bearish toward S1.",
         "",
@@ -621,6 +3825,23 @@ def fmt_signed(x):
     return f"{sign}{abs(val):.2f}"
 
 
+_EMA_WITH_NUMBER_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])ema\s*(\d+)")
+_EMA_TOKEN_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])ema(?![A-Za-z0-9_])")
+
+
+def _normalize_indicator_label(name: object) -> str:
+    raw = str(name)
+
+    def _number_repl(match: re.Match[str]) -> str:
+        digits = match.group(1)
+        return f"avg {digits}"
+
+    cleaned = _EMA_WITH_NUMBER_RE.sub(_number_repl, raw)
+    cleaned = _EMA_TOKEN_RE.sub("avg", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
 def fmt_targets(pairs) -> str:
     if not pairs:
         return "n/a"
@@ -631,211 +3852,673 @@ def fmt_targets(pairs) -> str:
             continue
         name, val = item
         try:
-            parts.append(f"{name} {fmt_money(val)}")
+            label = _normalize_indicator_label(name)
+            parts.append(f"{label} {fmt_money(val)}")
         except Exception:  # noqa: BLE001
             continue
 
     return " → ".join(parts) if parts else "n/a"
 
 
-def format_signal_clean(sym: str, payload: dict, *, verbose: bool = False) -> str:
-    """Render an easy-to-read trade context block for Discord."""
+def _extract_technical_state(source: Optional[Mapping[str, Any]]) -> Optional[str]:
+    if not isinstance(source, Mapping):
+        return None
 
-    bias = payload.get("bias", "NEUTRAL")
-    bias_confirm = payload.get("bias_confirm", "UNKNOWN")
-    conviction = payload.get("conviction", "LOW")
-    regime = payload.get("regime", "UNKNOWN")
-    tf_exec = payload.get("tf_exec", "5m")
-    tf_struct = payload.get("tf_struct", "60m")
-    tf_ctx = payload.get("tf_ctx", "1D")
+    candidates: list[Optional[object]] = []
+    direct = source.get("data_quality")
+    if direct is not None:
+        candidates.append(direct)
+    meta = source.get("meta")
+    if isinstance(meta, Mapping):
+        candidates.append(meta.get("data_quality"))
 
-    pivot = payload.get("pivot")
-    r1 = payload.get("r1")
-    r2 = payload.get("r2")
-    s1 = payload.get("s1")
-    s2 = payload.get("s2")
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            state = candidate.get("technical_state")
+            if isinstance(state, str):
+                return state.upper()
+        elif isinstance(candidate, str):
+            return candidate.upper()
 
-    vix_trend = payload.get("vix_trend", "unknown")
-    sqqq_dir = payload.get("sqqq_dir", "unknown")
+    return None
 
-    edge = payload.get("edge")
-    model = payload.get("model", payload.get("model_version", "unknown"))
-    ts = payload.get("ts")
 
-    bias_upper = str(bias).upper()
-    bias_confirm_upper = str(bias_confirm).upper()
-    bias_confirm_display = bias_confirm_upper if bias_confirm_upper else "UNKNOWN"
+ACTION_LABELS = {
+    "TRADE_SELECTIVELY": "TRADE SELECTIVELY",
+    "WAIT": "WAIT",
+    "STAND_DOWN": "STAND DOWN",
+}
 
-    bias_emoji = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "🟡"}.get(bias_upper, "🟡")
-    confirm_emoji = {
-        "BULLISH": "🟢",
-        "BEARISH": "🔴",
-        "UNKNOWN": "🟡",
-        "NEUTRAL": "🟡",
-    }.get(bias_confirm_upper, "🟡")
+ACTION_EMOJI = {
+    "TRADE_SELECTIVELY": "🟢",
+    "WAIT": "🟡",
+    "STAND_DOWN": "🔴",
+}
 
-    lines: list[str] = []
-    lines.append(f"🚨 **{sym} — Trade Context**")
 
-    last_price = payload.get("last_price")
-    last_price_ts = payload.get("last_price_ts")
-    price_tf = payload.get("price_tf") or PRICE_TF_LABEL
+@dataclass(frozen=True)
+class DefaultActionDecision:
+    code: str
+    emoji: str
+    label: str
+    reasons: tuple[str, ...]
 
-    lines.append(fmt_last_price(sym, last_price, last_price_ts, price_tf))
 
-    if payload.get("educational_only"):
-        edge_meta = payload.get("edge")
-        if isinstance(edge_meta, (int, float)):
-            lines.append(f"⚠️ **LOW EDGE / EDUCATIONAL** (edge {edge_meta:.3f})")
-        else:
-            lines.append("⚠️ **LOW EDGE / EDUCATIONAL**")
-        lines.append("")
+@dataclass(frozen=True)
+class TradeContextSummary:
+    symbol: str
+    decision: DefaultActionDecision
+    market_state: str
+    risk_bias: str
+    psychological_risks: tuple[str, ...]
+    allowed: tuple[str, ...]
+    caution: tuple[str, ...]
+    avoid: tuple[str, ...]
+    silence: bool
+    silence_reasons: tuple[str, ...]
+    generated_et: Optional[datetime]
 
-    pivot_val = payload.get("pivot")
-    distance_line = None
-    if last_price is not None and pivot_val is not None:
+
+def _technical_state_from_payload(payload: Mapping[str, Any]) -> str:
+    source = payload.get("data_quality") if isinstance(payload, Mapping) else None
+    if isinstance(source, Mapping):
+        raw = source.get("technical_state")
+        if isinstance(raw, Mapping):
+            raw = raw.get("technical_state")
+        if isinstance(raw, str):
+            return raw.upper()
+    return "UNKNOWN"
+
+
+def _edge_value(payload: Mapping[str, Any]) -> Optional[float]:
+    try:
+        edge_val = payload.get("edge")
+        return float(edge_val) if edge_val is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gate_mode(payload: Mapping[str, Any], gate: Optional[Mapping[str, Any]]) -> str:
+    if isinstance(gate, Mapping):
+        mode = gate.get("mode")
+        if isinstance(mode, str) and mode:
+            return mode.upper()
+    mode = payload.get("gate_mode")
+    if isinstance(mode, str) and mode:
+        return mode.upper()
+    gate_payload = payload.get("gate")
+    if isinstance(gate_payload, Mapping):
+        mode = gate_payload.get("mode")
+        if isinstance(mode, str) and mode:
+            return mode.upper()
+    return ""
+
+
+def _bias_conflict(bias: str, confirm: str) -> bool:
+    combo = (bias.upper(), confirm.upper())
+    return combo in {("BULL", "BEARISH"), ("BEAR", "BULLISH")}
+
+
+def _has_range_regime(payload: Mapping[str, Any]) -> bool:
+    for key in ("pivot_regime", "regime"):
+        raw = payload.get(key)
+        if isinstance(raw, str):
+            text = raw.upper()
+            if any(term in text for term in ("RANGE", "BALANCE", "NEUTRAL")):
+                return True
+    return False
+
+
+def _trend_tag(payload: Mapping[str, Any]) -> bool:
+    if payload.get("pivot_extension_mode"):
+        return True
+    strength = payload.get("trend_strength")
+    try:
+        return float(strength) >= 0.6
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _determine_default_action(
+    payload: Mapping[str, Any],
+    *,
+    gate: Optional[Mapping[str, Any]],
+    price_snapshot: Optional[PriceSnapshot],
+    macro_risk: Optional[Mapping[str, Any]],
+    session: str,
+) -> DefaultActionDecision:
+    tech_state = _technical_state_from_payload(payload)
+    gate_mode = _gate_mode(payload, gate)
+    edge = _edge_value(payload) or 0.0
+    bias = str(payload.get("bias") or "NEUTRAL").upper()
+    confirm = str(payload.get("bias_confirm") or "UNKNOWN").upper()
+    conviction = str(payload.get("conviction") or "LOW").upper()
+
+    stand_down_tags: list[str] = []
+    if tech_state not in {"FRESH", "OK"}:
+        stand_down_tags.append("data_stale")
+    if isinstance(price_snapshot, PriceSnapshot) and not price_snapshot.ok:
+        stand_down_tags.append("price_invalid")
+    if gate_mode == "HARD":
+        stand_down_tags.append("vol_spike")
+    if bool(payload.get("stand_down")):
+        stand_down_tags.append("model_stand_down")
+    if isinstance(macro_risk, Mapping):
+        delta = macro_risk.get("delta_min")
         try:
-            diff = float(last_price) - float(pivot_val)
-            direction = "above" if diff >= 0 else "below"
-            distance_line = (
-                f"📏 **vs Pivot:** {fmt_signed(diff)} pts ({direction} {fmt_money(pivot_val)})"
-            )
+            if float(delta) <= 30:
+                stand_down_tags.append("macro_event_imminent")
         except Exception:  # noqa: BLE001
-            distance_line = None
+            pass
 
-    if distance_line:
-        lines.append(distance_line)
+    if stand_down_tags:
+        code = "STAND_DOWN"
+        return DefaultActionDecision(
+            code=code,
+            emoji=ACTION_EMOJI[code],
+            label=ACTION_LABELS[code],
+            reasons=tuple(stand_down_tags),
+        )
 
+    wait_tags: list[str] = []
+    if _bias_conflict(bias, confirm):
+        wait_tags.append("conflict")
+    if edge < 0.05:
+        wait_tags.append("low_edge")
+    if conviction != "HIGH":
+        wait_tags.append("conviction")
+    if gate_mode in {"WATCH", "SOFT", "LIGHT"}:
+        wait_tags.append("gate_watch")
+    if isinstance(macro_risk, Mapping):
+        delta = macro_risk.get("delta_min")
+        try:
+            if 30 < float(delta) <= 60:
+                wait_tags.append("macro_watch")
+        except Exception:  # noqa: BLE001
+            pass
+    if _has_range_regime(payload):
+        wait_tags.append("range")
+    if session in {"PRE", "AH"}:
+        wait_tags.append("offhours")
+
+    trend_active = _trend_tag(payload)
+
+    if not wait_tags and conviction == "HIGH" and edge >= 0.08 and gate_mode in {"", "OK"}:
+        reasons = ["trend" if trend_active else "structured"]
+        code = "TRADE_SELECTIVELY"
+        return DefaultActionDecision(
+            code=code,
+            emoji=ACTION_EMOJI[code],
+            label=ACTION_LABELS[code],
+            reasons=tuple(reasons),
+        )
+
+    if not wait_tags:
+        wait_tags.append("default_wait")
+
+    code = "WAIT"
+    return DefaultActionDecision(
+        code=code,
+        emoji=ACTION_EMOJI[code],
+        label=ACTION_LABELS[code],
+        reasons=tuple(wait_tags),
+    )
+
+
+def _describe_market_state(
+    decision: DefaultActionDecision,
+    payload: Mapping[str, Any],
+    macro_risk: Optional[Mapping[str, Any]],
+) -> str:
+    reasons = set(decision.reasons)
+    if decision.code == "STAND_DOWN":
+        if "macro_event_imminent" in reasons:
+            return "High-impact event window; liquidity unstable"
+        if "vol_spike" in reasons:
+            return "Volatility regime shift in progress; no stable context yet"
+        if "data_stale" in reasons or "price_invalid" in reasons:
+            return "Market data incomplete; waiting for refresh"
+        return "Market context unstable; stand down"
+
+    if decision.code == "WAIT":
+        if "range" in reasons:
+            return "Volatility compressed, range-bound tape"
+        if "conflict" in reasons:
+            return "Signals mixed; no clean momentum path"
+        if "macro_watch" in reasons and isinstance(macro_risk, Mapping):
+            return "Awaiting catalyst; expansion trigger pending"
+        if "offhours" in reasons:
+            return "Off-hours tape; wait for liquidity rebuild"
+        return "Volatility muted; no expansion trigger"
+
+    if "trend" in reasons:
+        return "Volatility expanding with directional follow-through"
+    return "Market structure stable enough to frame risk"
+
+
+def _describe_risk_bias(payload: Mapping[str, Any]) -> str:
+    bias = str(payload.get("bias") or "NEUTRAL").upper()
+    confirm = str(payload.get("bias_confirm") or "UNKNOWN").upper()
+    if bias == "BULL" and confirm == "BULLISH":
+        return "Upside asymmetry > downside risk"
+    if bias == "BEAR" and confirm == "BEARISH":
+        return "Downside asymmetry > upside reward"
+    if bias == "BULL":
+        return "Upside idea but confirmation mixed"
+    if bias == "BEAR":
+        return "Downside idea but confirmation mixed"
+    return "Risk asymmetry unclear"
+
+
+def _psychological_risk_lines(decision: DefaultActionDecision) -> tuple[str, ...]:
+    reasons = set(decision.reasons)
+    if decision.code == "STAND_DOWN":
+        lines = [
+            "Forcing trades into unstable tape",
+            "Anchoring to prior bias",
+        ]
+        if "macro_event_imminent" in reasons:
+            lines[0] = "Taking risk into event-driven volatility"
+        return tuple(lines)
+    if decision.code == "WAIT":
+        lines = [
+            "Overtrading chop",
+            "Chasing small breakouts",
+        ]
+        if "conflict" in reasons:
+            lines[1] = "Trading when confirmation disagrees"
+        return tuple(lines)
+    return (
+        "FOMO on late breaks",
+        "Relaxing stop discipline",
+    )
+
+
+TRADE_ENVELOPE = {
+    "WAIT": {
+        "allowed": ("Small-size scalps", "Defined-risk downside probes"),
+        "caution": ("Call buying", "Momentum chasing"),
+        "avoid": ("Full-size directional trades", "Holding for expansion without a trigger"),
+    },
+    "STAND_DOWN": {
+        "allowed": ("Observation & prep only", "Update levels and scenarios"),
+        "caution": ("Any intraday punts", "Counter-trend fades into noise"),
+        "avoid": ("Adding risk into unstable tape", "Holding positions through event volatility"),
+    },
+    "TRADE_SELECTIVELY": {
+        "allowed": ("Measured entries with confirmation", "Defined-risk continuation setups"),
+        "caution": ("Counter-trend fades", "Oversizing beyond plan"),
+        "avoid": ("Trading without invalidation", "Holding through opposing regime flips"),
+    },
+}
+
+
+def _trade_envelope_for(decision: DefaultActionDecision) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    block = TRADE_ENVELOPE.get(decision.code, TRADE_ENVELOPE["WAIT"])
+    return tuple(block["allowed"]), tuple(block["caution"]), tuple(block["avoid"])
+
+
+def _should_silence_trade_context(
+    decision: DefaultActionDecision,
+    *,
+    now_et: datetime,
+    macro_risk: Optional[Mapping[str, Any]],
+    bias: str,
+    confirm: str,
+    edge: float,
+    session: str,
+    tech_state: str,
+) -> tuple[bool, tuple[str, ...]]:
+    reasons: list[str] = []
+
+    if session == "RTH":
+        minutes_since_midnight = now_et.hour * 60 + now_et.minute
+        open_minute = RTH_OPEN.hour * 60 + RTH_OPEN.minute
+        delta_open = minutes_since_midnight - open_minute
+        if 0 <= delta_open < 10:
+            reasons.append("open_noise")
+
+    if isinstance(macro_risk, Mapping):
+        delta = macro_risk.get("delta_min")
+        try:
+            if float(delta) <= 10:
+                reasons.append("macro_event_imminent")
+        except Exception:  # noqa: BLE001
+            pass
+
+    if _bias_conflict(bias, confirm):
+        reasons.append("conflicting_signals")
+
+    if edge < 0.02:
+        reasons.append("low_confidence")
+
+    if session in {"WEEKEND"}:
+        reasons.append("thin_liquidity")
+    elif session in {"PRE", "AH"} and edge < 0.03:
+        reasons.append("thin_liquidity")
+    elif session == "RTH":
+        minutes_since_midnight = now_et.hour * 60 + now_et.minute
+        if 12 * 60 <= minutes_since_midnight <= 13 * 60 + 15 and decision.code != "TRADE_SELECTIVELY" and edge < 0.04:
+            reasons.append("lunch_lull")
+
+    if tech_state not in {"FRESH", "OK"} and decision.code != "STAND_DOWN":
+        reasons.append("data_stale")
+
+    hard_triggers = {"macro_event_imminent", "open_noise", "thin_liquidity", "data_stale"}
+    hard_reasons = [reason for reason in reasons if reason in hard_triggers]
+    if hard_reasons:
+        return True, tuple(reasons)
+
+    return False, tuple()
+
+
+def build_trade_context_summary(
+    symbol: str,
+    payload: Mapping[str, Any],
+    *,
+    now_et: Optional[datetime] = None,
+    price_snapshot: Optional[PriceSnapshot] = None,
+    gate: Optional[Mapping[str, Any]] = None,
+    macro_risk: Optional[Mapping[str, Any]] = None,
+    session: Optional[str] = None,
+) -> TradeContextSummary:
+    now = now_et or _now_et()
+    macro = macro_risk if macro_risk is not None else payload.get("macro_risk")
+    session_code = session or payload.get("session") or market_session_et()
+    decision = _determine_default_action(
+        payload,
+        gate=gate,
+        price_snapshot=price_snapshot,
+        macro_risk=macro if isinstance(macro, Mapping) else None,
+        session=session_code,
+    )
+
+    market_state_line = _describe_market_state(decision, payload, macro if isinstance(macro, Mapping) else None)
+    risk_bias_line = _describe_risk_bias(payload)
+    psych_lines = _psychological_risk_lines(decision)
+    allowed, caution, avoid = _trade_envelope_for(decision)
+
+    edge_val = _edge_value(payload) or 0.0
+    tech_state = _technical_state_from_payload(payload)
+    bias = str(payload.get("bias") or "NEUTRAL").upper()
+    confirm = str(payload.get("bias_confirm") or "UNKNOWN").upper()
+
+    silence, silence_reasons = _should_silence_trade_context(
+        decision,
+        now_et=now,
+        macro_risk=macro if isinstance(macro, Mapping) else None,
+        bias=bias,
+        confirm=confirm,
+        edge=edge_val,
+        session=session_code,
+        tech_state=tech_state,
+    )
+
+    return TradeContextSummary(
+        symbol=symbol.upper(),
+        decision=decision,
+        market_state=market_state_line,
+        risk_bias=risk_bias_line,
+        psychological_risks=psych_lines,
+        allowed=allowed,
+        caution=caution,
+        avoid=avoid,
+        silence=silence,
+        silence_reasons=silence_reasons,
+        generated_et=now,
+    )
+
+
+def render_trade_context(summary: TradeContextSummary) -> str:
+    lines: list[str] = [f"🧠 TNT TRADE CONTEXT — {summary.symbol}"]
     lines.append("")
+    lines.append("Market State:")
+    lines.append(f"• {summary.market_state}")
+    lines.append("")
+    lines.append("Risk Bias:")
+    lines.append(f"• {summary.risk_bias}")
+    lines.append("")
+    lines.append("Psychological Risk:")
+    for entry in summary.psychological_risks:
+        lines.append(f"• {entry}")
+    lines.append("")
+    lines.append("TRADE ENVELOPE")
+    lines.append("✅ Allowed:")
+    for item in summary.allowed:
+        lines.append(f"• {item}")
+    lines.append("")
+    lines.append("⚠️ Caution:")
+    for item in summary.caution:
+        lines.append(f"• {item}")
+    lines.append("")
+    lines.append("⛔ Avoid:")
+    for item in summary.avoid:
+        lines.append(f"• {item}")
+    lines.append("")
+    lines.append(f"DEFAULT ACTION: {summary.decision.emoji} {summary.decision.label}")
+    return "\n".join(lines)
 
-    lines.append(
-        f"**Bias:** {bias_emoji} {bias_upper} ({confirm_emoji} confirm: {bias_confirm_display})"
+
+def format_signal_clean(
+    sym: str,
+    payload: dict,
+    *,
+    verbose: bool = False,
+    now_et: Optional[datetime] = None,
+    gate: Optional[Mapping[str, Any]] = None,
+    price_snapshot: Optional[PriceSnapshot] = None,
+) -> str:
+    summary = build_trade_context_summary(
+        sym,
+        payload,
+        now_et=now_et,
+        price_snapshot=price_snapshot,
+        gate=gate,
     )
-    pivot_regime = (payload.get("pivot_regime") or regime or "UNKNOWN")
-    pivot_regime_display = str(pivot_regime).upper()
-    extension_mode = payload.get("pivot_extension_mode")
-    mode_label = "EXTENSION MODE" if extension_mode else "NORMAL"
-    lines.append(
-        f"🧭 Regime: {pivot_regime_display} | Mode: {mode_label} | Conviction: {str(conviction).upper()}"
-    )
+
+    payload["default_action_code"] = summary.decision.code
+    payload["default_action_label"] = summary.decision.label
+    payload["default_action_reasons"] = list(summary.decision.reasons)
+    payload["default_action_silence"] = summary.silence
+    payload["default_action_silence_reasons"] = list(summary.silence_reasons)
+
+    payload["trade_context_summary"] = {
+        "decision": summary.decision.code,
+        "emoji": summary.decision.emoji,
+        "label": summary.decision.label,
+        "reasons": list(summary.decision.reasons),
+        "market_state": summary.market_state,
+        "risk_bias": summary.risk_bias,
+        "psychological_risk": list(summary.psychological_risks),
+        "allowed": list(summary.allowed),
+        "caution": list(summary.caution),
+        "avoid": list(summary.avoid),
+        "silence": summary.silence,
+        "silence_reasons": list(summary.silence_reasons),
+        "generated_et": summary.generated_et.isoformat() if summary.generated_et else None,
+    }
+
+    if summary.silence:
+        return SILENCE_NOTICE
+
+    return _format_trade_context_block(sym, summary, payload, gate or {}, price_snapshot)
+
+
+def _bias_marker(tag: str) -> str:
+    mapping = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "🟡"}
+    return mapping.get(tag.upper(), "⚪")
+
+
+def _confirm_marker(tag: str) -> str:
+    mapping = {"BULLISH": "🟢", "BEARISH": "🔴", "MIXED": "🟡", "UNKNOWN": "⚪"}
+    return mapping.get(tag.upper(), "⚪")
+
+
+def _decision_mode_label(decision: DefaultActionDecision) -> str:
+    mapping = {
+        "TRADE_SELECTIVELY": "AGGRESSIVE",
+        "WAIT": "NORMAL",
+        "STAND_DOWN": "STAND-DOWN",
+    }
+    return mapping.get(decision.code, decision.label.upper())
+
+
+def _coerce_float(value: Optional[object]) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _format_ts_display(ts_iso: Optional[str]) -> str:
+    if not ts_iso:
+        return "n/a"
+    try:
+        dt = parse_iso(str(ts_iso))
+    except Exception:  # noqa: BLE001
+        return str(ts_iso)
+    return dt.astimezone(ET).strftime("%H:%M ET")
+
+
+def _price_descriptor(payload: Mapping[str, Any], price_snapshot: Optional[PriceSnapshot]) -> str:
+    mode = str(payload.get("price_mode") or "").upper()
+    if mode == "LIVE":
+        return "live close"
+    if mode == "CLOSED":
+        return "last close"
+    tf = str(payload.get("price_tf") or "").strip()
+    if tf:
+        return f"{tf} close"
+    source = getattr(price_snapshot, "source", "")
+    if source == "polygon_snapshot_lastTrade":
+        return "live snapshot"
+    if source == "db_1m_close":
+        return "last 1m close"
+    if source == "db_1d_close":
+        return "last 1d close"
+    return "price"
+
+
+def _format_level_chain(pairs: Optional[Iterable[Any]], *, limit: int = 2) -> str:
+    if not pairs:
+        return "n/a"
+    formatted: list[str] = []
+    for item in pairs:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        name, value = item
+        try:
+            formatted.append(f"{str(name).upper()} {float(value):.2f}")
+        except Exception:  # noqa: BLE001
+            continue
+        if len(formatted) >= limit:
+            break
+    return " → ".join(formatted) if formatted else "n/a"
+
+
+def _format_trade_context_block(
+    symbol: str,
+    summary: TradeContextSummary,
+    payload: Mapping[str, Any],
+    gate: Mapping[str, Any],
+    price_snapshot: Optional[PriceSnapshot],
+) -> str:
+    sym = (symbol or "?").strip().upper() or "?"
+
+    price_val = _coerce_float(payload.get("last_price"))
+    if price_val is None and isinstance(price_snapshot, PriceSnapshot):
+        price_val = _coerce_float(price_snapshot.price)
+
+    ts_iso = payload.get("last_price_ts")
+    if not ts_iso and isinstance(price_snapshot, PriceSnapshot) and price_snapshot.asof_et:
+        ts_iso = price_snapshot.asof_et.astimezone(timezone.utc).isoformat()
+    ts_display = _format_ts_display(ts_iso)
+    descriptor = _price_descriptor(payload, price_snapshot)
+    price_text = f"{price_val:.2f}" if price_val is not None else "n/a"
+
+    pivot = _coerce_float(payload.get("pivot"))
+    r1 = _coerce_float(payload.get("r1"))
+    r2 = _coerce_float(payload.get("r2"))
+    s1 = _coerce_float(payload.get("s1"))
+    s2 = _coerce_float(payload.get("s2"))
+
+    delta = None if price_val is None or pivot is None else price_val - pivot
+    if delta is None:
+        vs_pivot = "n/a"
+        now_line = "- Now: n/a"
+    else:
+        direction = "above" if delta >= 0 else "below"
+        vs_pivot = f"{delta:+.2f} pts ({direction} {fmt_money(pivot)})"
+        now_line = f"- Now: **{fmt_money(price_val)}** ({abs(delta):.2f} pts, {direction} **{fmt_money(pivot)}**)"
+
+    bias = str(payload.get("bias") or "NEUTRAL").upper()
+    confirm = str(payload.get("bias_confirm") or "UNKNOWN").upper()
+    conviction = str(payload.get("conviction") or "LOW").upper()
+    regime = str(payload.get("tnt_regime") or payload.get("pivot_regime") or payload.get("regime") or "UNKNOWN").upper()
+    mode_label = _decision_mode_label(summary.decision)
+
+    tf_exec = str(payload.get("tf_exec") or "5m")
+    tf_struct = str(payload.get("tf_struct") or "60m")
+    tf_ctx = str(payload.get("tf_ctx") or "1D")
+
+    upside_chain = _format_level_chain(payload.get("upside_targets"))
+    downside_chain = _format_level_chain(payload.get("downside_targets"))
+
+    gate_mode = str(gate.get("mode") or payload.get("gate_mode") or "n/a")
+    gate_reason = str(gate.get("reason") or payload.get("gate_reason") or "").strip() or "n/a"
+
+    lines: list[str] = [f"🚨 **{sym} — Trade Context**"]
+    lines.append(f"💲 **Last Price:** **{price_text}** ({descriptor} | {ts_display})")
+    lines.append(f"📏 **vs Pivot:** {vs_pivot}")
+
+    bias_line = f"**Bias:** {_bias_marker(bias)} {bias} ({_confirm_marker(confirm)} confirm: {confirm})"
+    lines.append("")
+    lines.append(bias_line)
+    lines.append(f"🧭 Regime: {regime} | Mode: {mode_label} | Conviction: {conviction}")
+
     lines.append("")
     lines.append("⏱ Timeframes:")
     lines.append(f"- Execution: {tf_exec}")
     lines.append(f"- Structure: {tf_struct}")
     lines.append(f"- Context: {tf_ctx}")
+
     lines.append("")
     lines.append("📐 Key Levels (RTH):")
-
-    level_ctx = payload.get("level_ctx") if isinstance(payload.get("level_ctx"), dict) else None
-
     if pivot is not None:
         lines.append(f"- Pivot: **{fmt_money(pivot)}**")
     else:
         lines.append("- Pivot: n/a")
+    lines.append(now_line)
+    lines.append(f"- Upside: {upside_chain}")
+    lines.append(f"- Downside: {downside_chain}")
 
-    if last_price is not None:
-        if pivot is not None:
-            try:
-                diff = float(last_price) - float(pivot)
-                direction = "above" if diff >= 0 else "below"
-                lines.append(
-                    f"- Now: **{fmt_money(last_price)}** ({fmt_signed(diff)} pts, {direction} **{fmt_money(pivot)}**)")
-            except Exception:  # noqa: BLE001
-                lines.append(f"- Now: **{fmt_money(last_price)}**")
-        else:
-            lines.append(f"- Now: **{fmt_money(last_price)}**")
-
-    if level_ctx:
-        lines.append(f"- Upside: {fmt_targets(level_ctx.get('upside_targets'))}")
-        lines.append(f"- Downside: {fmt_targets(level_ctx.get('downside_targets'))}")
-
-        if level_ctx.get("extension_mode") and last_price is not None:
-            broken_levels = level_ctx.get("broken") if isinstance(level_ctx.get("broken"), list) else []
-            try:
-                price_val = float(last_price)
-            except Exception:  # noqa: BLE001
-                price_val = None
-
-            if price_val is not None:
-                pivot_regime = (payload.get("pivot_regime") or "").upper()
-                if pivot_regime.startswith("ABOVE"):
-                    broken_support = [item for item in broken_levels if isinstance(item, (list, tuple)) and len(item) == 2 and item[1] < price_val]
-                    if broken_support:
-                        lines.append(f"- Support (broken): {fmt_targets(broken_support[:3])}")
-                else:
-                    broken_overhead = [item for item in broken_levels if isinstance(item, (list, tuple)) and len(item) == 2 and item[1] > price_val]
-                    if broken_overhead:
-                        lines.append(f"- Overhead resistance (broken): {fmt_targets(broken_overhead[:3])}")
-    else:
-        lines.append("- Upside: n/a")
-        lines.append("- Downside: n/a")
-        lines.append("- (no level context available)")
-
+    bull_entry_level = fmt_money(pivot) if pivot is not None else "Pivot"
     lines.append("")
     lines.append("🧠 How Pros Would Trade It:")
+    lines.append(f"- Bull: enter on reclaim + hold above **{bull_entry_level}**")
+    lines.append(f"- Targets: {upside_chain}")
+    lines.append(f"- Invalidation: lose **{bull_entry_level}**")
+    lines.append(f"- Bear: enter on lose + hold below **{bull_entry_level}**")
+    lines.append(f"- Targets: {downside_chain}")
+    lines.append(f"- Invalidation: reclaim **{bull_entry_level}**")
 
-    bull_plan: list[str] = []
-    bear_plan: list[str] = []
-
-    bull_plan.append(f"- Bull: enter on reclaim + hold above **{fmt_money(pivot)}**" if pivot is not None else "- Bull: await clean reclaim of Pivot")
-    bear_plan.append(f"- Bear: enter on lose + hold below **{fmt_money(pivot)}**" if pivot is not None else "- Bear: wait for decisive break under Pivot")
-
-    if level_ctx:
-        bull_plan.append(f"- Targets: {fmt_targets(level_ctx.get('upside_targets'))}")
-        bear_plan.append(f"- Targets: {fmt_targets(level_ctx.get('downside_targets'))}")
-    else:
-        bull_plan.append("- Targets: need updated pivots/levels")
-        bear_plan.append("- Targets: need updated pivots/levels")
-
-    if pivot is not None:
-        bull_plan.append(f"- Invalidation: lose **{fmt_money(pivot)}**")
-        bear_plan.append(f"- Invalidation: reclaim **{fmt_money(pivot)}**")
-    else:
-        bull_plan.append("- Invalidation: intraday structure fails")
-        bear_plan.append("- Invalidation: intraday structure fails")
-
-    lines.extend(bull_plan)
-    lines.extend(bear_plan)
-
-    lines.append("")
-    lines.append("### 🧭 **Market Confirmation**")
-    lines.append(f"- VIX: **{vix_trend}**")
-    lines.append(f"- SQQQ: **{sqqq_dir}**")
     lines.append("")
     lines.append("🚫 Do Nothing If:")
     lines.append("- No break + retest confirmation (first spike only)")
     lines.append("- Choppy price around pivot (no direction)")
     lines.append("- VIX gate flips hard against the bias")
+    lines.append(f"- Gate: {gate_mode} | {gate_reason}")
+
+    vix_trend = str(payload.get("vix_trend") or "n/a")
+    sqqq_dir = str(payload.get("sqqq_dir") or "n/a")
     lines.append("")
+    lines.append("🧭 **Market Confirmation**")
+    lines.append(f"- VIX: **{vix_trend}**")
+    lines.append(f"- SQQQ: **{sqqq_dir}**")
 
-    if verbose:
-        lines.append("### 🔍 **Signal Details**")
-        if ts:
-            lines.append(f"- Signal ts: `{ts}`")
-        if model:
-            lines.append(f"- Model: `{model}`")
-        if edge is not None:
-            lines.append(f"- Edge: `{edge}`")
-        gate_mode = payload.get("gate_mode")
-        if gate_mode:
-            gate_reason = payload.get("gate_reason")
-            gate_line = f"- Gate: `{gate_mode}`"
-            if gate_reason:
-                gate_line += f" ({gate_reason})"
-            lines.append(gate_line)
-        vix_level = payload.get("vix_level")
-        if vix_level is not None:
-            try:
-                vix_level_val = float(vix_level)
-            except Exception:  # noqa: BLE001
-                vix_level_val = None
-            if vix_level_val is not None:
-                lines.append(f"- VIX level: `{vix_level_val:.2f}`")
-        lines.append("")
-
+    lines.append("")
     lines.append("_Not financial advice._")
     return "\n".join(lines)
-
 
 def build_signal_payload(sym: str) -> Optional[tuple[dict, float, Dict[str, object]]]:
     """Return structured signal context, probability, and gate info."""
@@ -843,6 +4526,11 @@ def build_signal_payload(sym: str) -> Optional[tuple[dict, float, Dict[str, obje
     symbol = (sym or "").strip().upper()
     if not symbol:
         return None
+
+    now_et = _now_et()
+    session = market_session_et()
+    macro_events = load_macro_events_for_date(now_et.strftime("%Y-%m-%d"))
+    macro_risk = macro_within_minutes(macro_events, 60, now_et)
 
     sig = get_latest_signal(symbol)
     if not sig:
@@ -920,9 +4608,17 @@ def build_signal_payload(sym: str) -> Optional[tuple[dict, float, Dict[str, obje
         "ts": sig.get("ts"),
         "gate_mode": gate.get("mode"),
         "gate_reason": gate.get("reason"),
-        "analysis_mode": "db",
-        "analysis_source": "model",
+        "trade_context_mode": "db",
+        "trade_context_source": "model",
+        "session": session,
+        "generated_et": now_et.isoformat(),
     }
+
+    payload["analysis_mode"] = payload["trade_context_mode"]
+    payload["analysis_source"] = payload["trade_context_source"]
+
+    if macro_risk:
+        payload["macro_risk"] = macro_risk
 
     stale_limit = DATA_STALE_MAX_MIN if DATA_STALE_MAX_MIN > 0 else 3.0
     try:
@@ -935,6 +4631,7 @@ def build_signal_payload(sym: str) -> Optional[tuple[dict, float, Dict[str, obje
     price_mode = "db"
     price_source = "db"
     price_tf_label = PRICE_TF_LABEL
+    price_age_minutes: Optional[float] = None
 
     try:
         last_price_info = get_latest_price(symbol)
@@ -970,23 +4667,51 @@ def build_signal_payload(sym: str) -> Optional[tuple[dict, float, Dict[str, obje
                     last_px = None
                 else:
                     last_ts = live_ts
-                    price_mode = "live"
-                    price_source = live_src or "polygon"
-                    price_tf_label = "live"
+                    if isinstance(live_src, str) and (
+                        live_src.startswith("snapshot")
+                        or live_src.startswith("index-snapshot")
+                        or live_src.startswith("ws-cache")
+                    ):
+                        price_mode = "live"
+                        price_source = live_src
+                        price_tf_label = "live"
+                    else:
+                        price_mode = "closed"
+                        price_source = live_src or "snapshot"
                     fresh = True
                     print(f"[PRICE] using live snapshot for {symbol} ({price_source})")
         elif not fresh:
             print(f"[PRICE][WARN] {symbol} data stale and live snapshot unavailable; using cached bar")
+
+    payload["data_quality"] = {"technical_state": "FRESH" if fresh else "STALE"}
+
+    if last_ts:
+        try:
+            ts_dt = parse_iso(str(last_ts))
+            price_age_minutes = (now_et - ts_dt.astimezone(ET)).total_seconds() / 60.0
+        except Exception:  # noqa: BLE001
+            price_age_minutes = None
 
     level_ctx = None
     if last_px is not None:
         payload["last_price"] = last_px
         payload["last_price_ts"] = last_ts
         payload["price_tf"] = price_tf_label
-        payload["price_mode"] = price_mode
+        resolved_price_mode = "LIVE"
+        if price_mode != "live":
+            if session == "RTH" and fresh:
+                resolved_price_mode = "LIVE"
+            else:
+                resolved_price_mode = "CLOSED"
+        payload["price_mode"] = resolved_price_mode
+        if price_age_minutes is not None:
+            payload["price_age_minutes"] = price_age_minutes
         if price_mode == "live":
             payload["price_source"] = price_source
+            payload["trade_context_mode"] = "on_demand"
             payload["analysis_mode"] = "on_demand"
+        elif price_mode == "closed":
+            payload["price_source"] = price_source
         if isinstance(pivots, dict):
             try:
                 level_ctx = build_level_context(last_px, pivots)
@@ -1006,10 +4731,22 @@ def build_signal_payload(sym: str) -> Optional[tuple[dict, float, Dict[str, obje
         except Exception:  # noqa: BLE001
             pass
 
+    # TNT regime (used for discipline gating in autopost/analyze)
+    try:
+        tnt = tnt_regime_assess(payload, now_et=now_et)
+    except Exception:  # noqa: BLE001
+        tnt = {"regime": "UNKNOWN", "posture": "UNKNOWN", "permissions": {}, "reasons": ["tnt assess failed"]}
+    payload["tnt"] = tnt
+    payload["tnt_regime"] = tnt.get("regime")
+    payload["tnt_posture"] = tnt.get("posture")
+    payload["tnt_confidence"] = tnt.get("confidence")
+
+    _maybe_append_regime_audit(payload, now_et=now_et)
+
     return payload, prob_up, gate
 
 
-def build_analysis_payload(sym: str) -> tuple[Optional[dict], Optional[str]]:
+def build_trade_context_payload(sym: str) -> tuple[Optional[dict], Optional[str]]:
     built = build_signal_payload(sym)
     if not built:
         return None, "signal unavailable"
@@ -1031,11 +4768,11 @@ def build_analysis_payload(sym: str) -> tuple[Optional[dict], Optional[str]]:
     return payload, None
 
 
-def build_analysis_packet(
+def build_trade_context_packet(
     sym: str,
     payload: dict,
     *,
-    analysis_mode: str,
+    context_mode: str,
     live_price: Optional[float],
     live_price_ts: Optional[str],
 ) -> tuple[dict, Optional[dict]]:
@@ -1059,10 +4796,10 @@ def build_analysis_packet(
         except Exception:  # noqa: BLE001
             return None
 
-    price_source = "polygon_snapshot" if analysis_mode == "on_demand" else "db_1m"
-    price_val = live_price if analysis_mode == "on_demand" and live_price is not None else payload.get("last_price")
+    price_source = "polygon_snapshot" if context_mode == "on_demand" else "db_1m"
+    price_val = live_price if context_mode == "on_demand" and live_price is not None else payload.get("last_price")
     price_val = _safe_float(price_val)
-    price_ts_val = live_price_ts if analysis_mode == "on_demand" and live_price_ts is not None else payload.get("last_price_ts")
+    price_ts_val = live_price_ts if context_mode == "on_demand" and live_price_ts is not None else payload.get("last_price_ts")
 
     pivot_levels = {
         "P": _safe_float(payload.get("pivot")),
@@ -1089,7 +4826,7 @@ def build_analysis_packet(
     if price_ts_val:
         try:
             ts_dt = parse_iso(price_ts_val)
-            delta = datetime.now(timezone.utc) - ts_dt.astimezone(timezone.utc)
+            delta = _now_utc() - ts_dt.astimezone(timezone.utc)
             data_staleness_s = max(delta.total_seconds(), 0.0)
         except Exception:  # noqa: BLE001
             data_staleness_s = None
@@ -1122,10 +4859,15 @@ def build_analysis_packet(
             "session": market_session_et(),
             "data_staleness_s": data_staleness_s,
         },
-        "analysis_mode": analysis_mode,
+        "trade_context_mode": context_mode,
+        "analysis_mode": context_mode,
     }
 
     return packet, pivots_for_gate
+
+
+build_analysis_payload = build_trade_context_payload
+build_analysis_packet = build_trade_context_packet
 
 
 def build_autopost_payload():
@@ -1155,6 +4897,19 @@ def build_autopost_payload():
     lines.append("🧭 Regime:")
     lines.append("TRANSITION")
     lines.append("")
+    symbols_clean = list(dict.fromkeys(watchlist))
+    now_et = _now_et()
+    session = market_session_et(now_et.astimezone(timezone.utc))
+
+    last_price_block = _format_last_price_section(
+        symbols_clean,
+        now_et=now_et,
+        session=session,
+    )
+    if last_price_block.strip():
+        lines.append("")
+        lines.append(last_price_block.rstrip("\n"))
+
     lines.append(render_directional_confirmation_block(tf=os.getenv("BIAS_TF", "5m")))
     lines.append("")
     lines.append("📐 Key Levels:")
@@ -1170,8 +4925,12 @@ def build_autopost_payload():
     return "\n".join(lines)
 
 
-ET = ZoneInfo("America/New_York")
-ET_TZ = ET
+_NOW_PROVIDER: Optional[Callable[[], datetime]] = None
+
+
+def _set_now_provider(provider: Optional[Callable[[], datetime]]) -> None:
+    global _NOW_PROVIDER
+    _NOW_PROVIDER = provider
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "./db/tnt.db")
@@ -1180,6 +4939,7 @@ MODEL_VERSION = os.getenv("MODEL_VERSION", "heuristic-v1")
 HORIZON_MIN = int(os.getenv("MODEL_HORIZON_MIN", "5"))
 
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0") or "0")
+CANARY_CHANNEL_ID = int(os.getenv("DISCORD_CANARY_CHANNEL_ID", "0") or "0")
 
 
 def db_connect() -> sqlite3.Connection:
@@ -1214,6 +4974,11 @@ def set_analysis_mode(mode: str) -> None:
 
 _autopost_daily_task = None
 _autopost_signal_task = None
+_automation_focus_task: Optional[asyncio.Task] = None
+_automation_intraday_task: Optional[asyncio.Task] = None
+_automation_recap_task: Optional[asyncio.Task] = None
+_automation_heartbeat_task: Optional[asyncio.Task] = None
+_slash_tree_synced = False
 
 DATA_STALE_MAX_MIN = float(os.getenv("DATA_STALE_MAX_MIN", "3") or "3")
 DATA_STALE_WARN_CHANNEL_ID = int(os.getenv("DATA_STALE_WARN_CHANNEL", "0") or "0")
@@ -1223,6 +4988,10 @@ AUTOPOST_EDGE_MIN_STRICT = _env_float("AUTOPOST_EDGE_MIN_STRICT", "0.04")
 AUTOPOST_EDGE_MIN_INSIGHTS = _env_float("AUTOPOST_EDGE_MIN_INSIGHTS", "0.015")
 
 _last_daily_post_et_date: Optional[date] = None
+_last_focus_list_et_date: Optional[date] = None
+_last_intraday_update_et_date: Optional[date] = None
+_last_recap_et_date: Optional[date] = None
+_last_heartbeat_sent_ts: Optional[float] = None
 _last_signal_post_by_symbol: Dict[str, int] = {}
 
 SignalState = Dict[str, object]
@@ -1236,6 +5005,7 @@ _last_monday_date: Optional[date] = None
 
 _data_stale_paused = False
 _data_stale_lock: Optional[asyncio.Lock] = None
+_data_stale_initialized = False
 
 _bootstrap_tasks: dict[str, asyncio.Task] = {}
 
@@ -1250,7 +5020,8 @@ _TF_LABELS = {
 PRICE_TF_LABEL = _TF_LABELS.get(TF.lower() if isinstance(TF, str) else TF, str(TF))
 
 _DEFAULT_FUTURES_CONTEXT_PATH = Path(__file__).resolve().parent.parent / "iqfeed_service" / "output" / "futures_context.json"
-FUTURES_CONTEXT_PATH = os.getenv("FUTURES_CONTEXT_PATH") or str(_DEFAULT_FUTURES_CONTEXT_PATH)
+FUTURES_CONTEXT_PATH = Path(os.getenv("FUTURES_CONTEXT_PATH", "") or _DEFAULT_FUTURES_CONTEXT_PATH).expanduser()
+SMART_MARKET_IQ_PATH = Path(os.getenv("SMART_MARKET_IQ_PATH", "data/smart_market_iq.json") or "data/smart_market_iq.json").expanduser()
 FUTURES_CONTEXT_LABEL = os.getenv("FUTURES_CONTEXT_LABEL", "@ES#")
 FUTURES_STALE_MINUTES_ACTIVE = int(os.getenv("FUTURES_STALE_MINUTES_ACTIVE", "20"))
 FUTURES_STALE_MINUTES_OFFHOURS = int(os.getenv("FUTURES_STALE_MINUTES_OFFHOURS", str(12 * 60)))
@@ -1338,8 +5109,6 @@ AI_MODEL = os.getenv("DISCORD_AI_MODEL", "gpt-5-mini")
 AI_MAX_CHARS = int(os.getenv("DISCORD_AI_MAX_CHARS", "1200") or "1200")
 VERBOSE_DEFAULT = os.getenv("DISCORD_VERBOSE_DEFAULT", "0") == "1"
 
-_openai: Optional[OpenAI] = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if AI_ENABLED else None
-
 
 def _ai_enabled() -> bool:
     return os.getenv("DISCORD_AI_ENABLED", "0") in ("1", "true", "True")
@@ -1363,10 +5132,879 @@ def _ai_timeout() -> float:
         return 12.0
 
 
+def _coach_model_name() -> str:
+    # Prefer TNT_LLM_MODEL so the One Door wrapper can enforce a single locked model.
+    # If unset, fall back to legacy knobs.
+    return (os.getenv("TNT_LLM_MODEL") or os.getenv("OPENAI_MODEL_COACH") or _ai_model()).strip()
+
+
+def _coach_max_tokens() -> int:
+    try:
+        value = int(os.getenv("COACH_MAX_TOKENS", "900") or "900")
+    except Exception:  # noqa: BLE001
+        value = 900
+    return max(200, min(value, 2000))
+
+
+def _extract_ai_text(resp: object) -> str:
+    """Legacy helper retained for downstream compatibility."""
+    text_attr = getattr(resp, "output_text", None)
+    if isinstance(text_attr, str) and text_attr.strip():
+        return text_attr.strip()
+    return ""
+
+
+def _bounded_list(
+    items: Sequence[str],
+    *,
+    min_len: int,
+    max_len: int,
+    filler: str,
+) -> list[str]:
+    cleaned = [itm.strip() for itm in items if isinstance(itm, str) and itm.strip()]
+    while len(cleaned) < min_len:
+        cleaned.append(filler)
+    return cleaned[:max_len]
+
+
+def _compose_coach_sections(
+    answer: str,
+    why_lines: Sequence[str],
+    key_lines: Sequence[str],
+    next_line: str,
+) -> str:
+    lines: list[str] = [f"Answer: {answer.strip()}"]
+    lines.append("Why:")
+    lines.extend(f"- {line}" for line in why_lines)
+    lines.append("Key level / invalidation:")
+    lines.extend(f"- {line}" for line in key_lines)
+    lines.append("Next Step:")
+    lines.append(f"- {next_line.strip()}")
+    return "\n".join(lines)
+
+
+def _build_coach_limited_response(symbol: str, meta: Mapping[str, Any]) -> str:
+    missing_sections: list[str] = []
+    data_quality = meta.get("data_quality") if isinstance(meta, dict) else {}
+    if isinstance(data_quality, dict):
+        dq_missing = data_quality.get("missing_sections")
+        if isinstance(dq_missing, (list, tuple)):
+            missing_sections.extend(str(item) for item in dq_missing if item)
+    meta_missing = meta.get("missing_sections") if isinstance(meta, dict) else []
+    if isinstance(meta_missing, (list, tuple)):
+        missing_sections.extend(str(item) for item in meta_missing if item)
+    if not missing_sections:
+        missing_sections = []
+
+    reasons: list[str] = []
+    if missing_sections:
+        joined = ", ".join(sorted(set(missing_sections)))
+        reasons.append(f"Missing sections: {joined}.")
+
+    gate_info = meta.get("gate") if isinstance(meta, dict) else None
+    if isinstance(gate_info, dict):
+        mode = str(gate_info.get("mode") or "").upper()
+        reason = gate_info.get("reason")
+        if mode and mode != "OK":
+            detail = f"Gate {mode}" + (f" — {reason}" if reason else "")
+            reasons.append(detail)
+
+    if not reasons:
+        reasons.append("Analyze returned limited data; live inputs not confirmed.")
+
+    why_lines = _bounded_list(
+        reasons,
+        min_len=2,
+        max_len=4,
+        filler="Respect capital until data refreshes."
+    )
+
+    key_lines = _bounded_list(
+        ["Wait for fresh price and signal data before defining triggers."],
+        min_len=1,
+        max_len=2,
+        filler="Use pivots from /analyze once live data resumes."
+    )
+
+    next_line = f"Re-run /analyze {symbol.upper()} once the feed updates."
+    return _compose_coach_sections(
+        "Not actionable — data not ready",
+        why_lines,
+        key_lines,
+        next_line,
+    )
+
+
+def _build_coach_user_text(question: str) -> str:
+    return (
+        "Answer the user's question using ONLY TNT_STATE.\n"
+        "Be concise, confident, and specific.\n"
+        "If timestamps look stale or permissions.no_trade is true, do NOT go silent: answer in a standby mode.\n"
+        "In standby mode: avoid price/level claims, give scenario-based guidance for the next session open, and list what to watch.\n"
+        "Never claim certainty about tomorrow's direction.\n"
+        "Never invent prices, indicators, levels, or timestamps beyond what TNT_STATE contains.\n"
+        "Do not provide financial advice.\n"
+        "You may reference specific option contracts ONLY if they appear in TNT_STATE; do not recommend a specific contract trade.\n\n"
+        "When data is healthy (TNT_STATE.meta.data_health == OK and permissions.no_trade == false), ground conditions using these fields when available:\n"
+        "- TNT_STATE.price.last\n"
+        "- TNT_STATE.levels.pivots_rth (P, S1, R1)\n\n"
+        "If present, you MAY also reference numeric indicators from TNT_STATE.technicals (RSI14, MACD histogram) ONLY when data is healthy; do not use them in standby mode.\n\n"
+        "If TNT_STATE.context.recent_daily_trend is present, use it to describe the past few sessions' trend.\n\n"
+
+        "If TNT_STATE.edge_profile is present, tailor tone/constraints to that profile (risk budget, preferred setups, avoid list).\n\n"
+        "Respond using exactly this format:\n"
+        "Answer: <bias + why in one sentence>\n"
+        "Bullish only if:\n"
+        "- condition\n"
+        "Bearish if:\n"
+        "- condition\n"
+        "Invalidation:\n"
+        "- level or state that cancels the idea\n"
+        "Do nothing if:\n"
+        "- condition that tells traders to stand aside\n\n"
+        "User question:\n"
+        f"{question.strip()}"
+    ).strip()
+
+
+def _sanitize_edge_profile(obj: object) -> Optional[dict[str, Any]]:
+    if not isinstance(obj, dict):
+        return None
+
+    def _clean_str(val: object, *, max_len: int = 120) -> Optional[str]:
+        if not isinstance(val, str):
+            return None
+        s = val.strip()
+        if not s:
+            return None
+        return s[:max_len]
+
+    def _clean_list(val: object, *, max_items: int = 8, max_len: int = 80) -> list[str]:
+        if not isinstance(val, (list, tuple)):
+            return []
+        out: list[str] = []
+        for item in val:
+            s = _clean_str(item, max_len=max_len)
+            if s:
+                out.append(s)
+            if len(out) >= max_items:
+                break
+        return out
+
+    profile: dict[str, Any] = {}
+    risk_budget = _clean_str(obj.get("risk_budget"))
+    if risk_budget:
+        profile["risk_budget"] = risk_budget.upper()
+    hold_time = _clean_str(obj.get("hold_time"))
+    if hold_time:
+        profile["hold_time"] = hold_time.upper()
+    profile["preferred_setups"] = _clean_list(obj.get("preferred_setups"))
+    profile["avoid"] = _clean_list(obj.get("avoid"))
+
+    notes = _clean_str(obj.get("notes"), max_len=240)
+    if notes:
+        profile["notes"] = notes
+
+    # Drop empty profiles.
+    if not any(profile.get(k) for k in ("risk_budget", "hold_time", "preferred_setups", "avoid", "notes")):
+        return None
+    return profile
+
+
+def _load_global_edge_profile() -> Optional[dict[str, Any]]:
+    """Load a single global edge profile (no user-id).
+
+    Sources (first hit wins):
+    1) `TNT_EDGE_PROFILE_JSON` env var
+    2) SQLite settings key `edge_profile_json`
+    """
+
+    raw = (os.getenv("TNT_EDGE_PROFILE_JSON") or "").strip()
+    if raw:
+        try:
+            obj = json.loads(raw)
+            return _sanitize_edge_profile(obj)
+        except Exception:  # noqa: BLE001
+            return None
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            migrate_settings_table(conn)
+            raw_db = settings_get(conn, "edge_profile_json", "").strip()
+        if raw_db:
+            obj = json.loads(raw_db)
+            return _sanitize_edge_profile(obj)
+    except Exception:  # noqa: BLE001
+        return None
+
+    return None
+
+
+def _build_coach_data_snapshot_line(tnt_state: Mapping[str, Any]) -> str:
+    """Deterministic one-liner that adds grounding context for /ask.
+
+    IMPORTANT: If data health is not OK or permissions.no_trade is true, we intentionally
+    avoid printing prices/levels (standby rules).
+    """
+
+    meta = tnt_state.get("meta") if isinstance(tnt_state.get("meta"), dict) else {}
+    permissions = tnt_state.get("permissions") if isinstance(tnt_state.get("permissions"), dict) else {}
+    levels = tnt_state.get("levels") if isinstance(tnt_state.get("levels"), dict) else {}
+
+    data_health = str(meta.get("data_health") or "UNKNOWN").upper()
+    freshness = meta.get("data_freshness_sec")
+    no_trade = bool(permissions.get("no_trade"))
+
+    freshness_txt = "n/a"
+    if isinstance(freshness, (int, float)):
+        freshness_txt = f"{int(freshness)}s"
+
+    if data_health != "OK" or no_trade:
+        return f"Data: health {data_health} (freshness {freshness_txt})"
+
+    price = tnt_state.get("price") if isinstance(tnt_state.get("price"), dict) else {}
+    last = price.get("last")
+    last_f: Optional[float] = None
+    if isinstance(last, (int, float)):
+        last_f = float(last)
+
+    piv = levels.get("pivots_rth") if isinstance(levels.get("pivots_rth"), dict) else {}
+    p = piv.get("P")
+    s1 = piv.get("S1")
+    r1 = piv.get("R1")
+
+    tech = tnt_state.get("technicals") if isinstance(tnt_state.get("technicals"), dict) else {}
+    rsi_14 = tech.get("rsi_14")
+    macd_hist = tech.get("macd_hist")
+    macd_hist_pct = tech.get("macd_hist_pct")
+    tf = tech.get("tf")
+    vwap = tech.get("vwap")
+    trend = tech.get("trend") if isinstance(tech.get("trend"), dict) else None
+    trend_dir = trend.get("direction") if isinstance(trend, dict) else None
+    trend_strength = trend.get("strength") if isinstance(trend, dict) else None
+
+    def _fmt_num(val: object, nd: int = 2) -> str:
+        try:
+            return f"{float(val):.{nd}f}" if val is not None else "n/a"
+        except Exception:  # noqa: BLE001
+            return "n/a"
+
+    def _fmt(val: object) -> str:
+        return fmt_money(float(val)) if isinstance(val, (int, float)) else "n/a"
+
+    last_txt = fmt_money(last_f) if last_f is not None else "n/a"
+    tech_bits: list[str] = []
+    if tf:
+        tech_bits.append(f"tf {tf}")
+
+    if isinstance(vwap, (int, float)) and last_f is not None:
+        try:
+            delta = float(last_f) - float(vwap)
+            side = "above" if delta >= 0 else "below"
+            tech_bits.append(f"VWAP {side} {_fmt_num(abs(delta), 2)}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    if isinstance(trend_dir, str) and trend_dir:
+        if isinstance(trend_strength, (int, float)):
+            tech_bits.append(f"Trend {trend_dir} ({_fmt_num(trend_strength, 2)})")
+        else:
+            tech_bits.append(f"Trend {trend_dir}")
+
+    if isinstance(rsi_14, (int, float)):
+        tech_bits.append(f"RSI14 {_fmt_num(rsi_14, 1)}")
+    if isinstance(macd_hist, (int, float)):
+        if isinstance(macd_hist_pct, (int, float)):
+            tech_bits.append(f"MACD hist {_fmt_num(macd_hist, 4)} ({_fmt_num(macd_hist_pct, 3)}%)")
+        else:
+            tech_bits.append(f"MACD hist {_fmt_num(macd_hist, 4)}")
+
+    tvds = tnt_state.get("tvds") if isinstance(tnt_state.get("tvds"), dict) else {}
+    tvds_score = tvds.get("score")
+    tvds_label = tvds.get("label")
+
+    do_nothing = tnt_state.get("do_nothing_alert") if isinstance(tnt_state.get("do_nothing_alert"), dict) else {}
+    do_nothing_enabled = bool(do_nothing.get("enabled"))
+
+    extra_bits: list[str] = []
+    if isinstance(tvds_score, (int, float)) and isinstance(tvds_label, str) and tvds_label:
+        extra_bits.append(f"TVDS {float(tvds_score):.1f} {tvds_label}")
+    if do_nothing_enabled:
+        extra_bits.append("DO_NOTHING")
+
+    tech_txt = (" | " + " | ".join(tech_bits)) if tech_bits else ""
+    extra_txt = (" | " + " | ".join(extra_bits)) if extra_bits else ""
+    return f"Data: last {last_txt} | P {_fmt(p)} | S1 {_fmt(s1)} | R1 {_fmt(r1)}{tech_txt}{extra_txt} | health {data_health} ({freshness_txt})"
+
+
+_COACH_SYSTEM_ADDENDUM = (
+    "COACH MODE OVERRIDE:\n"
+    "- Your ONLY factual context is TNT_STATE (authoritative).\n"
+    "- Follow the user's requested output format EXACTLY.\n"
+    "- Do not include extra sections, headings, or commentary outside the format.\n"
+    "- If data is stale/closed, answer in standby mode using recent session history from TNT_STATE if present.\n"
+)
+
+
+async def _compute_recent_daily_trend(symbol: str, *, sessions: int = 5) -> Optional[dict[str, object]]:
+    """Return a small trend summary using the last `sessions` daily bars.
+
+    Preference order:
+    1) Local DB (tf='1d')
+    2) Provider daily bars via UnifiedDataConnector (Polygon)
+    """
+
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+
+    bars: list[dict[str, object]] = []
+
+    # 1) DB bars (fast, offline)
+    try:
+        rows = get_last_n_bars(sym, tf="1d", n=max(int(sessions) + 3, 8))
+        for ts, o, h, l, c in rows:
+            try:
+                bars.append(
+                    {
+                        "ts": str(ts),
+                        "date": str(ts)[:10],
+                        "open": float(o),
+                        "high": float(h),
+                        "low": float(l),
+                        "close": float(c),
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        bars = []
+
+    # 2) Provider fallback (must be async-safe; do NOT call sync wrappers that use asyncio.run).
+    if not bars:
+        try:
+            from datetime import datetime, timedelta
+
+            from zero_dte_pipeline.data_connectors.unified import UnifiedDataConnector
+
+            providers = ["polygon"]
+            end = datetime.now()
+            # Grab extra days to cover weekends/holidays.
+            start = end - timedelta(days=max(int(sessions) * 6, 30))
+
+            async with UnifiedDataConnector(priority=providers) as connector:
+                df = await connector.get_historical_bars(sym, start, end, "1d", providers=providers)
+
+            if df is not None and getattr(df, "empty", True) is False:
+                cols = {str(c).lower(): c for c in getattr(df, "columns", [])}
+                ts_col = cols.get("ts") or cols.get("timestamp")
+                o_col = cols.get("open")
+                h_col = cols.get("high")
+                l_col = cols.get("low")
+                c_col = cols.get("close")
+
+                tail = df.tail(max(int(sessions) + 3, 8))
+                for _idx, row in tail.iterrows():
+                    try:
+                        ts_val = row[ts_col] if ts_col is not None else None
+                        if ts_val is None and hasattr(row, "name"):
+                            ts_val = row.name
+                        ts_str = str(ts_val) if ts_val is not None else ""
+                        if not ts_str:
+                            continue
+                        bars.append(
+                            {
+                                "ts": ts_str,
+                                "date": ts_str[:10],
+                                "open": float(row[o_col]) if o_col is not None else float("nan"),
+                                "high": float(row[h_col]) if h_col is not None else float("nan"),
+                                "low": float(row[l_col]) if l_col is not None else float("nan"),
+                                "close": float(row[c_col]) if c_col is not None else float("nan"),
+                            }
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+        except Exception:  # noqa: BLE001
+            bars = []
+
+    if not bars:
+        return None
+
+    # Keep only the last N sessions with valid closes.
+    bars = [b for b in bars if isinstance(b.get("close"), (int, float))]
+    if len(bars) < 2:
+        return None
+
+    tail = bars[-int(sessions):] if len(bars) > int(sessions) else bars
+    closes = [float(b["close"]) for b in tail]
+    dates = [str(b.get("date") or "") for b in tail]
+
+    first = closes[0]
+    last = closes[-1]
+    ret_pct = None
+    if first not in (0.0, -0.0):
+        try:
+            ret_pct = (last / first - 1.0) * 100.0
+        except Exception:  # noqa: BLE001
+            ret_pct = None
+
+    # Simple per-session slope (points per day).
+    slope_pts = (last - first) / max(len(closes) - 1, 1)
+
+    trend = "FLAT"
+    if ret_pct is not None:
+        if ret_pct >= 0.75:
+            trend = "UP"
+        elif ret_pct <= -0.75:
+            trend = "DOWN"
+
+    return {
+        "symbol": sym,
+        "sessions": len(closes),
+        "dates": dates,
+        "closes": closes,
+        "return_pct": ret_pct,
+        "slope_pts_per_session": slope_pts,
+        "trend": trend,
+        "last_bar": tail[-1],
+        "prev_bar": tail[-2] if len(tail) >= 2 else None,
+        "source": "db" if get_latest_daily_bar(sym) is not None else "provider",
+    }
+
+
+def _build_trend_based_coach_response(symbol: str, trend: Mapping[str, Any]) -> str:
+    sym = (symbol or "").strip().upper() or "UNKNOWN"
+
+    tr = str(trend.get("trend") or "FLAT").upper()
+    sessions = trend.get("sessions")
+    ret_pct = trend.get("return_pct")
+    last_bar = trend.get("last_bar") if isinstance(trend.get("last_bar"), Mapping) else {}
+    prev_bar = trend.get("prev_bar") if isinstance(trend.get("prev_bar"), Mapping) else {}
+
+    def _fmt_num(x: object) -> str:
+        try:
+            return f"{float(x):.2f}"
+        except Exception:  # noqa: BLE001
+            return "n/a"
+
+    last_close = _fmt_num(last_bar.get("close"))
+    prev_high = _fmt_num(prev_bar.get("high"))
+    prev_low = _fmt_num(prev_bar.get("low"))
+
+    # Use pivots if available (DB-derived) for cleaner conditions.
+    piv = None
+    try:
+        piv_info = get_latest_daily_pivots(sym)
+        if isinstance(piv_info, dict) and isinstance(piv_info.get("piv"), dict):
+            piv = piv_info.get("piv", {}).get("P")
+    except Exception:  # noqa: BLE001
+        piv = None
+    pivot_txt = _fmt_num(piv)
+
+    ret_txt = "n/a"
+    if isinstance(ret_pct, (int, float)):
+        ret_txt = f"{float(ret_pct):+.2f}%"
+
+    sess_txt = str(sessions) if isinstance(sessions, int) else "recent"
+
+    has_pivot = piv is not None
+
+    if tr == "UP":
+        answer = (
+            f"Conditional bullish tilt: last {sess_txt} daily closes are trending up ({ret_txt}); "
+            + (f"tomorrow depends on holding/reclaiming Pivot {pivot_txt}." if has_pivot else "tomorrow depends on holding the prior range and continuing higher.")
+        )
+        bull = (
+            f"Acceptance above Pivot {pivot_txt} with strength over prior high {prev_high}."
+            if has_pivot
+            else f"Strength over prior high {prev_high} with follow-through."
+        )
+        bear = (
+            f"Break below prior low {prev_low} or failure to reclaim Pivot {pivot_txt}."
+            if has_pivot
+            else f"Break and hold below prior low {prev_low}."
+        )
+        invalid = (
+            f"Breakout above {prev_high} that reverses back below Pivot {pivot_txt}."
+            if has_pivot
+            else f"Breakout above {prev_high} that fails and returns into the prior range."
+        )
+        idle = "First hour chops around Pivot with no clean direction."
+    elif tr == "DOWN":
+        answer = (
+            f"Conditional bearish tilt: last {sess_txt} daily closes are trending down ({ret_txt}); "
+            + (f"tomorrow depends on rejecting Pivot {pivot_txt}." if has_pivot else "tomorrow depends on continued rejection of the prior range and making lower lows.")
+        )
+        bull = (
+            f"Reclaim Pivot {pivot_txt} and hold above it; then watch for continuation above {prev_high}."
+            if has_pivot
+            else f"Reclaim and hold above prior high {prev_high}."
+        )
+        bear = (
+            f"Acceptance below Pivot {pivot_txt} and continuation under prior low {prev_low}."
+            if has_pivot
+            else f"Continuation under prior low {prev_low}."
+        )
+        invalid = (
+            f"Reclaim and hold back above Pivot {pivot_txt} after a breakdown."
+            if has_pivot
+            else f"Breakdown that snaps back above the prior range."
+        )
+        idle = "No clean reclaim/reject at Pivot in the first 30–60 minutes."
+    else:
+        answer = (
+            f"Neutral/range tilt: last {sess_txt} daily closes are mixed/flat ({ret_txt}); "
+            + (f"tomorrow is about a clean break from Pivot {pivot_txt}." if has_pivot else "tomorrow is about a clean break from the prior day range.")
+        )
+        bull = (
+            f"Hold above Pivot {pivot_txt} and break/hold above {prev_high}."
+            if has_pivot
+            else f"Break/hold above prior high {prev_high}."
+        )
+        bear = (
+            f"Lose Pivot {pivot_txt} and break/hold below {prev_low}."
+            if has_pivot
+            else f"Break/hold below prior low {prev_low}."
+        )
+        invalid = "Any breakout that fails and returns to the middle of the range."
+        idle = "Price stays inside the prior day range with no expansion."
+
+    # Last close is included as a gentle anchor (it is factual from bars).
+    answer = f"{answer} (Last close: {last_close})"
+
+    return "\n".join(
+        [
+            f"Answer: {answer}",
+            "Bullish only if:",
+            f"- {bull}",
+            "Bearish if:",
+            f"- {bear}",
+            "Invalidation:",
+            f"- {invalid}",
+            "Do nothing if:",
+            f"- {idle}",
+        ]
+    )
+
+
+def _build_coach_error_response(symbol: str, reason: str) -> str:
+    symbol_clean = (symbol or "").strip().upper() or "UNKNOWN"
+    reason_clean = (reason or "coach error").strip().split("\n", 1)[0][:160]
+    lines = [
+        f"⚠️ Coach temporarily unavailable for {symbol_clean}.",
+        f"Details: {reason_clean}.",
+        "Posting the latest /analyze output so you still have actionable levels.",
+    ]
+    return "\n".join(lines)
+
+
+def _normalize_coach_output(raw: str) -> tuple[str, bool]:
+    answer: Optional[str] = None
+    bull_lines: list[str] = []
+    bear_lines: list[str] = []
+    invalidation_line: Optional[str] = None
+    do_nothing_line: Optional[str] = None
+    section: Optional[str] = None
+
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if lower.startswith("answer"):
+            answer = line.split(":", 1)[1].strip() if ":" in line else line
+            section = None
+            continue
+        if lower.startswith("bullish only if"):
+            section = "bull"
+            continue
+        if lower.startswith("bearish if"):
+            section = "bear"
+            continue
+        if lower.startswith("invalidation"):
+            section = "invalid"
+            continue
+        if lower.startswith("do nothing if"):
+            section = "idle"
+            continue
+
+        content = line.lstrip("-• ").strip()
+        if not content:
+            continue
+        if section == "bull":
+            bull_lines.append(content)
+        elif section == "bear":
+            bear_lines.append(content)
+        elif section == "invalid" and not invalidation_line:
+            invalidation_line = content
+        elif section == "idle" and not do_nothing_line:
+            do_nothing_line = content
+
+    if not (answer and bull_lines and bear_lines and invalidation_line and do_nothing_line):
+        return "", False
+
+    bull_norm = _bounded_list(bull_lines, min_len=1, max_len=2, filler="Wait for /analyze once live data resumes.")
+    bear_norm = _bounded_list(bear_lines, min_len=1, max_len=2, filler="Wait for /analyze once live data resumes.")
+
+    composed_lines: list[str] = [f"Answer: {answer}", "Bullish only if:"]
+    for entry in bull_norm:
+        composed_lines.append(f"- {entry}")
+    composed_lines.append("Bearish if:")
+    for entry in bear_norm:
+        composed_lines.append(f"- {entry}")
+    composed_lines.append("Invalidation:")
+    composed_lines.append(f"- {invalidation_line}")
+    composed_lines.append("Do nothing if:")
+    composed_lines.append(f"- {do_nothing_line}")
+
+    return "\n".join(composed_lines), True
+
+
+async def _call_openai_coach(
+    *,
+    question: str,
+    render: RenderedPost,
+    analysis_payload: Mapping[str, Any],
+    recent_daily_trend: Optional[Mapping[str, Any]] = None,
+    options_chain_summary: Optional[Mapping[str, Any]] = None,
+) -> tuple[str, Optional[str], Optional[str]]:
+    tnt_state = build_tnt_state_from_analysis_payload(analysis_payload).state
+    if recent_daily_trend is not None:
+        try:
+            ctx = tnt_state.get("context")
+            if isinstance(ctx, dict):
+                ctx["recent_daily_trend"] = dict(recent_daily_trend)
+        except Exception:  # noqa: BLE001
+            pass
+    if options_chain_summary is not None:
+        try:
+            tnt_state["options_chain"] = dict(options_chain_summary)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Global (non-userid) edge profile to guide coaching style.
+    try:
+        profile = _load_global_edge_profile()
+        if profile:
+            tnt_state["edge_profile"] = profile
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Add deterministic edge/risk fields after all context is injected.
+    try:
+        enrich_tnt_state(tnt_state)
+    except Exception:  # noqa: BLE001
+        pass
+    user_text = _build_coach_user_text(question)
+    result = await call_tnt_agent_async(
+        tnt_state=tnt_state,
+        user_text=user_text,
+        label="coach",
+        model=_coach_model_name(),
+        max_output_tokens=_coach_max_tokens(),
+        temperature=0.35,
+        system_addendum=_COACH_SYSTEM_ADDENDUM,
+    )
+    return (result.text or "").strip(), result.prompt_sha256, result.tnt_state_sha256
+
+
+async def _run_analyze_for_symbol(symbol: str) -> tuple[str, dict[str, Any]]:
+    render, _ = await _fetch_on_demand_render(symbol, allow_cache=True)
+    payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+    return render.text, payload
+
+
+async def run_analyze_then_coach(symbol: str, question: str) -> tuple[str, RenderedPost, str, bool, float]:
+    started = time_lib.time()
+    sym = (symbol or "").strip().upper()
+
+    # Global, non-symbol questions: answer deterministically when possible.
+    # Example: "which stock had the most volume today?" can be answered via Polygon/Massive grouped daily
+    # even if intraday bars are stale and /analyze is in stand-down.
+    if _is_volume_leader_question(question):
+        try:
+            answer = await _answer_volume_leader_question(question)
+        except Exception:  # noqa: BLE001
+            answer = None
+        latency_ms = (time_lib.time() - started) * 1000.0
+        if answer:
+            cached = _get_cached_analyze(sym)
+            render = cached.render if cached is not None else RenderedPost(text="", agent_payload={})
+            return answer, render, "ok", False, latency_ms
+
+    if _is_market_session_question(question):
+        latency_ms = (time_lib.time() - started) * 1000.0
+        cached = _get_cached_analyze(sym)
+        render = cached.render if cached is not None else RenderedPost(text="", agent_payload={})
+        return _answer_market_session_question(), render, "ok", False, latency_ms
+
+    if _is_watchlist_question(question):
+        latency_ms = (time_lib.time() - started) * 1000.0
+        cached = _get_cached_analyze(sym)
+        render = cached.render if cached is not None else RenderedPost(text="", agent_payload={})
+        return _answer_watchlist_question(), render, "ok", False, latency_ms
+
+    cached_before = _get_cached_analyze(sym)
+    analyze_text, payload = await _run_analyze_for_symbol(sym)
+    cache_entry = _get_cached_analyze(sym) or cached_before
+    cache_hit = cache_entry is not None and cache_entry is cached_before and cached_before is not None
+
+    if cache_entry is not None:
+        render = cache_entry.render
+    else:
+        render = RenderedPost(text=analyze_text, agent_payload=payload)
+
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    stand_down = bool(meta.get("stand_down"))
+    missing_sections = meta.get("missing_sections") if isinstance(meta, dict) else []
+    if isinstance(missing_sections, (list, tuple)) and missing_sections:
+        stand_down = True
+
+    # Build a small recent-history trend block (daily closes) so /ask can answer even when markets are closed.
+    recent_trend = await _compute_recent_daily_trend(sym, sessions=5)
+
+    # If the user explicitly asked for the trend, answer deterministically (avoid LLM).
+    if _is_trend_question(question) and recent_trend is not None:
+        coach_text = _build_trend_based_coach_response(sym, recent_trend)
+        latency_ms = (time_lib.time() - started) * 1000.0
+        return coach_text, render, "ok", cache_hit, latency_ms
+
+    # Deterministic snapshot for /ask (only shown when data is healthy/tradable).
+    try:
+        tnt_state_for_snapshot = build_tnt_state_from_analysis_payload(payload or {}).state
+    except Exception:  # noqa: BLE001
+        tnt_state_for_snapshot = {}
+
+    # Symbol-specific preplanned answers that depend on TNT_STATE.
+    if _is_key_levels_question(question):
+        try:
+            preplanned = _answer_key_levels_question(sym, tnt_state_for_snapshot)
+        except Exception:  # noqa: BLE001
+            preplanned = None
+        if preplanned:
+            latency_ms = (time_lib.time() - started) * 1000.0
+            return preplanned, render, "ok", cache_hit, latency_ms
+
+    # Options chain microstructure (Polygon/Massive only). Cache aggressively.
+    options_micro = None
+    cached_opt = _get_cached_options_micro(sym)
+    if cached_opt is not None:
+        options_micro = cached_opt.packet
+    else:
+        try:
+            df = await _fetch_polygon_options_chain_df(sym)
+            if df is not None and getattr(df, "empty", True) is False:
+                api_key, _base, provider_label = _polygon_key_and_base()
+                now_et = _now_et()
+                summary = summarize_options_chain(
+                    df,
+                    underlying=sym,
+                    asof_et=now_et.isoformat(),
+                    provider=provider_label,
+                    max_per_side=_env_int("OPTIONS_MICRO_MAX_PER_SIDE", 8),
+                ).payload
+                options_micro = summary
+                _set_cached_options_micro(sym, summary)
+        except Exception:  # noqa: BLE001
+            options_micro = None
+
+    # If markets are closed / analysis is gated, we still want /ask to answer.
+    # Prefer a deterministic trend-based answer over any standby analyze block.
+    if stand_down and recent_trend is not None:
+        coach_text = _build_trend_based_coach_response(sym, recent_trend)
+        latency_ms = (time_lib.time() - started) * 1000.0
+        return coach_text, render, "ok_standby", cache_hit, latency_ms
+
+    # Even in stand-down (closed markets / missing sections), try the coach so /ask still answers.
+    # The prompt enforces standby behavior (no invented prices/levels) when data isn't ready.
+
+    prompt_sha: Optional[str] = None
+    state_sha: Optional[str] = None
+    try:
+        raw_reply, prompt_sha, state_sha = await _call_openai_coach(
+            question=question,
+            render=render,
+            analysis_payload=payload or {},
+            recent_daily_trend=recent_trend,
+            options_chain_summary=options_micro,
+        )
+        coach_text, ok = _normalize_coach_output(raw_reply)
+        if stand_down:
+            if ok:
+                status = "ok_standby"
+            else:
+                # If the LLM drifts from the strict format, fall back to a deterministic
+                # trend-based answer using recent daily history.
+                if recent_trend is not None:
+                    coach_text = _build_trend_based_coach_response(sym, recent_trend)
+                    ok = True
+                    status = "ok_standby"
+                else:
+                    coach_text = _build_coach_limited_response(sym, meta or {})
+                    status = "limited"
+        else:
+            status = "ok" if ok else "format_error"
+        if not ok:
+            coach_text = _build_coach_error_response(sym, "Invalid coach format")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[COACH][ERROR] {sym.upper()}: {exc}")
+        if stand_down:
+            if recent_trend is not None:
+                coach_text = _build_trend_based_coach_response(sym, recent_trend)
+                status = "ok_standby"
+            else:
+                coach_text = _build_coach_limited_response(sym, meta or {})
+                status = "limited"
+        else:
+            coach_text = _build_coach_error_response(sym, str(exc))
+            status = "error"
+
+    if status in {"error", "format_error"}:
+        try:
+            msg = _format_ops_event(
+                tag="llm_fail",
+                label="ask",
+                symbols=[sym.upper()],
+                status=status,
+                contracts={"agent": AUTOPOST_CONTRACT_VERSION, "chart": "1.0"},
+                prompt_sha256=prompt_sha,
+                tnt_state_sha256=state_sha,
+                violations=["COACH_FAILED" if status == "error" else "COACH_FORMAT_ERROR"],
+                audit_path=None,
+            )
+            await _notify_ops_quiet(client=bot, message=msg)
+        except Exception:
+            pass
+
+    latency_ms = (time_lib.time() - started) * 1000.0
+
+    # Add deterministic market snapshot when we are not in stand-down.
+    try:
+        if status == "ok" and isinstance(tnt_state_for_snapshot, dict) and tnt_state_for_snapshot:
+            snapshot_line = _build_coach_data_snapshot_line(tnt_state_for_snapshot)
+            # Only include prices/levels when the snapshot says health is OK and no_trade is false.
+            if snapshot_line and "health OK" in snapshot_line:
+                coach_text = f"{snapshot_line}\n{coach_text}".strip()
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Always anchor with Numeric Bias Pack (best-effort) before any coach text.
+    try:
+        from delivery.numeric_bias_pack import format_numeric_bias_pack_from_analysis_payload
+
+        pack = format_numeric_bias_pack_from_analysis_payload(analysis_payload=payload or {})
+        if pack:
+            coach_text = f"{pack}\n\n{coach_text}".strip()
+    except Exception:  # noqa: BLE001
+        pass
+
+    return coach_text, render, status, cache_hit, latency_ms
+
+
 async def ai_render_trade_context(openai_client, packet: dict) -> Tuple[Optional[str], Optional[str]]:
     """Return (text, err) using packet + AI narrative (AI supplies only plan + notes)."""
 
-    if not _ai_enabled() or openai_client is None:
+    if not _ai_enabled():
         return None, "AI disabled"
 
     def _render(packet: dict, payload: dict) -> str:
@@ -1480,55 +6118,67 @@ async def ai_render_trade_context(openai_client, packet: dict) -> Tuple[Optional
         else:
             lines.append("• Bear: wait for breakdown below Pivot with confirmation")
 
-        lines.append("")
-        lines.append("🧭 Market Confirmation:")
-        lines.append(render_directional_confirmation_block(tf=os.getenv("BIAS_TF", "5m")))
+            VALID_MODES = {"strict", "insights"}
 
-        lines.append("")
-        lines.append("🚫 Do Nothing If:")
-        if do_nothing:
-            for item in do_nothing:
-                lines.append(f"• {item}")
-        else:
-            lines.append("• Confirmation flips hard against the bias or data turns stale")
 
-        staleness = packet.get("notes", {}).get("data_staleness_s") if isinstance(packet.get("notes"), dict) else None
-        if isinstance(staleness, (int, float)) and staleness > 90:
-            lines.append("")
-            lines.append(f"⚠️ Data staleness: last price {staleness/60:.1f} min old")
+            def get_trade_context_mode() -> str:
+                with db_connect() as conn:
+                    raw = settings_get(conn, "trade_context_mode", None)
+                    if raw is None:
+                        raw = settings_get(conn, "analysis_mode", "insights")
+                    mode = (raw or "insights").strip().lower()
+                if mode not in VALID_MODES:
+                    mode = "insights"
+                return mode
 
+
+            def set_trade_context_mode(mode: str) -> None:
+                mode_clean = (mode or "insights").strip().lower()
+                if mode_clean not in VALID_MODES:
+                    raise ValueError(f"Invalid mode {mode_clean!r}; must be one of {sorted(VALID_MODES)}")
+                with db_connect() as conn:
+                    settings_set(conn, "trade_context_mode", mode_clean)
+                    settings_set(conn, "analysis_mode", mode_clean)
+
+
+            get_analysis_mode = get_trade_context_mode
+            set_analysis_mode = set_trade_context_mode
         lines.append("")
         lines.append("_Not financial advice._")
         return "\n".join(lines)
 
-    sys = (
-        "You are TNT Trading Bot. Draft ONLY the narrative fields for a trade context.\n"
-        "Follow the schema exactly and never output prose outside JSON.\n"
-        "Schema (all fields required):\n"
-        '{"bias": string, "regime": string, "plan_bull": [string], "plan_bear": [string], "do_nothing": [string]}\n'
-        "Rules:\n"
-        "- Use ONLY facts from the provided packet. Do NOT invent prices, levels, times, or news.\n"
-        "- Keep each string under 160 characters.\n"
-        "- Focus on rationale and execution notes; reference named levels (Pivot, R1, S1) instead of creating new numbers.\n"
-        "- Bullet strings should be actionable (e.g., trigger, target, invalidation).\n"
-        "- Maintain a neutral, professional tone.\n"
-        "Respond with valid JSON only."
-    )
-
-    user = "Packet:\n" + json.dumps(packet, ensure_ascii=False)
-
     try:
-        resp = await asyncio.wait_for(
-            openai_client.responses.create(  # type: ignore[call-arg]
+        tnt_state = build_tnt_state_from_packet(packet).state
+        user_text = (
+            "Task: Draft ONLY the narrative fields for a trade context.\n"
+            "Follow the schema exactly and never output prose outside JSON.\n"
+            "Schema (all fields required):\n"
+            '{"bias": string, "regime": string, "plan_bull": [string], "plan_bear": [string], "do_nothing": [string]}\n'
+            "Rules:\n"
+            "- Use ONLY facts from TNT_STATE. Do NOT invent prices, levels, times, or news.\n"
+            "- Keep each string under 160 characters.\n"
+            "- Focus on rationale and execution notes; reference named levels (Pivot, R1, S1) instead of creating new numbers.\n"
+            "- Bullet strings should be behavioral and conditional; never provide execution verbs.\n"
+            "- Maintain a calm, firm, professional tone.\n"
+            "Respond with valid JSON only."
+        )
+        result = await asyncio.wait_for(
+            call_tnt_agent_async(
+                tnt_state=tnt_state,
+                user_text=user_text,
+                label="trade_context_json",
                 model=_ai_model(),
-                input=user,
-                instructions=sys,
                 max_output_tokens=400,
                 temperature=0.2,
             ),
             timeout=_ai_timeout(),
         )
-        raw = getattr(resp, "output_text", "") or ""
+        try:
+            packet["tnt_state_sha256"] = result.tnt_state_sha256
+            packet["tnt_prompt_sha256"] = result.prompt_sha256
+        except Exception:  # noqa: BLE001
+            pass
+        raw = result.text
     except Exception as exc:  # noqa: BLE001
         return None, f"AI error: {exc}"
 
@@ -1596,7 +6246,140 @@ ANALYZE_SYNONYMS = {
     "MICROSOFT": "MSFT",
     "NVDA": "NVDA",
     "NVIDIA": "NVDA",
+    "SPX": "I:SPX",
+    "VIX": "I:VIX",
+
+    # Synthetic futures proxies (ETF-based; Polygon-supported).
+    # These are convenience aliases only — not real futures symbols.
+    "ES": "SPY",
+    "NQ": "QQQ",
+    "RTY": "IWM",
+    # Rates proxy (10Y note futures conceptually maps to duration).
+    "ZN": "TLT",
+    # Crude proxy.
+    "CL": "USO",
 }
+
+QUESTION_STOPWORDS = {
+    "IS",
+    "ARE",
+    "THE",
+    "WHAT",
+    "WHATS",
+    "SHOULD",
+    "IM",
+    "I",
+    "YOU",
+    "WE",
+    "THEY",
+    "IT",
+    "THIS",
+    "THAT",
+    "FOR",
+    "TO",
+    "A",
+    "AN",
+    "ON",
+    "IN",
+    "AT",
+    "OF",
+    "DO",
+    "BE",
+    "BULLISH",
+    "BEARISH",
+    "PLAN",
+    "RIGHT",
+    "NOW",
+    "CURRENTLY",
+    "TRADING",
+    "TRADE",
+    "PLAY",
+    "IDEA",
+    "UP",
+    "DOWN",
+    "HELP",
+    "PLEASE",
+}
+
+_SYMBOL_RE = re.compile(r"\b([A-Z]{1,5})(?:\b|[^\w])")
+_STOP_TOKENS = {
+    "I",
+    "A",
+    "AN",
+    "THE",
+    "IS",
+    "ARE",
+    "WAS",
+    "WERE",
+    "TO",
+    "OF",
+    "ON",
+    "IN",
+    "TSLA?",
+    "SPY?",
+    "QQQ?",
+}
+
+
+def _normalize_symbol_token(token: str) -> Optional[str]:
+    raw = (token or "").strip().upper()
+    if not raw:
+        return None
+
+    # Preserve Polygon index ticker format (e.g. I:SPX, I:VIX).
+    m = re.match(r"^I\s*[: ]\s*([A-Z0-9]{1,6})$", raw)
+    if m:
+        return f"I:{m.group(1)}"
+
+    cleaned = re.sub(r"[^A-Z0-9]", "", raw)
+    if not cleaned:
+        return None
+    if cleaned in QUESTION_STOPWORDS:
+        return None
+    if len(cleaned) > 6:
+        return None
+    return ANALYZE_SYNONYMS.get(cleaned, cleaned)
+
+
+def _detect_symbol_in_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    upper_text = text.upper()
+    candidates = list(TICKER_RE.findall(upper_text))
+    cash_tags = re.findall(r"\$([A-Z]{1,5})", upper_text)
+    candidates.extend(cash_tags)
+    for candidate in candidates:
+        symbol = _normalize_symbol_token(candidate)
+        if symbol:
+            return symbol
+    return None
+
+
+def _extract_symbol_from_text(text: str) -> Optional[str]:
+    symbol = _detect_symbol_in_text(text)
+    if symbol:
+        return symbol
+    if not text:
+        return None
+
+    upper_text = text.upper()
+    hits = _SYMBOL_RE.findall(upper_text)
+    cleaned: list[str] = []
+    for hit in hits:
+        candidate = hit.strip().replace("$", "")
+        if not candidate:
+            continue
+        if candidate in _STOP_TOKENS:
+            continue
+        if len(candidate) == 1:
+            continue
+        cleaned.append(ANALYZE_SYNONYMS.get(candidate, candidate))
+
+    for preferred in ("SPY", "QQQ", "IWM", "DIA"):
+        if preferred in cleaned:
+            return preferred
+
+    return cleaned[0] if cleaned else None
 
 
 def timeframe_block_lines(*, execution: str, structure: str, context: str) -> list[str]:
@@ -1908,17 +6691,25 @@ async def safe_send(
     pivots: Optional[dict] = None,
     analysis_mode: str = "db",
     output_mode: str = "strict",
+    label: str = "",
+    files: Optional[list[tuple[str, bytes]]] = None,
 ):
 
     if not QUALITY_GATE_ENABLED:
+        if files:
+            discord_files = [discord.File(fp=io.BytesIO(blob), filename=name) for name, blob in files]
+            return await channel.send(text, files=discord_files)
         return await channel.send(text)
 
     if kind == "analysis":
-        ok, reason = validate_analysis_message(text)
+        ok, reason = validate_analysis_message(text, label)
     else:
         ok, reason = True, "ok"
 
     if ok:
+        if files:
+            discord_files = [discord.File(fp=io.BytesIO(blob), filename=name) for name, blob in files]
+            return await channel.send(text, files=discord_files)
         return await channel.send(text)
 
     if QUALITY_GATE_LOG_FAILS:
@@ -1937,9 +6728,109 @@ async def safe_send(
             pivots,
             note=detail,
         )
+        if files:
+            discord_files = [discord.File(fp=io.BytesIO(blob), filename=name) for name, blob in files]
+            return await channel.send(fallback, files=discord_files)
         return await channel.send(fallback)
 
     return None
+
+
+async def safe_send_rate_limited(
+    send_target,
+    text: str,
+    *,
+    requester_id: Optional[int],
+    request_kind: str,
+    client: Optional[object] = None,
+    label: str = "",
+    kind: str = "text",
+    queue_mode: str = "raise",
+) -> Optional[object]:
+    """Rate-limited wrapper for sending a message (used for on-demand text).
+
+    Enforces per-user cooldowns and burst queue semantics. If queued and
+    queue_mode == 'raise', raises PublishQueuedError after enqueueing.
+    """
+
+    start_burst_queue_loop()
+    render = RenderedPost(text=text or "", agent_payload={})
+
+    if requester_id is None:
+        # No requester => treat as non-user-scoped send.
+        return await safe_send(send_target, text, kind=kind, symbol="", pivots=None, analysis_mode="coach", output_mode="coach", label=label)
+
+    if not _RATE_QUEUE_ENABLED and (queue_mode or "").lower() == "raise":
+        # Still compute wait for a useful error.
+        async with _PUBLISH_RATE_LOCK:
+            wait_s, _reasons = _compute_rate_wait_seconds(
+                label=label or "ask",
+                symbol="",
+                render=render,
+                requester_id=requester_id,
+                request_kind=request_kind,
+            )
+        if wait_s > 0.001:
+            raise PublishQueuedError(wait_seconds=wait_s, due_ts=_now_ts() + wait_s, key=_queue_key(label=label or "ask", symbol="", request_kind=request_kind))
+
+    async with _PUBLISH_RATE_LOCK:
+        wait_s, reasons = _compute_rate_wait_seconds(
+            label=label or "ask",
+            symbol="",
+            render=render,
+            requester_id=requester_id,
+            request_kind=request_kind,
+        )
+        if wait_s > 0.001:
+            key = _queue_key(label=label or "ask", symbol="", request_kind=request_kind)
+            due_ts = _now_ts() + wait_s
+            if _RATE_QUEUE_ENABLED:
+                global _QUEUE_SEQ
+                qp = _QueuedPublish(
+                    due_ts=due_ts,
+                    created_ts=_now_ts(),
+                    key=key,
+                    coro_factory=lambda: safe_send_rate_limited(
+                        send_target,
+                        text,
+                        requester_id=requester_id,
+                        request_kind=request_kind,
+                        client=client,
+                        label=label,
+                        kind=kind,
+                        queue_mode="silent",
+                    ),
+                    label=label or "ask",
+                    symbol="",
+                )
+                _QUEUE_SEQ += 1
+                _QUEUE_BY_KEY[key] = qp
+                heapq.heappush(_QUEUE_HEAP, (qp.due_ts, _QUEUE_SEQ, qp))
+                if (queue_mode or "").lower() == "raise":
+                    raise PublishQueuedError(wait_seconds=wait_s, due_ts=due_ts, key=key)
+                return None
+            if (queue_mode or "").lower() == "raise":
+                raise PublishQueuedError(wait_seconds=wait_s, due_ts=due_ts, key=key)
+            return None
+
+    msg = await safe_send(
+        send_target,
+        text,
+        kind=kind,
+        symbol="",
+        pivots=None,
+        analysis_mode="coach",
+        output_mode="coach",
+        label=label,
+    )
+    _mark_rate_usage(
+        label=label or "ask",
+        symbol="",
+        render=render,
+        requester_id=requester_id,
+        request_kind=request_kind,
+    )
+    return msg
 
 
 MEGA_CAP = {"AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA"}
@@ -1989,17 +6880,22 @@ AH_CLOSE = time(20, 0)
 
 def parse_iso(ts: str) -> datetime:
     """Parse an ISO8601 timestamp into a timezone-aware datetime."""
-    return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    # SQLite rows often store timestamps without an explicit offset.
+    # Treat naive timestamps as UTC so downstream astimezone() calls work.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def now_utc_iso() -> str:
     """Return the current UTC time as ISO8601 string."""
-    return datetime.now(timezone.utc).isoformat()
+    return _now_utc().isoformat()
 
 
 def market_session_et(dt_utc: Optional[datetime] = None) -> str:
     """Classify the current US equity session in Eastern Time."""
-    dt_utc = dt_utc or datetime.now(timezone.utc)
+    dt_utc = dt_utc or _now_utc()
     dt_et = dt_utc.astimezone(ET)
     if dt_et.weekday() >= 5:
         return "WEEKEND"
@@ -2274,7 +7170,7 @@ def latest_bar_age_min(symbol: str = "SPY", tf: str = "1m") -> float | None:
     except ValueError:
         return None
 
-    now = datetime.now(timezone.utc)
+    now = _now_utc()
     return (now - dt).total_seconds() / 60.0
 
 
@@ -2404,6 +7300,274 @@ def _session_history_bars(symbol: str, days: int = 3) -> list[Dict[str, object]]
         if bars:
             result.append({"date": key, "bars": bars})
     return result
+
+
+def _rows_to_df(rows: list[tuple]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=["ts", "o", "h", "l", "c", "v"])
+    has_volume = len(rows[0]) >= 6
+    columns = ["ts", "o", "h", "l", "c", "v"] if has_volume else ["ts", "o", "h", "l", "c"]
+    df = pd.DataFrame(rows, columns=columns)
+    if "v" not in df:
+        df["v"] = 0.0
+    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    df = df.dropna(subset=["ts", "o", "h", "l", "c"])
+    df = df.sort_values("ts").reset_index(drop=True)
+    for col in ("o", "h", "l", "c", "v"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["o", "h", "l", "c"])
+    df["v"] = df["v"].fillna(0.0)
+    return df
+
+
+def _drop_incomplete_bar(df: pd.DataFrame, tf_label: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    try:
+        last_ts = df["ts"].iloc[-1]
+        if not isinstance(last_ts, pd.Timestamp):
+            last_ts = pd.to_datetime(last_ts, utc=True, errors="coerce")
+    except Exception:  # noqa: BLE001
+        return df
+    if pd.isna(last_ts):
+        return df
+    if tf_label == "1D":
+        return df
+    threshold_map = {"60m": pd.Timedelta(hours=1), "5m": pd.Timedelta(minutes=5), "1m": pd.Timedelta(minutes=1)}
+    max_age = threshold_map.get(tf_label)
+    if max_age is None:
+        return df
+    if pd.Timestamp.utcnow() - last_ts < max_age:
+        trimmed = df.iloc[:-1].copy()
+        return trimmed.reset_index(drop=True)
+    return df
+
+
+def _resample_from_1m(symbol: str, minutes: int, limit: int) -> pd.DataFrame:
+    window = max(limit * minutes * 2, 400)
+    rows = get_last_n_bars(symbol, tf="1m", n=window, with_volume=True)
+    df = _rows_to_df(rows)
+    if df.empty:
+        return df
+    df = df.set_index("ts")
+    agg = (
+        df.resample(f"{minutes}min", label="right", closed="right")
+        .agg({"o": "first", "h": "max", "l": "min", "c": "last", "v": "sum"})
+        .dropna(subset=["o", "h", "l", "c"])
+        .reset_index()
+    )
+    return agg.tail(limit)
+
+
+def _agent_bars_for_symbol(symbol: str) -> Dict[str, pd.DataFrame]:
+    plan = [
+        ("1D", "1d", 400),
+        ("60m", "60m", 360),
+        ("5m", "5m", 480),
+        ("1m", "1m", 800),
+    ]
+    result: Dict[str, pd.DataFrame] = {}
+    for tf_label, tf_db, limit in plan:
+        rows = get_last_n_bars(symbol, tf=tf_db, n=limit + 10, with_volume=True)
+        df = _rows_to_df(rows)
+        if df.empty and tf_label not in {"1D", "1m"}:
+            res_minutes = 60 if tf_label == "60m" else 5
+            df = _resample_from_1m(symbol, res_minutes, limit + 10)
+        if df.empty:
+            continue
+        df = _drop_incomplete_bar(df, tf_label)
+        if df.empty:
+            continue
+        result[tf_label] = df.tail(limit)
+    return result
+
+
+def _agent_levels_for_symbol(symbol: str) -> tuple[Dict[str, float], list[Dict[str, float | str]]]:
+    levels: Dict[str, float] = {}
+    custom: list[Dict[str, float | str]] = []
+
+    piv = get_latest_daily_pivots(symbol)
+    if piv and isinstance(piv.get("piv"), dict):
+        piv_vals = piv["piv"]
+        mapping = {"P": "pivot", "R1": "r1", "S1": "s1", "R2": "r2", "S2": "s2"}
+        for src, dest in mapping.items():
+            try:
+                val = piv_vals.get(src)
+                if val is not None:
+                    num = float(val)
+                    if math.isfinite(num):
+                        levels[dest] = num
+            except Exception:  # noqa: BLE001
+                continue
+        try:
+            close_val = float(piv.get("C")) if piv.get("C") is not None else None
+        except Exception:  # noqa: BLE001
+            close_val = None
+        if close_val is not None and math.isfinite(close_val):
+            custom.append({"label": "Prior Close", "price": close_val, "note": "Previous RTH close"})
+
+    session = _latest_session_bars(symbol)
+    if session and session.get("bars"):
+        bars = session["bars"]
+        highs = [float(b.get("high", 0.0)) for b in bars]
+        lows = [float(b.get("low", 0.0)) for b in bars]
+        closes = [float(b.get("close", 0.0)) for b in bars]
+        vols = [float(b.get("volume", 0.0)) for b in bars]
+        total_vol = sum(vols)
+        vwap = None
+        if total_vol > 0:
+            typical_prices = [
+                (float(b.get("high", 0.0)) + float(b.get("low", 0.0)) + float(b.get("close", 0.0))) / 3.0
+                for b in bars
+            ]
+            vwap = sum(tp * vol for tp, vol in zip(typical_prices, vols)) / total_vol if total_vol else None
+        session_date = session.get("date")
+        if highs:
+            high_val = max(highs)
+            if math.isfinite(high_val):
+                custom.append({"label": "Session High", "price": high_val, "note": "Latest RTH high"})
+        if lows:
+            low_val = min(lows)
+            if math.isfinite(low_val):
+                custom.append({"label": "Session Low", "price": low_val, "note": "Latest RTH low"})
+        if closes:
+            close_val = closes[-1]
+            if math.isfinite(close_val):
+                custom.append({"label": "Session Close", "price": close_val, "note": "Latest RTH close"})
+        if vwap is not None and math.isfinite(vwap):
+            note = f"{session_date} RTH VWAP" if session_date else "Latest RTH VWAP"
+            custom.append({"label": "Session VWAP", "price": vwap, "note": note})
+
+    filtered_custom = [
+        item
+        for item in custom
+        if isinstance(item.get("price"), (int, float)) and math.isfinite(float(item["price"]))
+    ]
+    return levels, filtered_custom
+
+
+def _build_agent_payload(
+    symbols: Sequence[str],
+    *,
+    generated_at: datetime,
+    post_type: str,
+    extra_meta: Optional[Dict[str, Any]] = None,
+    sections: Optional[Dict[str, Any]] = None,
+    market_participation: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    unique_symbols = [sym.upper() for sym in symbols if sym]
+    unique_symbols = list(dict.fromkeys(unique_symbols))
+    if not unique_symbols:
+        return None
+
+    technical_state: Dict[str, Any] = {}
+    pattern_candidates: Dict[str, Any] = {}
+
+    stale_symbols: Dict[str, Any] = {}
+    missing_symbols: list[str] = []
+    freshness_limit = DATA_STALE_MAX_MIN if DATA_STALE_MAX_MIN > 0 else 3.0
+
+    for sym in unique_symbols:
+        try:
+            fresh = data_is_fresh(sym, tf="1m", max_min=freshness_limit)
+        except Exception:  # noqa: BLE001 - guard against data service hiccups
+            fresh = False
+        if not fresh:
+            stale_symbols[sym] = {"tf": "1m", "max_age_min": freshness_limit}
+            continue
+
+        bars_by_tf = _agent_bars_for_symbol(sym)
+        if not bars_by_tf:
+            missing_symbols.append(sym)
+            continue
+        levels, custom_levels = _agent_levels_for_symbol(sym)
+        package = build_agent_tech_package(
+            symbol=sym,
+            bars_by_tf=bars_by_tf,
+            levels=levels or None,
+            custom_levels=custom_levels or None,
+        )
+        technical_state.update(package.get("technical_state", {}))
+        pattern_candidates.update(package.get("pattern_candidates", {}))
+
+    meta: Dict[str, Any] = {
+        "generated_at": generated_at.astimezone(timezone.utc).isoformat(),
+        "symbols": unique_symbols,
+        "post_type": post_type,
+    }
+    if extra_meta:
+        meta.update(extra_meta)
+
+    technical_quality: str
+    if stale_symbols:
+        technical_quality = "STALE"
+    elif missing_symbols:
+        technical_quality = "MISSING"
+    elif technical_state:
+        technical_quality = "FRESH"
+    else:
+        technical_quality = "UNKNOWN"
+
+    data_quality: Dict[str, Any] = {
+        "technical_state": technical_quality,
+    }
+    if pattern_candidates:
+        data_quality["pattern_candidates"] = "FRESH"
+    elif technical_quality != "FRESH":
+        data_quality["pattern_candidates"] = technical_quality
+
+    meta["data_quality"] = data_quality
+    if stale_symbols:
+        meta["stale_symbols"] = stale_symbols
+    if missing_symbols:
+        meta["missing_symbols"] = missing_symbols
+
+    payload: Dict[str, Any] = {"meta": meta}
+    if sections:
+        payload["sections"] = sections
+    if technical_state:
+        payload["technical_state"] = technical_state
+    if pattern_candidates:
+        payload["pattern_candidates"] = pattern_candidates
+    if market_participation:
+        payload["market_participation"] = market_participation
+
+    if len(payload) == 1:
+        dq = meta.get("data_quality")
+        if isinstance(dq, dict):
+            if dq.get("technical_state") == "FRESH":
+                return None
+        elif dq == "FRESH":  # backward compatibility guard
+            return None
+
+    return payload
+
+
+def _render_with_agent_context(
+    lines: Sequence[str],
+    symbols: Sequence[str],
+    *,
+    generated_at: datetime,
+    post_type: str,
+    extra_meta: Optional[Dict[str, Any]] = None,
+    sections: Optional[Dict[str, Any]] = None,
+    market_participation: Optional[Dict[str, Any]] = None,
+    precomputed_agent_payload: Optional[Dict[str, Any]] = None,
+) -> RenderedPost:
+    text = "\n".join(lines)
+    if generated_at.tzinfo is None:
+        generated_at = generated_at.replace(tzinfo=timezone.utc)
+    agent_payload = precomputed_agent_payload
+    if agent_payload is None:
+        agent_payload = _build_agent_payload(
+            symbols,
+            generated_at=generated_at,
+            post_type=post_type,
+            extra_meta=extra_meta,
+            sections=sections,
+            market_participation=market_participation,
+        )
+    return RenderedPost(text=text, agent_payload=agent_payload)
 
 
 def compute_daily_bias(symbol: str, pivot_payload: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
@@ -2894,6 +8058,26 @@ def _hourly_regime_state(symbol: str) -> Optional[Dict[str, object]]:
     higher_lows = _higher_lows(hourly)
     range_info = _range_state(hourly)
 
+    # Internal indicators are allowed for gating, but must never be displayed.
+    try:
+        from delivery.tnt_internal_signals import compute_internal_signals, derive_policy_outputs
+    except Exception:  # noqa: BLE001
+        compute_internal_signals = None  # type: ignore[assignment]
+        derive_policy_outputs = None  # type: ignore[assignment]
+
+    policy = None
+    if compute_internal_signals and derive_policy_outputs:
+        closes_1m = []
+        try:
+            closes_1m = [float(row[4]) for row in raw if row and len(row) > 4 and row[4] is not None]
+        except Exception:  # noqa: BLE001
+            closes_1m = []
+
+        sig = compute_internal_signals(closes_1m[-240:], last_price=float(last_close) if last_close is not None else None)
+        rs = range_info[0] if range_info else None
+        rr = range_info[1] if range_info else None
+        policy = derive_policy_outputs(sig, range_state=rs, range_ratio=rr)
+
     score = 0.0
     if ema20 is not None and ema50 is not None:
         if ema20 > ema50:
@@ -2935,6 +8119,7 @@ def _hourly_regime_state(symbol: str) -> Optional[Dict[str, object]]:
         "ema50": ema50,
         "higher_lows": higher_lows,
         "range_info": range_info,
+        "policy": policy,
     }
 
 
@@ -2949,44 +8134,25 @@ def build_hourly_regime_block(symbol: str, state: Optional[Dict[str, object]] = 
         "BEARISH": "TREND_DOWN",
         "NEUTRAL": "RANGE",
     }
-    lines: List[str] = [f"{state['emoji']} 60-min Regime: {regime_map.get(regime_raw, regime_raw)}"]
+    lines: List[str] = [f"{state['emoji']} 60-min Posture: {regime_map.get(regime_raw, regime_raw)}"]
 
-    vwap = state.get("vwap")
-    price_above_vwap = state.get("price_above_vwap")
-    distance_pct = state.get("distance_vwap_pct")
-    if vwap is not None and price_above_vwap is not None and distance_pct is not None:
-        orientation = "above" if price_above_vwap else "below"
-        lines.append(f"• Price {orientation} VWAP ({distance_pct:+.2f}%)")
-    else:
-        lines.append("• Price vs VWAP unavailable")
-
-    ema20 = state.get("ema20")
-    ema50 = state.get("ema50")
-    if ema20 is not None and ema50 is not None:
-        relation = ">" if ema20 > ema50 else "<" if ema20 < ema50 else "="
-        lines.append(f"• EMA20 {relation} EMA50 ({ema20:.2f} vs {ema50:.2f})")
-    else:
-        lines.append("• EMA crossover unavailable")
-
-    higher_lows = state.get("higher_lows")
-    if higher_lows is True:
-        lines.append("• Higher-lows intact")
-    elif higher_lows is False:
-        lines.append("• Higher-lows broken")
-    else:
-        lines.append("• Higher-lows signal unavailable")
-
-    range_info = state.get("range_info")
-    if range_info:
-        state_label, ratio = range_info
-        if state_label == "expanding":
-            lines.append(f"• Range expanding vs 10-bar avg ({ratio:.2f}x)")
-        elif state_label == "compressing":
-            lines.append(f"• Range compressing vs 10-bar avg ({ratio:.2f}x)")
+    policy = state.get("policy")
+    if isinstance(policy, dict):
+        directive = str(policy.get("directive") or "AGGRESSION REDUCED")
+        gates = policy.get("gates")
+        if isinstance(gates, (list, tuple)):
+            gates_text = ", ".join(str(x) for x in gates if x)
         else:
-            lines.append(f"• Range steady vs 10-bar avg ({ratio:.2f}x)")
+            gates_text = "NONE"
+        momentum_only = bool(policy.get("momentum_only"))
+
+        lines.append(f"• Permission: {directive}")
+        lines.append(f"• Gates: {gates_text or 'NONE'}")
+        if momentum_only:
+            lines.append("• Constraint: MOMENTUM-ONLY")
     else:
-        lines.append("• Range signal unavailable")
+        lines.append("• Permission: AGGRESSION REDUCED")
+        lines.append("• Gates: NONE")
 
     lines.append("")
     return lines
@@ -3006,6 +8172,138 @@ def get_latest_daily_bar(symbol: str) -> Optional[tuple]:
             (symbol.upper(),),
         )
     return row[0] if row else None
+
+
+def _daily_pivots_refresh_max_age_days() -> int:
+    try:
+        return max(1, int(os.getenv("DAILY_PIVOTS_REFRESH_MAX_AGE_DAYS", "3")))
+    except Exception:  # noqa: BLE001
+        return 3
+
+
+def _should_refresh_daily_bar(ts_iso: Optional[str]) -> bool:
+    if not ts_iso:
+        return True
+    try:
+        bar_dt_et = parse_iso(str(ts_iso)).astimezone(ET)
+        age_days = (_now_et().date() - bar_dt_et.date()).days
+        return age_days >= _daily_pivots_refresh_max_age_days()
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _upsert_daily_bar_row(
+    symbol: str,
+    *,
+    ts_utc_iso: str,
+    open_val: float,
+    high_val: float,
+    low_val: float,
+    close_val: float,
+    volume_val: float,
+    source: str,
+) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        price_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices)")}
+        columns = ["symbol", "tf", "ts", "open", "high", "low", "close"]
+        values: list[object] = [symbol.upper(), "1d", ts_utc_iso, open_val, high_val, low_val, close_val]
+
+        if "volume" in price_columns:
+            columns.append("volume")
+            values.append(volume_val)
+        if "source" in price_columns:
+            columns.append("source")
+            values.append(source)
+        if "is_partial" in price_columns:
+            columns.append("is_partial")
+            values.append(0)
+
+        placeholders = ",".join(["?"] * len(values))
+        conn.execute(
+            f"INSERT OR REPLACE INTO prices({','.join(columns)}) VALUES ({placeholders})",
+            values,
+        )
+        conn.commit()
+
+
+def _refresh_daily_bar_from_polygon(symbol: str, *, lookback_days: int = 14) -> bool:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return False
+
+    api_key, base_url, provider = _polygon_key_and_base()
+    if not api_key:
+        return False
+
+    # Use the same symbol mapping as the ingestion scripts.
+    api_symbol = polygon_ingest.SYMBOL_API_MAP.get(sym, sym)
+
+    now_utc = _now_utc()
+    start_date = (now_utc - timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
+    end_date = now_utc.strftime("%Y-%m-%d")
+    url = f"{base_url.rstrip('/')}/v2/aggs/ticker/{api_symbol}/range/1/day/{start_date}/{end_date}"
+
+    try:
+        resp = httpx.get(
+            url,
+            params={
+                "apiKey": api_key,
+                "adjusted": "true",
+                "sort": "asc",
+                "limit": 50000,
+            },
+            timeout=20,
+        )
+    except Exception:
+        return False
+
+    if resp.status_code != 200:
+        return False
+
+    try:
+        data = resp.json()
+    except Exception:
+        return False
+
+    results = data.get("results") or []
+    if not isinstance(results, list) or not results:
+        return False
+
+    # Take the last completed daily bar.
+    last = results[-1]
+    try:
+        open_val = float(last.get("o"))
+        high_val = float(last.get("h"))
+        low_val = float(last.get("l"))
+        close_val = float(last.get("c"))
+        volume_val = float(last.get("v") or 0.0)
+        t_ms = int(last.get("t"))
+    except Exception:
+        return False
+
+    # Normalize timestamp to 16:00 ET so "Source" matches the RTH close.
+    try:
+        dt_utc = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc)
+        dt_et = dt_utc.astimezone(ET)
+        close_et = datetime.combine(dt_et.date(), RTH_CLOSE, tzinfo=ET)
+        ts_utc_iso = close_et.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return False
+
+    try:
+        _upsert_daily_bar_row(
+            sym,
+            ts_utc_iso=ts_utc_iso,
+            open_val=open_val,
+            high_val=high_val,
+            low_val=low_val,
+            close_val=close_val,
+            volume_val=volume_val,
+            source=f"{provider}_daily",
+        )
+    except Exception:
+        return False
+    return True
 
 
 def get_last_rth_session_hlc(symbol: str) -> Optional[Tuple[str, float, float, float, str]]:
@@ -3043,8 +8341,58 @@ def get_latest_daily_pivots(symbol: str) -> Optional[Dict[str, object]]:
     daily = get_latest_daily_bar(symbol)
     if daily:
         ts, _o, high, low, close = daily
+        if _should_refresh_daily_bar(ts):
+            if _refresh_daily_bar_from_polygon(symbol):
+                refreshed = get_latest_daily_bar(symbol)
+                if refreshed:
+                    daily = refreshed
+                    ts, _o, high, low, close = daily
+
+        # If we're in RTH and the stored daily bar isn't for today, fall back to
+        # intraday H/L/C from 1m RTH bars so pivots don't appear "2 days old".
+        try:
+            now_et = _now_utc().astimezone(ET)
+            if market_session_et(now_et.astimezone(timezone.utc)) == "RTH":
+                daily_date = str(ts)[:10]
+                today_date = now_et.date().isoformat()
+                if daily_date != today_date:
+                    rows = get_last_n_bars(str(symbol), tf="1m")
+                    highs: list[float] = []
+                    lows: list[float] = []
+                    last_close: float | None = None
+                    last_ts: str | None = None
+                    for rts, _ro, rh, rl, rc in rows:
+                        dt_utc = parse_iso(str(rts))
+                        dt_et = dt_utc.astimezone(ET)
+                        if dt_et.date().isoformat() != today_date:
+                            continue
+                        clock = dt_et.time()
+                        if not (RTH_OPEN <= clock < RTH_CLOSE):
+                            continue
+                        try:
+                            highs.append(float(rh))
+                            lows.append(float(rl))
+                            last_close = float(rc)
+                            last_ts = str(rts)
+                        except Exception:
+                            continue
+
+                    if highs and lows and last_close is not None and last_ts:
+                        piv = pivots_from_hlc(max(highs), min(lows), float(last_close))
+                        return {"ts": last_ts, "session": today_date, "H": max(highs), "L": min(lows), "C": float(last_close), "piv": piv}
+        except Exception:
+            pass
+
         piv = pivots_from_hlc(float(high), float(low), float(close))
         return {"ts": ts, "H": float(high), "L": float(low), "C": float(close), "piv": piv}
+
+    # No daily bar available locally — try to fetch one from Polygon/Massive.
+    if _refresh_daily_bar_from_polygon(symbol):
+        daily2 = get_latest_daily_bar(symbol)
+        if daily2:
+            ts, _o, high, low, close = daily2
+            piv = pivots_from_hlc(float(high), float(low), float(close))
+            return {"ts": ts, "H": float(high), "L": float(low), "C": float(close), "piv": piv}
 
     sess = get_last_rth_session_hlc(symbol)
     if not sess:
@@ -3100,7 +8448,7 @@ def classify_conviction(prob_up: float) -> str:
 
 
 def _utc_now_iso():
-    return datetime.now(timezone.utc).isoformat()
+    return _now_utc().isoformat()
 
 
 def explain_no_trade(
@@ -3392,7 +8740,7 @@ def macro_within_minutes(events: Optional[list[dict]], minutes: int, now_et: dat
 
 
 def format_morning_brief(symbols: Optional[list[str]] = None) -> str:
-    now_et = datetime.now(ET)
+    now_et = _now_et()
     today_et = now_et.strftime("%Y-%m-%d")
     target_date_et = next_market_date_et(now_et)
     sess = market_session_et(now_et)
@@ -3482,7 +8830,7 @@ def next_weekday(d: date) -> date:
 
 
 def next_market_date_et(now_et: datetime | None = None) -> str:
-    now_et = now_et or datetime.now(ET)
+    now_et = now_et or _now_et()
     d = now_et.date()
     if d.weekday() >= 5:
         d = next_weekday(d)
@@ -3688,7 +9036,7 @@ async def morning_brief_loop() -> None:
                 await asyncio.sleep(60)
                 continue
 
-            now_et = datetime.now(ET)
+            now_et = _now_et()
 
             # weekday filter
             map_days = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
@@ -3741,7 +9089,7 @@ async def morning_opt_loop() -> None:
                 await asyncio.sleep(60)
                 continue
 
-            now_et = datetime.now(ET)
+            now_et = _now_et()
             if now_et.weekday() >= 5:
                 await asyncio.sleep(60)
                 continue
@@ -3978,7 +9326,7 @@ def rolling_accuracy(symbol: str, horizon_min: int, n: int = 50, tf: str = "1m")
 
 
 def format_daily_summary(symbols: list[str]) -> str:
-    now_et = datetime.now(ET)
+    now_et = _now_et()
     lines = [
         "📌 **Daily Summary (signals + pivots)**",
         f"ET date/time: {now_et.strftime('%Y-%m-%d %H:%M')}",
@@ -4048,8 +9396,8 @@ def format_daily_summary(symbols: list[str]) -> str:
 
 def format_monday_playbook(symbols: list[str]) -> str:
     session = market_session_et()
-    title = "Monday Open Playbook" if datetime.now(ET).weekday() == 0 else "Next RTH Playbook"
-    lines = [f"📘 **{title} (levels + regimes + plan)**", f"ET: {datetime.now(ET).strftime('%Y-%m-%d %H:%M')} | Session={session}"]
+    title = "Monday Open Playbook" if _now_et().weekday() == 0 else "Next RTH Playbook"
+    lines = [f"📘 **{title} (levels + regimes + plan)**", f"ET: {_now_et().strftime('%Y-%m-%d %H:%M')} | Session={session}"]
     tf_bias = os.getenv("BIAS_TF", BIAS_TF)
     confirm_bias, _confirm_note, _ = vix_sqqq_confirmation(tf=tf_bias)
     primary_sym = symbols[0] if symbols else "SPY"
@@ -4057,6 +9405,17 @@ def format_monday_playbook(symbols: list[str]) -> str:
     prob_up = float(sig["prob_up"]) if sig else None
     edge_val = _edge(prob_up) if prob_up is not None else 0.0
     min_edge = AUTOPOST_EDGE_MIN_STRICT
+
+    signal_regime: Optional[str] = None
+    if sig and sig.get("meta"):
+        try:
+            sig_meta = json.loads(sig["meta"])
+        except Exception:  # noqa: BLE001
+            sig_meta = None
+        if isinstance(sig_meta, dict):
+            regime_val = sig_meta.get("regime") or sig_meta.get("market_regime")
+            if isinstance(regime_val, str):
+                signal_regime = regime_val.upper()
     strong_edge = prob_up is not None and edge_val >= min_edge
     market_status = "ACTIVE" if confirm_bias not in ("NEUTRAL", "UNKNOWN") and strong_edge else "WAIT MODE"
     lines.append(f"Market Status: **{market_status}**")
@@ -4099,7 +9458,7 @@ async def daily_summary_loop() -> None:
     global _last_summary_date
     while True:
         try:
-            now_et = datetime.now(ET)
+            now_et = _now_et()
             try:
                 hh, mm = [int(x) for x in DAILY_SUMMARY_TIME_ET.split(":", 1)]
             except ValueError:
@@ -4126,7 +9485,7 @@ async def monday_playbook_loop() -> None:
     global _last_monday_date
     while True:
         try:
-            now_et = datetime.now(ET)
+            now_et = _now_et()
             if now_et.weekday() != 0:
                 _last_monday_date = None
                 await asyncio.sleep(300)
@@ -4154,7 +9513,7 @@ async def monday_playbook_loop() -> None:
                     if session == "CLOSED":
                         msg = (
                             "📘 **Monday Playbook**\nET: "
-                            + datetime.now(ET).strftime("%Y-%m-%d %H:%M")
+                            + _now_et().strftime("%Y-%m-%d %H:%M")
                             + "\n⚠️ Market session is CLOSED. Holiday or unexpected closure—verify market hours."
                         )
                         await channel.send(msg)
@@ -4177,10 +9536,27 @@ def is_rth_now() -> bool:
 
 
 def _now_et() -> datetime:
+    provider = _NOW_PROVIDER
+    if provider is not None:
+        dt = provider()
+        if dt is None:
+            raise ValueError("_NOW_PROVIDER returned None")
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=ET)
+        return dt.astimezone(ET)
+
     if ET_TZ:
         return datetime.now(ET_TZ)
-    # fallback: local time (still ok for MVP, but ET_TZ should exist on Py3.13)
-    return datetime.now()
+
+    return datetime.now(timezone.utc).astimezone(ET)
+
+
+def _now_utc() -> datetime:
+    return _now_et().astimezone(timezone.utc)
+
+
+def _now_naive() -> datetime:
+    return _now_et().replace(tzinfo=None)
 
 
 def _parse_hhmm(s: str, default: str = "09:25") -> tuple[int, int]:
@@ -4235,7 +9611,7 @@ def settings_set(conn: sqlite3.Connection, key: str, value: str) -> None:
     cur.execute(
         "INSERT INTO settings(k,v,updated_ts) VALUES(?,?,?) "
         "ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_ts=excluded.updated_ts",
-        (key, value, datetime.now(timezone.utc).isoformat()),
+        (key, value, _now_utc().isoformat()),
     )
     conn.commit()
 
@@ -4345,7 +9721,7 @@ def _get_watchlist() -> list[str]:
 
 
 def _bootstrap_backfill_symbol(symbol: str, *, days: int = BOOTSTRAP_BACKFILL_DAYS) -> tuple[int, int]:
-    now = datetime.now(timezone.utc)
+    now = _now_utc()
     start = now - timedelta(days=days)
     end = now + timedelta(minutes=1)
     api_symbol = polygon_ingest.SYMBOL_API_MAP.get(symbol, symbol)
@@ -4414,7 +9790,7 @@ def _bootstrap_run_model(symbol: str) -> None:
 
 def _ensure_symbol_ready_sync(symbol: str) -> dict:
     sym = symbol.upper()
-    attempt_ts = datetime.now(timezone.utc).isoformat()
+    attempt_ts = _now_utc().isoformat()
     result: dict[str, object] = {
         "symbol": sym,
         "ok": False,
@@ -4425,6 +9801,7 @@ def _ensure_symbol_ready_sync(symbol: str) -> dict:
         "signal": None,
         "steps": [],
         "errors": [],
+        "warnings": [],
     }
 
     try:
@@ -4446,7 +9823,7 @@ def _ensure_symbol_ready_sync(symbol: str) -> dict:
 
     try:
         if not symbol_supported_polygon(sym):
-            raise RuntimeError("Polygon does not report trades for this symbol")
+            raise RuntimeError("Data provider does not report trades for this symbol")
     except Exception as exc:  # noqa: BLE001
         message = f"polygon availability failed: {exc}"
         result["errors"].append(message)
@@ -4488,8 +9865,11 @@ def _ensure_symbol_ready_sync(symbol: str) -> dict:
             result.setdefault("steps", []).append(f"new signal {latest_ts}")
 
     fresh_after = data_is_fresh(sym, tf="1m", max_min=freshness_limit)
-    if latest_signal and fresh_after:
+
+    if latest_signal and (fresh_after or result.get("inserted_bars", 0) > 0):
         result["ok"] = True
+        if not fresh_after:
+            result.setdefault("warnings", []).append("data still stale after bootstrap")
         _watchlist_record_success(sym, attempt_ts)
     else:
         if not fresh_after:
@@ -4550,6 +9930,12 @@ def _format_bootstrap_result(result: dict) -> str:
             lines.append("⚠️ Notes:")
             for note in result["errors"][:3]:
                 lines.append(f"• {note}")
+        warnings = result.get("warnings") or []
+        if warnings:
+            if not result.get("errors"):
+                lines.append("⚠️ Notes:")
+            for warn in warnings[:3]:
+                lines.append(f"• {warn}")
     else:
         lines.append(f"⚠️ **{sym}** bootstrap failed.")
         errors = result.get("errors") or ["Unknown error"]
@@ -4691,7 +10077,7 @@ def _should_post_signal(sym: str, prob_up: float, gate_mode: str, *, mode: str, 
 
     # cooldown per symbol
     cooldown = _env_int("AUTOPOST_SIGNAL_COOLDOWN_SEC", "600")
-    now = int(datetime.now(timezone.utc).timestamp())
+    now = int(_now_utc().timestamp())
     last = _last_signal_post_by_symbol.get(sym, 0)
     if now - last < cooldown:
         return False, f"cooldown {cooldown}s"
@@ -4722,7 +10108,7 @@ def _format_ts_et(ts_iso: Optional[str]) -> str:
         return "unknown"
     try:
         dt_et = parse_iso(ts_iso).astimezone(ET)
-        return dt_et.strftime("%Y-%m-%d %H:%M:%S ET")
+        return dt_et.strftime("%Y-%m-%d %H:%M ET")
     except Exception:  # noqa: BLE001
         return str(ts_iso)
 
@@ -4738,12 +10124,13 @@ def _calc_data_stale(symbol: str = DATA_STALE_SYMBOL) -> tuple[bool, Optional[fl
         ts_dt = parse_iso(ts_iso)
     except Exception:  # noqa: BLE001
         return True, None, ts_iso
-    age_min = (datetime.now(timezone.utc) - ts_dt).total_seconds() / 60.0
+    age_min = (_now_utc() - ts_dt).total_seconds() / 60.0
     return age_min > DATA_STALE_MAX_MIN, age_min, ts_iso
 
 
 async def _fetch_warn_channel() -> Optional[discord.abc.MessageableChannel]:
-    warn_channel_id = DATA_STALE_WARN_CHANNEL_ID or CHANNEL_ID
+    # Ops-first: adapter health should land in #tnt-ops by default.
+    warn_channel_id = DATA_STALE_WARN_CHANNEL_ID or _OPS_CHANNEL_ID or CHANNEL_ID
     if not warn_channel_id:
         return None
     channel = bot.get_channel(warn_channel_id)
@@ -4756,11 +10143,22 @@ async def _fetch_warn_channel() -> Optional[discord.abc.MessageableChannel]:
     return channel
 
 
-async def _send_stale_notification(message: str) -> None:
+async def _send_stale_notification(message: str, *, key: str) -> None:
     channel = await _fetch_warn_channel()
     if channel is None:
         print(f"[WARN] {message}")
         return
+
+    min_sec = float(_OPS_NOTICE_STALE_MIN_SEC)
+    if min_sec > 0:
+        now = _now_ts()
+        k = (key or "").strip().lower()
+        if k:
+            async with _OPS_NOTICE_LOCK:
+                last = _OPS_LAST_NOTICE_TS.get(k)
+                if last is not None and (now - last) < min_sec:
+                    return
+                _OPS_LAST_NOTICE_TS[k] = now
     try:
         await safe_send(channel, message, kind="status", symbol="", pivots=None)
     except Exception as exc:  # noqa: BLE001
@@ -4773,8 +10171,10 @@ async def _update_data_stale_state() -> bool:
 
     lock = _get_stale_lock()
     async with lock:
-        global _data_stale_paused
+        global _data_stale_paused, _data_stale_initialized
         stale, age_min, ts_iso = _calc_data_stale()
+        first_check = not _data_stale_initialized
+        _data_stale_initialized = True
         if stale:
             if not _data_stale_paused:
                 _data_stale_paused = True
@@ -4782,9 +10182,21 @@ async def _update_data_stale_state() -> bool:
                 if age_min is not None:
                     age_text = f"{age_min:.1f} min"
                 ts_text = _format_ts_et(ts_iso)
-                await _send_stale_notification(
-                    f"⚠️ **AutoPost Paused** — data feed stale. Latest {DATA_STALE_SYMBOL} 1m bar {ts_text} (age {age_text}, limit {DATA_STALE_MAX_MIN:.1f} min)."
-                )
+                if first_check:
+                    print(
+                        "[WARN] Autopost stale on startup; notification suppressed to avoid duplicate Discord alerts."
+                    )
+                else:
+                    msg = _format_ops_event(
+                        tag="adapter",
+                        label="data_feed",
+                        symbols=[DATA_STALE_SYMBOL],
+                        status="stale_data",
+                        contracts={"agent": AUTOPOST_CONTRACT_VERSION, "chart": "1.0"},
+                        violations=[f"DATA_STALE age_min={age_text} ts={ts_text}"],
+                        audit_path=None,
+                    )
+                    await _send_stale_notification(msg, key=f"adapter:data_stale:{DATA_STALE_SYMBOL}")
             return True
 
         if _data_stale_paused:
@@ -4793,9 +10205,16 @@ async def _update_data_stale_state() -> bool:
             if age_min is not None:
                 age_text = f"{age_min:.1f} min"
             ts_text = _format_ts_et(ts_iso)
-            await _send_stale_notification(
-                f"✅ **AutoPost Resumed** — data feed current. Latest {DATA_STALE_SYMBOL} 1m bar {ts_text} (age {age_text})."
+            msg = _format_ops_event(
+                tag="adapter",
+                label="data_feed",
+                symbols=[DATA_STALE_SYMBOL],
+                status="fresh_data",
+                contracts={"agent": AUTOPOST_CONTRACT_VERSION, "chart": "1.0"},
+                violations=[f"DATA_FRESH age_min={age_text} ts={ts_text}"],
+                audit_path=None,
             )
+            await _send_stale_notification(msg, key=f"adapter:data_fresh:{DATA_STALE_SYMBOL}")
         return False
 
 
@@ -4832,13 +10251,39 @@ def _derive_futures_posture(ctx: dict) -> Optional[str]:
     return "• Posture: Overnight holding inside prior RTH range."
 
 
+def _futures_context_enabled() -> bool:
+    """Return whether Futures Context should be used/rendered.
+
+    Futures context was historically produced by the IQFeed stack. If IQFeed is disabled,
+    disable futures context entirely (no gating, no section output) *unless* the user has
+    explicitly configured a futures context file via FUTURES_CONTEXT_PATH.
+    """
+    setting = (os.getenv("FUTURES_CONTEXT_ENABLED", "1") or "1").strip().lower()
+    if setting in {"0", "false", "off", "no"}:
+        return False
+
+    # If an explicit futures context path is configured, allow it even when IQFeed is off.
+    explicit_path = (os.getenv("FUTURES_CONTEXT_PATH", "") or "").strip()
+    if explicit_path:
+        return True
+
+    iqfeed_enabled = (os.getenv("IQFEED_ENABLED", "1") or "1").strip().lower()
+    if iqfeed_enabled in {"0", "false", "off", "no"}:
+        return False
+    return True
+
+
 def _load_futures_context_payload(now_ts: Optional[str] = None) -> dict:
-    path = FUTURES_CONTEXT_PATH
-    if not path:
+    if not _futures_context_enabled():
+        return {"ok": False, "disabled": True}
+
+    path_value = FUTURES_CONTEXT_PATH
+    path = Path(path_value) if not isinstance(path_value, Path) else path_value
+    if not str(path).strip():
         return {"ok": False, "reason": "path not configured"}
 
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8") as handle:
             raw_payload = json.load(handle)
     except FileNotFoundError:
         return {"ok": False, "reason": "missing"}
@@ -4858,9 +10303,9 @@ def _load_futures_context_payload(now_ts: Optional[str] = None) -> dict:
         try:
             now_et = parse_iso(now_ts).astimezone(ET)
         except Exception:  # noqa: BLE001
-            now_et = datetime.now(ET)
+            now_et = _now_et()
     else:
-        now_et = datetime.now(ET)
+        now_et = _now_et()
 
     computed_ts = ctx.get("computed_ts") or payload.get("computed_ts")
     if not computed_ts:
@@ -4893,12 +10338,34 @@ def _load_futures_context_payload(now_ts: Optional[str] = None) -> dict:
     return payload
 
 
+def _futures_context_status(now_ts: Optional[str] = None) -> tuple[dict, str, Optional[str]]:
+    """Return futures payload plus a normalized availability flag."""
+
+    payload = _load_futures_context_payload(now_ts)
+    if payload.get("disabled"):
+        return payload, "disabled", None
+    if payload.get("ok", True):
+        return payload, "fresh", None
+
+    raw_reason = str(payload.get("reason") or "unavailable")
+    reason_lower = raw_reason.lower()
+    if "stale" in reason_lower:
+        status = "stale"
+    elif "missing" in reason_lower:
+        status = "missing"
+    else:
+        status = "unavailable"
+    return payload, status, raw_reason
+
+
 def _format_futures_context_lines(
     payload: dict,
     *,
     post_type: str = "default",
     show_reason: bool = False,
 ) -> list[str]:
+    if not _futures_context_enabled() or (isinstance(payload, dict) and payload.get("disabled")):
+        return []
     if not isinstance(payload, dict):
         return []
 
@@ -4919,7 +10386,7 @@ def _format_futures_context_lines(
             "• ON range:"
             f" H {_fmt(_safe_float(ctx.get('on_high')))}"
             f" / L {_fmt(_safe_float(ctx.get('on_low')))}"
-            f" / VWAP {_fmt(_safe_float(ctx.get('on_vwap')))}"
+            f" / Anchor {_fmt(_safe_float(ctx.get('on_vwap')))}"
         )
 
     def _intraday_summary_line() -> Optional[str]:
@@ -4928,9 +10395,9 @@ def _format_futures_context_lines(
         if on_vwap is None:
             return None
         if last_price is None:
-            return f"• ON VWAP {_fmt(on_vwap)} (latest price pending)."
+            return f"• ON Anchor {_fmt(on_vwap)} (latest price pending)."
         relation = "holding above" if last_price >= on_vwap else "lost"
-        return f"• ES {relation} ON VWAP ({_fmt(on_vwap)})."
+        return f"• ES {relation} ON Anchor ({_fmt(on_vwap)})."
 
     if post_type in {"daily_prep", "after_hours", "pre_market", "default"}:
         lines.append(_on_range_line())
@@ -4987,13 +10454,16 @@ def _build_futures_section(
     post_type: str = "default",
     now_ts: Optional[str] = None,
     show_reason: bool = False,
+    payload: Optional[dict] = None,
 ) -> str:
-    payload = _load_futures_context_payload(now_ts)
+    if not _futures_context_enabled():
+        return ""
+    payload = payload if payload is not None else _load_futures_context_payload(now_ts)
     lines = _format_futures_context_lines(payload, post_type=post_type, show_reason=show_reason)
     if not lines:
         return ""
     return "\n".join([
-        f"📊 Futures Context — **{FUTURES_CONTEXT_LABEL}**",
+        f"📊 Futures Context — {FUTURES_CONTEXT_LABEL}",
         *lines,
         "",
     ])
@@ -5082,44 +10552,207 @@ def _section_lines(
     return _fetch_section_lines(fetcher_name, post_type=post_type, default=default)
 
 
-def build_daily_prep_payload(symbols: list[str]) -> str:
-    """Must pass the quality gate headings."""
+def get_levels_focus(*, post_type: str = "unknown") -> list[str]:
+    """Default levels fetcher for focus_list/intraday_update builders.
 
-    et = _now_et().strftime("%Y-%m-%d %H:%M ET")
+    Builders call this via `_section_lines()` if no explicit levels payload is provided.
+    Keep it lightweight and safe: rely on cached/latest daily pivots.
+    """
+
+    symbols = _get_watchlist() if callable(globals().get("_get_watchlist")) else ["SPY", "QQQ", "IWM"]
+    symbols = [str(s).strip().upper() for s in (symbols or []) if str(s).strip()]
+    if not symbols:
+        symbols = ["SPY"]
+
     lines: list[str] = []
-    lines.append("📌 **Daily Prep (RTH pivots + regime + plan)**")
+    for sym in symbols[:6]:
+        piv = get_latest_daily_pivots(sym)
+        if piv and isinstance(piv.get("piv"), dict):
+            vals = piv["piv"]
+            try:
+                p = float(vals.get("P")) if vals.get("P") is not None else None
+                r1 = float(vals.get("R1")) if vals.get("R1") is not None else None
+                s1 = float(vals.get("S1")) if vals.get("S1") is not None else None
+            except Exception:  # noqa: BLE001
+                p = r1 = s1 = None
+            if any(v is not None for v in (p, r1, s1)):
+                p_s = "n/a" if p is None else f"{p:.2f}"
+                r1_s = "n/a" if r1 is None else f"{r1:.2f}"
+                s1_s = "n/a" if s1 is None else f"{s1:.2f}"
+                lines.append(f"• {sym}: P {p_s} | R1 {r1_s} | S1 {s1_s}")
+                continue
+        lines.append(f"• {sym}: levels unavailable")
+
+    return lines
+
+
+def get_regime_snapshot(*, post_type: str = "unknown") -> list[str]:
+    """Default regime snapshot fetcher used by focus_list/pre_market builders."""
+
+    primary_sym = "SPY"
+    sig = get_latest_signal(primary_sym)
+    prob_up = float(sig["prob_up"]) if sig and sig.get("prob_up") is not None else None
+    edge_val: Optional[float] = _edge(prob_up) if prob_up is not None else None
     tf_bias = os.getenv("BIAS_TF", BIAS_TF)
-    confirm_bias, _confirm_note, _ = vix_sqqq_confirmation(tf=tf_bias)
-    primary_sym = symbols[0] if symbols else "SPY"
+    confirm_bias, _confirm_note, _confirm_ctx = vix_sqqq_confirmation(tf=tf_bias)
+    smiq, _pg = _resolve_market_participation(confirm_bias, edge_val)
+    regime = str((smiq.get("regime") if isinstance(smiq, dict) else None) or "UNKNOWN").upper()
+    bias = str(confirm_bias or "UNKNOWN").upper()
+    edge_s = "n/a" if edge_val is None else f"{edge_val:.2f}"
+    return [f"• Participation regime: {regime}", f"• Bias confirmation: {bias}", f"• Signal edge: {edge_s}"]
+
+
+def build_daily_prep_render(symbols: Optional[Sequence[str]] = None) -> RenderedPost:
+    """Plan-of-record briefing with explicit stand-down logic."""
+
+    symbols_clean = [sym.upper() for sym in (symbols or []) if sym]
+    if not symbols_clean:
+        symbols_clean = list(DEFAULT_DAILY_PREP_SYMBOLS)
+    else:
+        symbols_clean = list(dict.fromkeys(symbols_clean))
+        if symbols_clean == ["SPY"]:
+            for candidate in DEFAULT_DAILY_PREP_SYMBOLS:
+                if candidate not in symbols_clean:
+                    symbols_clean.append(candidate)
+    if not symbols_clean:
+        symbols_clean = ["SPY"]
+
+    now_et = _now_et()
+    now_iso = now_et.isoformat()
+    futures_payload, futures_status, futures_reason = _futures_context_status(now_iso)
+    session = market_session_et(now_et.astimezone(timezone.utc))
+
+    tf_bias = os.getenv("BIAS_TF", BIAS_TF)
+    confirm_bias, _confirm_note, _detail = vix_sqqq_confirmation(tf=tf_bias)
+    primary_sym = symbols_clean[0]
     sig = get_latest_signal(primary_sym)
     prob_up = float(sig["prob_up"]) if sig else None
     edge_val = _edge(prob_up) if prob_up is not None else 0.0
     min_edge = AUTOPOST_EDGE_MIN_STRICT
-    strong_edge = prob_up is not None and edge_val >= min_edge
-    market_status = "ACTIVE" if confirm_bias not in ("NEUTRAL", "UNKNOWN") and strong_edge else "WAIT MODE"
-    lines.append(f"Market Status: **{market_status}**")
+
+    signal_regime: Optional[str] = None
+    if sig and sig.get("meta"):
+        try:
+            sig_meta = json.loads(sig["meta"])
+        except Exception:  # noqa: BLE001
+            sig_meta = None
+        if isinstance(sig_meta, dict):
+            regime_val = sig_meta.get("regime") or sig_meta.get("market_regime")
+            if isinstance(regime_val, str):
+                signal_regime = regime_val.upper()
+
+    stand_down_reasons: list[str] = []
+    if confirm_bias in ("NEUTRAL", "UNKNOWN"):
+        stand_down_reasons.append(f"Directional confirmation {confirm_bias.lower()}.")
+    if prob_up is None:
+        stand_down_reasons.append("Primary signal offline (no current probability).")
+    elif edge_val < min_edge:
+        stand_down_reasons.append(f"Signal edge {edge_val:.2f} below strict floor {min_edge:.2f}.")
+    if futures_status not in {"fresh", "disabled"}:
+        reason = futures_reason or futures_status
+        stand_down_reasons.append(f"Futures context {reason}.")
+
+    smiq, pg = _resolve_market_participation(confirm_bias, edge_val)
+    participation_caution: Optional[str] = None
+    if pg.impact == "STAND_DOWN":
+        conflict_reason = _summarize_participation_conflict(pg)
+        if conflict_reason not in stand_down_reasons:
+            stand_down_reasons.append(conflict_reason)
+    elif pg.impact == "CAUTION":
+        participation_caution = _summarize_participation_caution(confirm_bias, pg)
+
+    pg_dict = _gate_result_to_dict(pg)
+    impact = pg_dict.get("impact")
+    if impact == "CAUTION":
+        pg_dict["reason"] = _summarize_participation_caution(confirm_bias, pg)
+    elif impact == "STAND_DOWN":
+        pg_dict["reason"] = _summarize_participation_conflict(pg)
+
+    market_participation_ctx = {
+        "raw": smiq,
+        "gate": pg_dict,
+    }
+
+    stand_down = bool(stand_down_reasons)
+    stand_down_due_to_futures = futures_status not in {"fresh", "disabled"} and any(
+        "Futures context" in reason for reason in stand_down_reasons
+    )
+    primary_reason = stand_down_reasons[0] if stand_down_reasons else ""
+
+    def _summarize_clear_condition(reason: str) -> str:
+        reason_clean = (reason or "").rstrip(".")
+        if reason_clean.startswith("Signal edge"):
+            return "signal edge lifts back above the strict floor"
+        if reason_clean.startswith("Directional confirmation"):
+            return "directional confirmation reconfirms"
+        if reason_clean.startswith("Primary signal offline"):
+            return "the primary signal is back online"
+        if reason_clean.lower().startswith("market participation"):
+            return "market participation gate clears"
+        if "Futures context" in reason_clean:
+            return "futures context refreshes"
+        return "stand-down triggers clear"
+
+    clear_condition_summary = _summarize_clear_condition(primary_reason)
+    status_label = "STAND DOWN" if stand_down else "ACTIVE"
+    edge_display = f"{edge_val:.2f}" if prob_up is not None else "n/a"
+
+    lines: list[str] = []
+    lines.append("📌 **Daily Prep — Plan of Record**")
+    lines.append(f"ET stamp: {now_et.strftime('%Y-%m-%d %H:%M')} | Session: {session}")
+    lines.append(f"Status: **{status_label}** | Bias: **{confirm_bias}** | Edge: {edge_display}")
+
+    last_price_block = _format_last_price_section(
+        symbols_clean,
+        now_et=now_et,
+        session=session,
+    )
+    if last_price_block.strip():
+        lines.append("")
+        lines.append(last_price_block.rstrip("\n"))
+
     lines.append(render_directional_confirmation_block(tf=os.getenv("BIAS_TF", "5m")))
+
+    if stand_down:
+        lines.append("")
+        lines.append("🚫 Stand-Down Triggers:")
+        for reason in stand_down_reasons:
+            lines.append(f"• {reason}")
+    else:
+        lines.append("")
+        lines.append("✅ Playbook Focus:")
+        if participation_caution:
+            lines.append(f"• Participation caution: {participation_caution}")
+        lines.append("• Work with clean breaks/retests at Pivot, S1, or R1.")
+        lines.append("• Size down if confirmation softens mid-session.")
+
     lines.append("")
     lines.append("⏱ Timeframes:")
     lines.append("• Execution: 5m")
     lines.append("• Structure: 60m")
     lines.append("• Context: 1D")
-    lines.append("")
-    lines.append("🧭 Regime:")
-    # Keep conservative; daily prep is a plan, not a forecast
-    lines.append("TRANSITION (confirm at key levels)")
-    lines.append("")
-    lines.append("")
 
-    futures_block = _build_futures_section(post_type="daily_prep", now_ts=_now_et().isoformat(), show_reason=True)
+    lines.append("")
+    lines.append("🔎 Regime Read:")
+    regime_note = "• Transitioning at key levels — wait for cash tape confirmation."
+    lines.append(regime_note)
+
+    futures_block = _build_futures_section(
+        post_type="daily_prep",
+        now_ts=now_iso,
+        show_reason=True,
+        payload=futures_payload,
+    )
     if futures_block:
-        lines.append(futures_block.rstrip("\n"))
         lines.append("")
+        lines.append(futures_block.rstrip("\n"))
 
+    pivot_map: Dict[str, Any] = {}
+    lines.append("")
     lines.append("📐 Key Levels (RTH):")
-
-    for sym in symbols:
+    for sym in symbols_clean:
         dp = get_latest_daily_pivots(sym)
+        pivot_map[sym] = dp
         if not dp or "piv" not in dp:
             lines.append(f"• **{sym}**: (no pivots yet)")
             continue
@@ -5130,18 +10763,197 @@ def build_daily_prep_payload(symbols: list[str]) -> str:
         lines.append(f"• **{sym}**: P {p_val:.2f} | R1 {r1:.2f} | S1 {s1:.2f}")
 
     lines.append("")
+    options_insert_idx = len(lines)
     lines.append("🧠 How Pros Would Trade It:")
-    lines.append("• Use TREND playbook only on break + retest at Pivot / S1 / R1")
-    lines.append("• Use RANGE rules only if price holds inside S1–R1 (avoid mid-range)")
-    lines.append("• Defined risk only; reduce size if conviction is LOW or confirmation is NEUTRAL")
+    if stand_down:
+        if stand_down_due_to_futures:
+            lines.append("• Stand-down: wait for futures context to refresh and bias to reconfirm before deploying risk.")
+        else:
+            lines.append(f"• Stand-down: stay sidelined until {clear_condition_summary}.")
+        lines.append("• Alternate: keep prep manual; let confirmation + liquidity rebuild before re-engaging.")
+    else:
+        lines.append("• Trend setup: break + hold above Pivot/S1/R1 before adding risk.")
+        lines.append("• Range setup: fade edges only with confirmation plus volume agreement.")
+
+    lines.append("")
+    lines.append("🛡 Risk Controls:")
+    if stand_down:
+        if stand_down_due_to_futures:
+            lines.append("• Invalidation: stay sidelined until futures context refreshes and bias reconfirms.")
+        else:
+            lines.append(f"• Invalidation: stand-down clears once {clear_condition_summary}.")
+    else:
+        lines.append("• Invalidation: lose Pivot/S1 with momentum or bias flips NEUTRAL/UNKNOWN.")
+
     lines.append("")
     lines.append("🚫 Do Nothing If:")
-    lines.append("• Directional confirmation is NEUTRAL/UNKNOWN and price chops around Pivot")
-    lines.append("• High-impact macro window is imminent (if you add macro banners)")
+    lines.append("• Confirmation flips NEUTRAL/UNKNOWN around Pivot.")
+    if futures_status not in {"fresh", "disabled"}:
+        lines.append("• Futures context stays stale or a high-impact macro release is <15m away.")
+    else:
+        example_reason = primary_reason.rstrip(".") if primary_reason else "stand-down triggers remain"
+        lines.append(f"• Stand-down triggers remain unresolved (e.g., {example_reason}).")
+
     lines.append("")
-    lines.append(f"ET: {et}")
+    lines.append(f"ET stamp: {now_et.strftime('%Y-%m-%d %H:%M ET')}")
     lines.append("_Not financial advice._")
-    return "\n".join(lines)
+
+    section_data: Dict[str, Any] = {
+        "futures_context": futures_payload,
+        "pivots": pivot_map,
+        "stand_down_reasons": stand_down_reasons,
+        "regime_notes": [regime_note.replace("• ", "")],
+        "market_participation": market_participation_ctx,
+    }
+
+    extra_meta: Dict[str, Any] = {
+        "futures_status": futures_status,
+        "stand_down": stand_down,
+        "bias": confirm_bias,
+        "edge": edge_val,
+        "participation_gate": pg_dict,
+    }
+    if prob_up is not None:
+        extra_meta["prob_up"] = prob_up
+
+    agent_payload = _build_agent_payload(
+        symbols_clean,
+        generated_at=now_et,
+        post_type="daily_prep",
+        extra_meta=extra_meta,
+        sections=section_data,
+        market_participation=market_participation_ctx,
+    )
+
+    technical_state = _extract_technical_state(agent_payload) or "UNKNOWN"
+    primary_pivot = pivot_map.get(primary_sym)
+    pivot_present = bool(
+        isinstance(primary_pivot, dict)
+        and isinstance(primary_pivot.get("piv"), dict)
+        and primary_pivot["piv"].get("P") is not None
+    )
+    bias_label = "BULL"
+    if confirm_bias == "BEARISH":
+        bias_label = "BEAR"
+    elif confirm_bias not in {"BULLISH", "BEARISH"}:
+        bias_label = "NEUTRAL"
+
+    options_meta = {
+        "bias": bias_label,
+        "confirm": confirm_bias,
+        "regime": signal_regime or "UNKNOWN",
+        "pivot_present": pivot_present,
+        "stand_down": stand_down,
+        "technical_state": technical_state,
+    }
+
+    trend_strength = extra_meta.get("trend_strength") or section_data.get("trend_strength") if isinstance(section_data, dict) else None
+    if isinstance(trend_strength, (int, float)):
+        options_meta["trend_score"] = float(trend_strength)
+
+    options_section = build_options_framework(options_meta)
+    if options_section and not validate_options_framework(options_section):
+        insertion = options_section.splitlines() + [""]
+        max_chars = int(DEFAULT_MAX_CHARS_BY_PAYLOAD.get("daily_prep", DEFAULT_MAX_CHARS_DEFAULT))
+        trial_lines = list(lines)
+        trial_lines[options_insert_idx:options_insert_idx] = insertion
+        if len("\n".join(trial_lines)) <= max_chars:
+            lines[options_insert_idx:options_insert_idx] = insertion
+
+    return _render_with_agent_context(
+        lines,
+        symbols_clean,
+        generated_at=now_et,
+        post_type="daily_prep",
+        extra_meta=extra_meta,
+        sections=section_data,
+        market_participation=market_participation_ctx,
+        precomputed_agent_payload=agent_payload,
+    )
+
+
+def build_daily_prep_payload(symbols: list[str]) -> str:
+    render = build_daily_prep_render(symbols)
+    return render.text
+
+
+def build_after_hours_render(
+    symbols: Optional[Sequence[str]] = None,
+    *,
+    regime: Optional[object] = None,
+    levels: Optional[object] = None,
+    options: Optional[object] = None,
+) -> RenderedPost:
+    symbols_clean = [sym.upper() for sym in (symbols or []) if sym]
+
+    now_et = _now_et()
+    futures_payload, futures_status, _ = _futures_context_status(now_et.isoformat())
+    lines: list[str] = []
+    lines.append("🌙 **After Hours Rundown**")
+    lines.append(f"ET date/time: {now_et.strftime('%Y-%m-%d %H:%M')}")
+    lines.append("")
+
+    futures_block = _build_futures_section(
+        post_type="after_hours",
+        now_ts=now_et.isoformat(),
+        show_reason=True,
+        payload=futures_payload,
+    )
+    if futures_block:
+        lines.append(futures_block.rstrip("\n"))
+        lines.append("")
+
+    if symbols_clean:
+        lines.append("📊 Coverage:")
+        lines.append(f"• Monitoring {', '.join(symbols_clean)} into tomorrow.")
+        lines.append("")
+
+    regime_lines = _section_lines(
+        regime,
+        "get_regime_snapshot",
+        post_type="after_hours",
+        default=["• Regime snapshot pending."],
+    )
+    lines.append("📈 Regime Snapshot:")
+    lines.extend(regime_lines)
+    lines.append("")
+
+    level_lines = _section_lines(
+        levels,
+        "get_levels_focus",
+        post_type="after_hours",
+        default=["• Levels fixture pending."],
+    )
+    lines.append("📐 Levels To Review:")
+    lines.extend(level_lines)
+    lines.append("")
+
+    options_lines = _section_lines(
+        options,
+        "get_options_focus",
+        post_type="after_hours",
+        default=["• Options flow placeholder."],
+    )
+    lines.append("📝 Options Flow:")
+    lines.extend(options_lines)
+    lines.append("")
+    lines.append("_Not financial advice._")
+
+    section_data: Dict[str, Any] = {
+        "futures_context": futures_payload,
+        "regime_lines": regime_lines,
+        "levels_lines": level_lines,
+        "options_focus": options_lines,
+    }
+
+    return _render_with_agent_context(
+        lines,
+        symbols_clean,
+        generated_at=now_et,
+        post_type="after_hours",
+        extra_meta={"futures_status": futures_status},
+        sections=section_data,
+    )
 
 
 def build_after_hours_payload(
@@ -5151,57 +10963,87 @@ def build_after_hours_payload(
     levels: Optional[object] = None,
     options: Optional[object] = None,
 ) -> str:
+    render = build_after_hours_render(symbols, regime=regime, levels=levels, options=options)
+    return render.text
+
+
+def build_pre_market_render(
+    symbols: Optional[Sequence[str]] = None,
+    *,
+    regime: Optional[object] = None,
+    levels: Optional[object] = None,
+    options: Optional[object] = None,
+) -> RenderedPost:
+    symbols_clean = [sym.upper() for sym in (symbols or []) if sym]
+
     now_et = _now_et()
+    futures_payload, futures_status, _ = _futures_context_status(now_et.isoformat())
     lines: list[str] = []
-    lines.append("🌙 **After Hours Rundown**")
+    lines.append("🌅 **Pre-Market Briefing**")
     lines.append(f"ET date/time: {now_et.strftime('%Y-%m-%d %H:%M')}")
     lines.append("")
 
-    futures_block = _build_futures_section(post_type="after_hours", now_ts=now_et.isoformat(), show_reason=True)
+    futures_block = _build_futures_section(
+        post_type="pre_market",
+        now_ts=now_et.isoformat(),
+        show_reason=True,
+        payload=futures_payload,
+    )
     if futures_block:
         lines.append(futures_block.rstrip("\n"))
         lines.append("")
 
-    tracked = [sym.upper() for sym in (symbols or []) if sym]
-    if tracked:
-        lines.append("📊 Coverage:")
-        lines.append(f"• Monitoring {', '.join(tracked)} into tomorrow.")
+    if symbols_clean:
+        lines.append("🎯 Opening Watch:")
+        lines.append(f"• Primary symbols: {', '.join(symbols_clean)}")
         lines.append("")
 
+    regime_lines = _section_lines(
+        regime,
+        "get_regime_snapshot",
+        post_type="pre_market",
+        default=["• Regime snapshot pending."],
+    )
     lines.append("📈 Regime Snapshot:")
-    lines.extend(
-        _section_lines(
-            regime,
-            "get_regime_snapshot",
-            post_type="after_hours",
-            default=["• Regime snapshot pending."],
-        )
-    )
+    lines.extend(regime_lines)
     lines.append("")
 
-    lines.append("📐 Levels To Review:")
-    lines.extend(
-        _section_lines(
-            levels,
-            "get_levels_focus",
-            post_type="after_hours",
-            default=["• Levels fixture pending."],
-        )
+    level_lines = _section_lines(
+        levels,
+        "get_levels_focus",
+        post_type="pre_market",
+        default=["• Levels fixture pending."],
     )
+    lines.append("📐 Key Levels For The Open:")
+    lines.extend(level_lines)
     lines.append("")
 
-    lines.append("📝 Options Flow:")
-    lines.extend(
-        _section_lines(
-            options,
-            "get_options_focus",
-            post_type="after_hours",
-            default=["• Options flow placeholder."],
-        )
+    options_lines = _section_lines(
+        options,
+        "get_options_focus",
+        post_type="pre_market",
+        default=["• Options flow placeholder."],
     )
+    lines.append("📝 Options Flow Highlights:")
+    lines.extend(options_lines)
     lines.append("")
     lines.append("_Not financial advice._")
-    return "\n".join(lines)
+
+    section_data: Dict[str, Any] = {
+        "futures_context": futures_payload,
+        "regime_lines": regime_lines,
+        "levels_lines": level_lines,
+        "options_focus": options_lines,
+    }
+
+    return _render_with_agent_context(
+        lines,
+        symbols_clean,
+        generated_at=now_et,
+        post_type="pre_market",
+        extra_meta={"futures_status": futures_status},
+        sections=section_data,
+    )
 
 
 def build_pre_market_payload(
@@ -5211,57 +11053,240 @@ def build_pre_market_payload(
     levels: Optional[object] = None,
     options: Optional[object] = None,
 ) -> str:
+    render = build_pre_market_render(symbols, regime=regime, levels=levels, options=options)
+    return render.text
+
+
+def build_focus_list_render(
+    symbols: Optional[Sequence[str]] = None,
+    *,
+    regime: Optional[object] = None,
+    levels: Optional[object] = None,
+    options: Optional[object] = None,
+) -> RenderedPost:
     now_et = _now_et()
+    now_iso = now_et.isoformat()
+    futures_payload, futures_status, futures_reason = _futures_context_status(now_iso)
+
+    stand_down_reasons: list[str] = []
+    futures_guard_reason = futures_reason or futures_status
+    if futures_status != "fresh":
+        stand_down_reasons.append(f"Futures context {futures_guard_reason}.")
+
+    symbols_clean = [sym.upper() for sym in (symbols or STARTUP_SYMBOLS) if sym]
+    if not symbols_clean:
+        symbols_clean = ["SPY"]
+    primary_sym = symbols_clean[0]
+
+    tf_bias = os.getenv("BIAS_TF", BIAS_TF)
+    confirm_bias, _confirm_note, _confirm_ctx = vix_sqqq_confirmation(tf=tf_bias)
+    sig = get_latest_signal(primary_sym)
+    prob_up = float(sig["prob_up"]) if sig and sig.get("prob_up") is not None else None
+    edge_val: Optional[float] = _edge(prob_up) if prob_up is not None else None
+
+    smiq, pg = _resolve_market_participation(confirm_bias, edge_val)
+    participation_caution: Optional[str] = None
+    if pg.impact == "STAND_DOWN":
+        stand_down_reasons.append(_summarize_participation_conflict(pg))
+    elif pg.impact == "CAUTION":
+        participation_caution = _summarize_participation_caution(confirm_bias, pg)
+
+    stand_down = bool(stand_down_reasons)
+    stand_reason = stand_down_reasons[0] if stand_down_reasons else None
+    pg_dict = _gate_result_to_dict(pg)
+    impact = pg_dict.get("impact")
+    if impact == "CAUTION":
+        pg_dict["reason"] = _summarize_participation_caution(confirm_bias, pg)
+    elif impact == "STAND_DOWN":
+        pg_dict["reason"] = _summarize_participation_conflict(pg)
+    market_participation_ctx = {"raw": smiq, "gate": pg_dict}
+
+    # Hard gate: if price/levels disagree in scale, do not post anything else.
+    integrity_message = PREFLIGHT_INTEGRITY_STANDDOWN_TEXT
+    primary_snap = _get_last_price_snapshot(primary_sym)
+    primary_price = primary_snap.px
+    dp_primary = get_latest_daily_pivots(primary_sym)
+    primary_pivot = None
+    if dp_primary and isinstance(dp_primary.get("piv"), dict):
+        try:
+            primary_pivot = float(dp_primary["piv"].get("P")) if dp_primary["piv"].get("P") is not None else None
+        except Exception:  # noqa: BLE001
+            primary_pivot = None
+    integrity_conflict = False
+    if primary_price is not None and primary_pivot is not None and primary_price > 0 and primary_pivot > 0:
+        rel = abs(primary_price - primary_pivot) / max(primary_price, primary_pivot)
+        if rel > 0.20 and abs(primary_price - primary_pivot) > 10.0:
+            integrity_conflict = True
+
     lines: list[str] = []
-    lines.append("🌅 **Pre-Market Briefing**")
-    lines.append(f"ET date/time: {now_et.strftime('%Y-%m-%d %H:%M')}")
+    lines.append("🎯 Focus List — Next RTH")
+    lines.append(f"ET stamp: {now_et.strftime('%Y-%m-%d %H:%M')} ET")
     lines.append("")
+    if integrity_conflict:
+        lines.append("Stand-Down: **ON**")
+        lines.append(f"Reason: {integrity_message}")
+        lines.append("")
+        lines.append(FOOTER_DISCLAIMER)
 
-    futures_block = _build_futures_section(post_type="pre_market", now_ts=now_et.isoformat(), show_reason=True)
+        return _render_with_agent_context(
+            lines,
+            symbols_clean,
+            generated_at=now_et,
+            post_type="focus_list",
+            extra_meta={
+                "futures_status": futures_status,
+                "stand_down": True,
+                "stand_reason": integrity_message,
+                "data_integrity_conflict": True,
+            },
+            sections={
+                "futures_context": futures_payload,
+                "market_participation": market_participation_ctx,
+            },
+            market_participation=market_participation_ctx,
+        )
+
+    lines.append(f"Stand-Down: **{'ON' if stand_down else 'OFF'}**")
+    if stand_down:
+        lines.append(f"Reason: {stand_reason or 'Stand-down engaged.'}")
+    else:
+        lines.append("Reason: n/a")
+
+    if participation_caution:
+        lines.append(f"Participation caution: {participation_caution}")
+
+    aggression_label = "PROHIBITED" if stand_down else "REDUCED"
+    momentum_only = "false"
+    no_trade = "true" if stand_down else "false"
+    reason_bits = [bit for bit in [stand_reason, participation_caution] if bit]
+    reasons_csv = "; ".join(reason_bits) if reason_bits else "n/a"
+    lines.append(
+        f"🚦 Permissions: Aggression **{aggression_label}** | Momentum-only: {momentum_only} | No-trade: {no_trade}"
+    )
+    lines.append(f"Reason(s): {reasons_csv}")
+
+    participation_section = _format_participation_section(smiq, pg_dict).rstrip("\n")
+    lines.append("")
+    lines.append(participation_section)
+
+    futures_block = _build_futures_section(
+        post_type="focus_list",
+        now_ts=now_iso,
+        show_reason=True,
+        payload=futures_payload,
+    ).rstrip("\n")
     if futures_block:
-        lines.append(futures_block.rstrip("\n"))
         lines.append("")
+        lines.append(futures_block)
 
-    watch = [sym.upper() for sym in (symbols or []) if sym]
-    if watch:
-        lines.append("🎯 Opening Watch:")
-        lines.append(f"• Primary symbols: {', '.join(watch)}")
-        lines.append("")
+    # Guidance
+    default_behavior = "stand-down" if stand_down else ("reduced participation" if participation_caution else "reduced participation")
+    one_line_focus = "Confirm posture only at key zones; wait for gates to resolve."
+    lines.append("")
+    lines.append("📈 Guidance")
+    lines.append(f"• Primary focus: {one_line_focus}")
+    lines.append(f"• Default behavior: {default_behavior}")
 
-    lines.append("📈 Regime Snapshot:")
-    lines.extend(
-        _section_lines(
-            regime,
-            "get_regime_snapshot",
-            post_type="pre_market",
-            default=["• Regime snapshot pending."],
-        )
+    regime_lines = _section_lines(
+        regime,
+        "get_regime_snapshot",
+        post_type="focus_list",
+        default=["• Regime snapshot pending."],
     )
     lines.append("")
+    lines.append("📈 Regime Snapshot")
+    lines.extend(regime_lines)
 
-    lines.append("📐 Key Levels For The Open:")
-    lines.extend(
-        _section_lines(
-            levels,
-            "get_levels_focus",
-            post_type="pre_market",
-            default=["• Levels fixture pending."],
-        )
+    # Focus symbols
+    lines.append("")
+    lines.append("🔭 Focus Symbols")
+    for sym in symbols_clean:
+        lines.append(f"• {sym}: observe behavior at key zones; wait for posture confirmation.")
+
+    # Levels in play
+    level_lines = _section_lines(
+        levels,
+        "get_levels_focus",
+        post_type="focus_list",
+        default=["Levels pending."],
     )
     lines.append("")
+    lines.append("📐 Levels In Play")
+    lines.extend(level_lines)
 
-    lines.append("📝 Options Flow Highlights:")
-    lines.extend(
-        _section_lines(
-            options,
-            "get_options_focus",
-            post_type="pre_market",
-            default=["• Options flow placeholder."],
-        )
+    # Options environment (context only)
+    options_lines = _section_lines(
+        options,
+        "get_options_focus",
+        post_type="focus_list",
+        default=[
+            "• Gamma: NORMAL",
+            "• Theta: NORMAL",
+            "• Vol Regime: NORMAL",
+        ],
     )
+
+    def _extract_value(prefixes: tuple[str, ...]) -> Optional[str]:
+        for raw in options_lines:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            text = text.lstrip("•").strip()
+            low = text.lower()
+            for p in prefixes:
+                if low.startswith(p):
+                    if ":" in text:
+                        return text.split(":", 1)[1].strip() or None
+                    return text[len(p) :].strip() or None
+        return None
+
+    gamma_val = _extract_value(("gamma", "gamma:")) or "NORMAL"
+    theta_val = _extract_value(("theta", "theta:")) or "NORMAL"
+    vol_val = _extract_value(("vol regime", "vol_regime", "vol", "vol:")) or "NORMAL"
     lines.append("")
-    lines.append("_Not financial advice._")
-    return "\n".join(lines)
+    lines.append("🧠 Options Environment (context only)")
+    lines.append(f"• Gamma: {gamma_val}")
+    lines.append(f"• Theta: {theta_val}")
+    lines.append(f"• Vol Regime: {vol_val}")
+
+    # Guardrails
+    lines.append("")
+    lines.append("🚫 Guardrails")
+    lines.append("• If data becomes stale/degraded, stand down.")
+    lines.append("• If market participation conflicts with bias, reduce participation.")
+    lines.append("• If futures context is stale, stand down until refresh.")
+
+    lines.append("")
+    lines.append(FOOTER_DISCLAIMER)
+    extra_meta: Dict[str, Any] = {
+        "futures_status": futures_status,
+        "stand_down": stand_down,
+        "bias": confirm_bias,
+        "edge": edge_val,
+        "participation_gate": pg_dict,
+    }
+    if prob_up is not None:
+        extra_meta["prob_up"] = prob_up
+    if stand_down and stand_reason:
+        extra_meta["stand_reason"] = stand_reason
+
+    section_data: Dict[str, Any] = {
+        "futures_context": futures_payload,
+        "regime_lines": regime_lines,
+        "levels_lines": level_lines,
+        "options_focus": options_lines,
+        "market_participation": market_participation_ctx,
+    }
+
+    return _render_with_agent_context(
+        lines,
+        symbols_clean,
+        generated_at=now_et,
+        post_type="focus_list",
+        extra_meta=extra_meta,
+        sections=section_data,
+        market_participation=market_participation_ctx,
+    )
 
 
 def build_focus_list_payload(
@@ -5271,58 +11296,310 @@ def build_focus_list_payload(
     levels: Optional[object] = None,
     options: Optional[object] = None,
 ) -> str:
+    render = build_focus_list_render(symbols, regime=regime, levels=levels, options=options)
+    return render.text
+
+
+def build_intraday_update_render(
+    symbols: Optional[Sequence[str]] = None,
+    *,
+    regime: Optional[object] = None,
+    levels: Optional[object] = None,
+    options: Optional[object] = None,
+) -> RenderedPost:
+    MAX_CHARS = DEFAULT_MAX_CHARS_BY_PAYLOAD.get("intraday_update", 900)
+
     now_et = _now_et()
-    lines: list[str] = []
-    lines.append("🎯 **Focus List — Next RTH**")
-    lines.append(f"ET date/time: {now_et.strftime('%Y-%m-%d %H:%M')}")
-    lines.append("")
+    now_iso = now_et.isoformat()
+    futures_payload, futures_status, futures_reason = _futures_context_status(now_iso)
 
-    futures_block = _build_futures_section(post_type="focus_list", now_ts=now_et.isoformat())
-    if futures_block:
-        lines.append(futures_block.rstrip("\n"))
-        lines.append("")
+    session_value = futures_payload.get("session") if isinstance(futures_payload, dict) else None
+    if not session_value:
+        session_value = market_session_et(now_et.astimezone(timezone.utc))
+    session_label = str(session_value or "UNK").upper()
 
-    lines.append("📈 Regime Snapshot:")
-    lines.extend(
-        _section_lines(
-            regime,
-            "get_regime_snapshot",
-            post_type="focus_list",
-            default=["• Regime snapshot pending."],
+    symbols_clean = [sym.upper() for sym in (symbols or STARTUP_SYMBOLS) if sym]
+    if not symbols_clean:
+        symbols_clean = ["SPY"]
+    primary_sym = symbols_clean[0]
+
+    stand_down_triggers: list[dict[str, str]] = []
+    input_alerts: list[str] = []
+
+    def _join_reason(parts: Sequence[str]) -> str:
+        clean_parts: list[str] = []
+        for part in parts:
+            if part is None:
+                continue
+            text = str(part).strip()
+            if not text or text.lower() == "none":
+                continue
+            clean_parts.append(text.rstrip("."))
+        if not clean_parts:
+            return ""
+        return ". ".join(clean_parts) + "."
+
+    def _add_stand_down(reason: str, clear: str, guidance: Optional[str] = None) -> None:
+        text = _join_reason([reason, guidance])
+        clear_text = clear.strip()
+        if clear_text:
+            clear_text = clear_text.rstrip(".") + "."
+        stand_down_triggers.append({"reason": text, "clear": clear_text or "Stand-down triggers clear."})
+
+    def _add_input_alert(reason: str, guidance: Optional[str] = None) -> None:
+        note = _join_reason([reason])
+        if note:
+            input_alerts.append(note)
+
+    futures_guard_reason = futures_reason or futures_status
+    if futures_status != "fresh":
+        age_note: Optional[str] = None
+        if isinstance(futures_payload, dict):
+            age_val = futures_payload.get("age_minutes")
+            if isinstance(age_val, (int, float)) and age_val >= 0:
+                age_note = f"{int(round(age_val))}m old"
+        reason_bits: list[str] = [f"Futures context {futures_guard_reason}"]
+        if age_note and age_note not in str(futures_guard_reason):
+            reason_bits[-1] = reason_bits[-1] + f" ({age_note})"
+        reason_text = reason_bits[0]
+        clear_summary = "Futures context refreshes with a fresh timestamp"
+        if session_label == "RTH":
+            _add_input_alert(reason_text)
+        else:
+            _add_stand_down(reason_text, clear_summary, None)
+
+    tf_bias = os.getenv("BIAS_TF", BIAS_TF)
+    confirm_bias, confirm_note, _confirm_ctx = vix_sqqq_confirmation(tf=tf_bias)
+    confirmation_short: Optional[str] = confirm_note if isinstance(confirm_note, str) and confirm_note.strip() else None
+    sig = get_latest_signal(primary_sym)
+    prob_up = float(sig["prob_up"]) if sig and sig.get("prob_up") is not None else None
+    edge_val: Optional[float] = _edge(prob_up) if prob_up is not None else None
+    edge_floor = AUTOPOST_EDGE_MIN_STRICT
+    plan_mode = bool(edge_val is not None and edge_val < edge_floor)
+    plan_mode_reason: Optional[str] = None
+    if plan_mode and edge_val is not None:
+        plan_mode_reason = f"Signal edge {edge_val:.2f} below strict floor {edge_floor:.2f}"
+
+    smiq, pg = _resolve_market_participation(confirm_bias, edge_val)
+    participation_caution: Optional[str] = None
+    if pg.impact == "STAND_DOWN":
+        _add_stand_down(
+            _summarize_participation_conflict(pg),
+            "Market participation gate clears as breadth rebuilds",
         )
-    )
-    lines.append("")
+    elif pg.impact == "CAUTION":
+        participation_caution = _summarize_participation_caution(confirm_bias, pg)
 
-    focus_symbols = [sym.upper() for sym in (symbols or STARTUP_SYMBOLS) if sym]
-    if focus_symbols:
-        lines.append("🔭 Focus Symbols:")
-        for sym in focus_symbols:
-            lines.append(f"• {sym}: setup placeholder.")
-        lines.append("")
+    stand_down = bool(stand_down_triggers)
+    stand_reason = stand_down_triggers[0]["reason"] if stand_down_triggers else None
+    pg_dict = _gate_result_to_dict(pg)
+    impact = pg_dict.get("impact")
+    if impact == "CAUTION":
+        pg_dict["reason"] = _summarize_participation_caution(confirm_bias, pg)
+    elif impact == "STAND_DOWN":
+        pg_dict["reason"] = _summarize_participation_conflict(pg)
+    market_participation_ctx = {"raw": smiq, "gate": pg_dict}
 
-    lines.append("📐 Levels In Play:")
-    lines.extend(
-        _section_lines(
-            levels,
-            "get_levels_focus",
-            post_type="focus_list",
-            default=["• Levels fixture pending."],
+    last_snapshots: dict[str, PriceSnapshot] = {
+        sym: _get_last_price_snapshot(sym)
+        for sym in symbols_clean
+    }
+    last_prices: dict[str, Optional[float]] = {sym: snap.px for sym, snap in last_snapshots.items()}
+    stale_flags: dict[str, bool] = {sym: snap.stale for sym, snap in last_snapshots.items()}
+
+    def _pivot_triplet(symbol: str) -> dict[str, Optional[float]]:
+        if isinstance(levels, dict):
+            level_payload = levels.get(symbol)
+            if isinstance(level_payload, dict):
+                piv = level_payload.get("piv") or level_payload
+            else:
+                piv = None
+        else:
+            piv = None
+        dp = get_latest_daily_pivots(symbol)
+        if dp and isinstance(dp.get("piv"), dict):
+            piv = dp["piv"]
+        result = {"P": None, "R1": None, "S1": None}
+        if isinstance(piv, dict):
+            for key in ("P", "R1", "S1"):
+                try:
+                    val = piv.get(key)
+                    result[key] = float(val) if val is not None else None
+                except Exception:  # noqa: BLE001
+                    result[key] = None
+        return result
+
+    spy_levels = _pivot_triplet("SPY")
+    qqq_levels = _pivot_triplet("QQQ") if "QQQ" in symbols_clean else None
+
+    bias_label = classify_bias(prob_up) if prob_up is not None else (confirm_bias or "UNKNOWN")
+    conviction_label = classify_conviction(prob_up) if prob_up is not None else "LOW"
+    regime_label = str((smiq.get("regime") if isinstance(smiq, dict) else None) or "UNKNOWN").upper()
+
+    integrity_message = PREFLIGHT_INTEGRITY_STANDDOWN_TEXT
+    integrity_conflict = False
+    if last_prices.get("SPY") is not None and spy_levels.get("P") is not None:
+        lp = float(last_prices["SPY"])  # type: ignore[arg-type]
+        pv = float(spy_levels["P"])  # type: ignore[arg-type]
+        if lp > 0 and pv > 0:
+            rel = abs(lp - pv) / max(lp, pv)
+            if rel > 0.20 and abs(lp - pv) > 10.0:
+                integrity_conflict = True
+
+    header = f"⏱ Intraday Update ({session_label}) — {now_et.strftime('%Y-%m-%d %H:%M ET')}"
+    footer = FOOTER_DISCLAIMER
+
+    if integrity_conflict:
+        text = "\n".join([header, integrity_message, footer])
+        return _render_with_agent_context(
+            text.split("\n"),
+            symbols_clean,
+            generated_at=now_et,
+            post_type="intraday_update",
+            extra_meta={
+                "futures_status": futures_status,
+                "stand_down": True,
+                "stand_reason": integrity_message,
+                "data_integrity_conflict": True,
+                "session": session_label,
+            },
+            sections={
+                "futures_context": futures_payload,
+                "market_participation": market_participation_ctx,
+            },
+            market_participation=market_participation_ctx,
         )
-    )
-    lines.append("")
 
-    lines.append("📝 Options Focus:")
-    lines.extend(
-        _section_lines(
-            options,
-            "get_options_focus",
-            post_type="focus_list",
-            default=["• Options focus placeholder."],
-        )
+    last_csv = ", ".join(
+        f"{sym} {last_prices.get(sym):.2f}" if isinstance(last_prices.get(sym), (int, float)) else f"{sym} n/a"
+        for sym in symbols_clean
     )
-    lines.append("")
-    lines.append("_Not financial advice._")
-    return "\n".join(lines)
+
+    posture_line = f"🧭 Posture: {bias_label.upper()} | Regime: {regime_label} | Conv: {conviction_label.upper()}"
+    aggression_label = "PROHIBITED" if stand_down else ("REDUCED" if participation_caution else "REDUCED")
+    momentum_only = "true" if regime_label == "MOMENTUM" else "false"
+    no_trade = "true" if stand_down else "false"
+    reasons_parts: list[str] = []
+    if stand_reason:
+        reasons_parts.append(stand_reason)
+    if participation_caution:
+        reasons_parts.append(f"Participation caution: {participation_caution}")
+    if plan_mode_reason:
+        reasons_parts.append(plan_mode_reason)
+    reasons_csv = ", ".join(reasons_parts) or "n/a"
+
+    def _levels_compact(symbol: str, triplet: dict[str, Optional[float]]) -> str:
+        def _f(v: Optional[float]) -> str:
+            return "n/a" if v is None else f"{v:.2f}"
+        return f"P {_f(triplet.get('P'))} / R1 {_f(triplet.get('R1'))} / S1 {_f(triplet.get('S1'))}"
+
+    futures_alignment = "ALIGNED"
+    if futures_status != "fresh":
+        futures_alignment = "CONFLICT"
+    else:
+        posture = str((futures_payload or {}).get("posture") if isinstance(futures_payload, dict) else "").lower()
+        if any(word in posture for word in ("mixed", "balance", "neutral")):
+            futures_alignment = "MIXED"
+
+    text_lines: list[str] = []
+    text_lines.append(header)
+    text_lines.append(f"💵 Last: {last_csv}")
+    text_lines.append("")
+    text_lines.append(posture_line)
+    text_lines.append(
+        f"🚦 Permissions: Aggression **{aggression_label}** | Stand-down: {'ON' if stand_down else 'OFF'} | Momentum-only: {momentum_only} | No-trade: {no_trade}"
+    )
+    text_lines.append(f"Reason(s): {reasons_csv}")
+    text_lines.append("")
+    text_lines.append("📐 Key Levels")
+    text_lines.append(f"SPY: {_levels_compact('SPY', spy_levels)}")
+    if qqq_levels:
+        text_lines.append(f"QQQ: {_levels_compact('QQQ', qqq_levels)}")
+    text_lines.append("")
+    text_lines.append(f"🟦 Futures Alignment: {futures_alignment}")
+    text_lines.append("Event Risk: NONE")
+    text_lines.append("")
+    text_lines.append("✅ Allowed")
+    text_lines.append("• Observe posture; reduce participation until confirmation.")
+    text_lines.append("")
+    text_lines.append("🚫 Prohibited")
+    text_lines.append("• Escalating aggression when posture is not confirmed.")
+    text_lines.append("• Any action during degraded inputs.")
+    text_lines.append("")
+    text_lines.append("Invalidation: posture degrades or data becomes stale/degraded.")
+    text_lines.append("")
+    text_lines.append(footer)
+
+    text = "\n".join(text_lines)
+    if len(text) > MAX_CHARS:
+        # Keep the contract-safe core lines only.
+        text = "\n".join(
+            [
+                header,
+                f"💵 Last: {last_csv}",
+                posture_line,
+                f"🚦 Permissions: Aggression **{aggression_label}** | Momentum-only: {momentum_only} | No-trade: {no_trade}",
+                f"Reason(s): {reasons_csv}",
+                footer,
+            ]
+        )
+
+    render_lines = text.split("\n")
+    required_lines = list(render_lines)
+
+    section_data: Dict[str, Any] = {
+        "futures_context": futures_payload,
+        "market_participation": market_participation_ctx,
+        "input_alerts": input_alerts,
+        "stand_down_triggers": stand_down_triggers,
+        "plan_mode": {
+            "active": plan_mode,
+            "reason": plan_mode_reason,
+            "edge_floor": edge_floor,
+        },
+        "last_prices": {
+            sym: {
+                "price": last_prices.get(sym),
+                "stale": stale_flags.get(sym, True),
+            }
+            for sym in symbols_clean
+        },
+        "levels": {
+            "SPY": spy_levels,
+            "QQQ": qqq_levels,
+        },
+        "optional_lines": render_lines[len(required_lines):],
+    }
+
+    extra_meta: Dict[str, Any] = {
+        "futures_status": futures_status,
+        "stand_down": stand_down,
+        "bias": bias_label,
+        "edge": edge_val,
+        "participation_gate": pg_dict,
+        "plan_mode": plan_mode,
+        "session": session_label,
+    }
+    if prob_up is not None:
+        extra_meta["prob_up"] = prob_up
+    if stand_down and stand_reason:
+        extra_meta["stand_reason"] = stand_reason
+    if plan_mode and plan_mode_reason:
+        extra_meta["plan_mode_reason"] = plan_mode_reason
+    if participation_caution:
+        extra_meta["participation_caution"] = participation_caution
+    if confirmation_short:
+        extra_meta["confirmation"] = confirmation_short
+
+    return _render_with_agent_context(
+        render_lines,
+        symbols_clean,
+        generated_at=now_et,
+        post_type="intraday_update",
+        extra_meta=extra_meta,
+        sections=section_data,
+        market_participation=market_participation_ctx,
+    )
 
 
 def build_intraday_update_payload(
@@ -5331,51 +11608,134 @@ def build_intraday_update_payload(
     levels: Optional[object] = None,
     options: Optional[object] = None,
 ) -> str:
+    render = build_intraday_update_render(regime=regime, levels=levels, options=options)
+    return render.text
+
+
+def build_close_recap_render(
+    symbols: Optional[Sequence[str]] = None,
+    *,
+    regime: Optional[object] = None,
+    levels: Optional[object] = None,
+    options: Optional[object] = None,
+) -> RenderedPost:
+    """Text-only close recap (v1). No charts unless explicitly added later."""
+
+    MAX_CHARS = DEFAULT_MAX_CHARS_BY_PAYLOAD.get("recap", 900)
+
     now_et = _now_et()
+    now_iso = now_et.isoformat()
+
+    futures_payload, futures_status, _futures_reason = _futures_context_status(now_iso)
+
+    symbols_clean = [sym.upper() for sym in (symbols or STARTUP_SYMBOLS) if sym]
+    if not symbols_clean:
+        symbols_clean = ["SPY"]
+    primary_sym = symbols_clean[0]
+
+    tf_bias = os.getenv("BIAS_TF", BIAS_TF)
+    confirm_bias, confirm_note, _confirm_ctx = vix_sqqq_confirmation(tf=tf_bias)
+    confirmation_short: Optional[str] = confirm_note if isinstance(confirm_note, str) and confirm_note.strip() else None
+
+    sig = get_latest_signal(primary_sym)
+    prob_up = float(sig["prob_up"]) if sig and sig.get("prob_up") is not None else None
+    bias_label = classify_bias(prob_up) if prob_up is not None else (confirm_bias or "UNKNOWN")
+    conviction_label = classify_conviction(prob_up) if prob_up is not None else "LOW"
+
+    smiq, pg = _resolve_market_participation(confirm_bias, _edge(prob_up) if prob_up is not None else None)
+    pg_dict = _gate_result_to_dict(pg)
+    impact = pg_dict.get("impact")
+    if impact == "CAUTION":
+        pg_dict["reason"] = _summarize_participation_caution(confirm_bias, pg)
+    elif impact == "STAND_DOWN":
+        pg_dict["reason"] = _summarize_participation_conflict(pg)
+    market_participation_ctx = {"raw": smiq, "gate": pg_dict}
+
+    last_snapshots: dict[str, PriceSnapshot] = {sym: _get_last_price_snapshot(sym) for sym in symbols_clean}
+    last_prices: dict[str, Optional[float]] = {sym: snap.px for sym, snap in last_snapshots.items()}
+
+    def _pivot_triplet(symbol: str) -> dict[str, Optional[float]]:
+        dp = get_latest_daily_pivots(symbol)
+        piv = dp.get("piv") if dp and isinstance(dp.get("piv"), dict) else None
+        result = {"P": None, "R1": None, "S1": None}
+        if isinstance(piv, dict):
+            for key in ("P", "R1", "S1"):
+                try:
+                    val = piv.get(key)
+                    result[key] = float(val) if val is not None else None
+                except Exception:  # noqa: BLE001
+                    result[key] = None
+        return result
+
+    spy_levels = _pivot_triplet("SPY")
+    qqq_levels = _pivot_triplet("QQQ") if "QQQ" in symbols_clean else None
+
+    regime_label = str((smiq.get("regime") if isinstance(smiq, dict) else None) or "UNKNOWN").upper()
+    stand_down = bool(pg_dict.get("impact") == "STAND_DOWN")
+    footer = FOOTER_DISCLAIMER
+
+    last_csv = ", ".join(
+        f"{sym} {last_prices.get(sym):.2f}" if isinstance(last_prices.get(sym), (int, float)) else f"{sym} n/a"
+        for sym in symbols_clean
+    )
+
+    def _levels_compact(triplet: dict[str, Optional[float]]) -> str:
+        def _f(v: Optional[float]) -> str:
+            return "n/a" if v is None else f"{v:.2f}"
+        return f"P {_f(triplet.get('P'))} / R1 {_f(triplet.get('R1'))} / S1 {_f(triplet.get('S1'))}"
+
+    header = f"🧾 Close Recap — {now_et.strftime('%Y-%m-%d %H:%M ET')}"
+    posture_line = f"🧭 Close posture: {bias_label.upper()} | Regime: {regime_label} | Conv: {conviction_label.upper()}"
+    permissions = "Stand-down: ON" if stand_down else "Stand-down: OFF"
+    futures_alignment = "FRESH" if futures_status == "fresh" else "DEGRADED"
+
     lines: list[str] = []
-    lines.append("⚡ **Intraday Update**")
-    lines.append(f"ET date/time: {now_et.strftime('%Y-%m-%d %H:%M')}")
+    lines.append(header)
+    lines.append(f"💵 Last: {last_csv}")
     lines.append("")
+    lines.append(posture_line)
+    if confirmation_short:
+        lines.append(f"Confirm: {confirmation_short}")
+    lines.append(f"🚦 {permissions} | Futures: {futures_alignment}")
+    lines.append("")
+    lines.append("📐 Key Levels")
+    lines.append(f"SPY: {_levels_compact(spy_levels)}")
+    if qqq_levels:
+        lines.append(f"QQQ: {_levels_compact(qqq_levels)}")
+    lines.append("")
+    lines.append("What changed:")
+    lines.append("• Close posture is the only thing that matters now; plan the next session, don’t chase this one.")
+    lines.append("• If inputs were degraded or participation was thin, keep risk reduced until conditions improve.")
+    lines.append("")
+    lines.append(footer)
 
-    futures_block = _build_futures_section(post_type="intraday_update", now_ts=now_et.isoformat())
-    if futures_block:
-        lines.append(futures_block.rstrip("\n"))
-        lines.append("")
+    text = "\n".join(lines).strip()
+    if len(text) > MAX_CHARS:
+        text = "\n".join([header, posture_line, f"💵 Last: {last_csv}", footer])
 
-    lines.append("📈 Regime Shift Watch:")
-    lines.extend(
-        _section_lines(
-            regime,
-            "get_regime_snapshot",
-            post_type="intraday_update",
-            default=["• Intraday regime placeholder."],
-        )
+    extra_meta: Dict[str, Any] = {
+        "futures_status": futures_status,
+        "stand_down": stand_down,
+        "bias": bias_label,
+        "session": "CLOSE",
+    }
+    if prob_up is not None:
+        extra_meta["prob_up"] = prob_up
+    if confirmation_short:
+        extra_meta["confirmation"] = confirmation_short
+
+    return _render_with_agent_context(
+        text.split("\n"),
+        symbols_clean,
+        generated_at=now_et,
+        post_type="recap",
+        extra_meta=extra_meta,
+        sections={
+            "futures_context": futures_payload,
+            "market_participation": market_participation_ctx,
+        },
+        market_participation=market_participation_ctx,
     )
-    lines.append("")
-
-    lines.append("📐 Levels In Play:")
-    lines.extend(
-        _section_lines(
-            levels,
-            "get_levels_focus",
-            post_type="intraday_update",
-            default=["• Levels fixture pending."],
-        )
-    )
-    lines.append("")
-
-    lines.append("📝 Options Signals:")
-    lines.extend(
-        _section_lines(
-            options,
-            "get_options_focus",
-            post_type="intraday_update",
-            default=["• Options focus placeholder."],
-        )
-    )
-    lines.append("")
-    lines.append("_Not financial advice._")
-    return "\n".join(lines)
 
 
 async def build_signal_alert_payload(sym: str, *, mode: str) -> Optional[tuple[str, str]]:
@@ -5415,6 +11775,11 @@ async def build_signal_alert_payload(sym: str, *, mode: str) -> Optional[tuple[s
             print(f"[AUTOPOST] skip {sym}: {reason}")
             return None
 
+    ok_tnt, reason_tnt = tnt_regime_gate(payload, output_mode=mode_norm)
+    if not ok_tnt:
+        print(f"[AUTOPOST] skip {sym}: {reason_tnt}")
+        return None
+
     state = _extract_signal_state(payload)
     ok, reason = _should_post_signal(sym, prob_up, gate_mode, mode=mode_norm, state=state)
     if not ok:
@@ -5422,50 +11787,65 @@ async def build_signal_alert_payload(sym: str, *, mode: str) -> Optional[tuple[s
             print(f"[AUTOPOST] skip {sym}: {reason}")
         return None
 
-    analysis_mode = (payload.get("analysis_mode") or "db").strip().lower()
-    if analysis_mode not in {"db", "on_demand"}:
-        analysis_mode = "db"
+    context_mode = (payload.get("trade_context_mode") or payload.get("analysis_mode") or "db").strip().lower()
+    if context_mode not in {"db", "on_demand"}:
+        context_mode = "db"
 
-    payload["analysis_mode"] = analysis_mode
-    payload["analysis_source"] = payload.get("analysis_source") or "model"
+    payload["trade_context_mode"] = context_mode
+    payload["analysis_mode"] = context_mode
+
+    context_source = payload.get("trade_context_source") or payload.get("analysis_source") or "model"
+    payload["trade_context_source"] = context_source
+    payload["analysis_source"] = context_source
+
+    payload["trade_context_output_mode"] = mode_norm
     payload["analysis_output_mode"] = mode_norm
 
     live_price_override: Optional[float] = None
     live_price_ts: Optional[str] = None
-    if analysis_mode == "on_demand":
+    if context_mode == "on_demand":
         if isinstance(payload.get("last_price"), (int, float)):
             live_price_override = float(payload["last_price"])
         live_price_ts = payload.get("last_price_ts") if isinstance(payload.get("last_price_ts"), str) else None
 
-    packet, _ = build_analysis_packet(
+    packet, _ = build_trade_context_packet(
         sym,
         payload,
-        analysis_mode=analysis_mode,
+        context_mode=context_mode,
         live_price=live_price_override,
         live_price_ts=live_price_ts,
     )
+    packet["trade_context_output_mode"] = payload["trade_context_output_mode"]
     packet["analysis_output_mode"] = payload["analysis_output_mode"]
     packet["edge"] = payload.get("edge")
     packet["edge_threshold"] = payload.get("edge_threshold")
     packet["educational_only"] = payload.get("educational_only")
+    payload["trade_context_packet"] = packet
     payload["analysis_packet"] = packet
 
-    if payload["analysis_output_mode"] == "insights":
-        ai_text, ai_err = await ai_render_trade_context(_openai, packet)
+    if payload["trade_context_output_mode"] == "insights":
+        ai_text, ai_err = await ai_render_trade_context(None, packet)
         if ai_err:
             print(f"[AUTOPOST] insights fallback {sym}: {ai_err}")
         if ai_text:
             ok_ai, reason_ai = validate_output(ai_text, mode="insights")
             if ok_ai:
-                _last_signal_post_by_symbol[sym] = int(datetime.now(timezone.utc).timestamp())
+                _last_signal_post_by_symbol[sym] = int(_now_utc().timestamp())
                 _record_signal_state(sym, state)
                 return ai_text, "insights"
             print(f"[AUTOPOST] insights blocked {sym}: {reason_ai}")
 
-    fallback = format_signal_clean(sym, payload, verbose=False)
+    fallback = format_signal_clean(
+        sym,
+        payload,
+        verbose=False,
+        now_et=_now_et(),
+        gate=gate,
+        price_snapshot=_get_last_price_snapshot(sym),
+    )
     ok_fb, reason_fb = validate_output(fallback, mode="strict")
     if ok_fb:
-        _last_signal_post_by_symbol[sym] = int(datetime.now(timezone.utc).timestamp())
+        _last_signal_post_by_symbol[sym] = int(_now_utc().timestamp())
         _record_signal_state(sym, state)
         return fallback, "strict"
 
@@ -5485,7 +11865,7 @@ async def autopost_daily_loop(channel):
 
     while not bot.is_closed():
         try:
-            if not _env_bool("AUTOPOST_DAILY_ENABLED", "1"):
+            if not _env_bool("AUTOPOST_DAILY_ENABLED", "0"):
                 await asyncio.sleep(poll_sec)
                 continue
 
@@ -5510,20 +11890,26 @@ async def autopost_daily_loop(channel):
             due = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
             if now_et >= due and (_last_daily_post_et_date != now_et.date()):
                 symbols = _get_watchlist()
-                payload = build_daily_prep_payload(symbols)
-                await safe_send(
+                render = build_daily_prep_render(symbols)
+                await _publish_autopost_render(
                     channel,
-                    payload,
-                    kind="analysis",
+                    render,
+                    builder="build_daily_prep_render",
+                    label="daily_prep",
                     symbol="",
-                    pivots=None,
-                    analysis_mode="db",
-                    output_mode="strict",
+                    context_mode="db",
+                    context_output_mode="strict",
                 )
 
                 _last_daily_post_et_date = now_et.date()
                 print(f"[OK] daily prep posted for {now_et.date()}")
 
+            await asyncio.sleep(poll_sec)
+
+        except ContractViolationError as exc:
+            print(f"[WARN] autopost_daily_loop contract violation: {exc}")
+            if STRICT_CONTRACTS:
+                raise
             await asyncio.sleep(poll_sec)
 
         except Exception as exc:  # noqa: BLE001
@@ -5538,7 +11924,7 @@ async def autopost_signal_loop(channel):
 
     while not bot.is_closed():
         try:
-            if not _env_bool("AUTOPOST_SIGNAL_ENABLED", "1"):
+            if not _env_bool("AUTOPOST_SIGNAL_ENABLED", "0"):
                 await asyncio.sleep(poll)
                 continue
 
@@ -5565,11 +11951,15 @@ async def autopost_signal_loop(channel):
                     await safe_send(
                         channel,
                         text,
-                        kind="analysis",
+                            # Signal alerts are not full analysis cards; bypass the
+                            # analysis-format validator to prevent confusing stand-down
+                            # fallbacks like "Missing section: Last Price".
+                            kind="status",
                         symbol=sym,
                         pivots=None,
                         analysis_mode="db",
                         output_mode=output_mode,
+                            label="signal_alert",
                     )
                     posted = True
                     break
@@ -5589,11 +11979,19 @@ def _ensure_autopost_task():
         print("[OK] autopost: disabled (AUTOPOST_ENABLED=0)")
         return
 
-    channel_id = _env_int("AUTOPOST_CHANNEL_ID", "0")
+    canary_id = CANARY_CHANNEL_ID
+    if canary_id:
+        channel_id = canary_id
+    else:
+        channel_id = _env_int("AUTOPOST_CHANNEL_ID", "0")
+
     channel = bot.get_channel(channel_id) if channel_id else None
     if channel is None:
         print(f"[WARN] autopost: channel not found/invalid id={channel_id}; skipping tasks.")
         return
+
+    if canary_id:
+        print(f"[OK] autopost routed to canary channel id={channel_id}")
 
     if _env_bool("AUTOPOST_DAILY_ENABLED", "1"):
         if not _autopost_daily_task or _autopost_daily_task.done():
@@ -5606,41 +12004,326 @@ def _ensure_autopost_task():
             print("[OK] autopost signal task scheduled")
 
 
+def _automation_enabled() -> bool:
+    """Primary switch for go-live automation.
+
+    Back-compat: if `TNT_AUTOMATION_ENABLED` is not set, fall back to `AUTOPOST_ENABLED`.
+    """
+
+    if os.getenv("TNT_AUTOMATION_ENABLED") is None:
+        return _env_bool("AUTOPOST_ENABLED", "0")
+    return _env_bool("TNT_AUTOMATION_ENABLED", "0")
+
+
+def _resolve_automation_channel():
+    canary_id = CANARY_CHANNEL_ID
+    channel_id = canary_id or _env_int("AUTOPOST_CHANNEL_ID", "0")
+    channel = bot.get_channel(channel_id) if channel_id else None
+    if channel is None:
+        print(f"[WARN] automation: channel not found/invalid id={channel_id}; skipping tasks.")
+        return None
+    if canary_id:
+        print(f"[OK] automation routed to canary channel id={channel_id}")
+    return channel
+
+
+async def automation_focus_list_loop(channel):
+    await bot.wait_until_ready()
+    global _last_focus_list_et_date
+
+    hh, mm = _parse_hhmm(os.getenv("TNT_FOCUS_LIST_TIME_ET", "08:10"))
+    poll_sec = 30
+    print(f"[OK] automation_focus_list_loop running (time_et={hh:02d}:{mm:02d})")
+
+    while not bot.is_closed():
+        try:
+            if not _env_bool("TNT_FOCUS_LIST_ENABLED", "1"):
+                await asyncio.sleep(poll_sec)
+                continue
+
+            max_min = float(os.getenv("DATA_STALE_MAX_MIN", "3"))
+            age = latest_bar_age_min("SPY", "1m")
+            if age is None or age > max_min:
+                print(f"[WARN] data stale: SPY age_min={age}; focus_list paused")
+                await _autopost_stale_guard()
+                await asyncio.sleep(poll_sec)
+                continue
+            if await _autopost_stale_guard():
+                await asyncio.sleep(poll_sec)
+                continue
+
+            now_et = _now_et()
+            if now_et.weekday() >= 5:
+                await asyncio.sleep(60)
+                continue
+
+            due = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if now_et >= due and (_last_focus_list_et_date != now_et.date()):
+                symbols = _get_watchlist()
+                render = build_focus_list_render(symbols)
+                primary = symbols[0].strip().upper() if symbols else "SPY"
+                await _publish_autopost_render(
+                    channel,
+                    render,
+                    builder="build_focus_list_render",
+                    label="focus_list",
+                    symbol=primary,
+                    context_mode="db",
+                    context_output_mode="strict",
+                )
+                _last_focus_list_et_date = now_et.date()
+                print(f"[OK] focus_list posted for {now_et.date()}")
+
+            await asyncio.sleep(poll_sec)
+
+        except ContractViolationError as exc:
+            print(f"[WARN] automation_focus_list_loop contract violation: {exc}")
+            if STRICT_CONTRACTS:
+                raise
+            await asyncio.sleep(poll_sec)
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_focus_list_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(poll_sec)
+
+
+async def automation_intraday_update_loop(channel):
+    await bot.wait_until_ready()
+    global _last_intraday_update_et_date
+
+    hh, mm = _parse_hhmm(os.getenv("TNT_INTRADAY_UPDATE_TIME_ET", "12:00"))
+    poll_sec = 30
+    print(f"[OK] automation_intraday_update_loop running (time_et={hh:02d}:{mm:02d})")
+
+    while not bot.is_closed():
+        try:
+            if not _env_bool("TNT_INTRADAY_UPDATE_ENABLED", "1"):
+                await asyncio.sleep(poll_sec)
+                continue
+
+            max_min = float(os.getenv("DATA_STALE_MAX_MIN", "3"))
+            age = latest_bar_age_min("SPY", "1m")
+            if age is None or age > max_min:
+                print(f"[WARN] data stale: SPY age_min={age}; intraday_update paused")
+                await _autopost_stale_guard()
+                await asyncio.sleep(poll_sec)
+                continue
+            if await _autopost_stale_guard():
+                await asyncio.sleep(poll_sec)
+                continue
+
+            now_et = _now_et()
+            if now_et.weekday() >= 5:
+                await asyncio.sleep(60)
+                continue
+
+            due = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if now_et >= due and (_last_intraday_update_et_date != now_et.date()):
+                symbols = _get_watchlist()
+                render = build_intraday_update_render(symbols)
+                primary = symbols[0].strip().upper() if symbols else "SPY"
+                await _publish_autopost_render(
+                    channel,
+                    render,
+                    builder="build_intraday_update_render",
+                    label="intraday_update",
+                    symbol=primary,
+                    context_mode="db",
+                    context_output_mode="strict",
+                )
+                _last_intraday_update_et_date = now_et.date()
+                print(f"[OK] intraday_update posted for {now_et.date()}")
+
+            await asyncio.sleep(poll_sec)
+
+        except ContractViolationError as exc:
+            print(f"[WARN] automation_intraday_update_loop contract violation: {exc}")
+            if STRICT_CONTRACTS:
+                raise
+            await asyncio.sleep(poll_sec)
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_intraday_update_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(poll_sec)
+
+
+async def automation_recap_loop(channel):
+    await bot.wait_until_ready()
+    global _last_recap_et_date
+
+    hh, mm = _parse_hhmm(os.getenv("TNT_RECAP_TIME_ET", "16:10"))
+    poll_sec = 30
+    print(f"[OK] automation_recap_loop running (time_et={hh:02d}:{mm:02d})")
+
+    while not bot.is_closed():
+        try:
+            if not _env_bool("TNT_RECAP_ENABLED", "1"):
+                await asyncio.sleep(poll_sec)
+                continue
+
+            now_et = _now_et()
+            if now_et.weekday() >= 5:
+                await asyncio.sleep(60)
+                continue
+
+            due = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if now_et >= due and (_last_recap_et_date != now_et.date()):
+                symbols = _get_watchlist()
+                render = build_close_recap_render([s.strip().upper() for s in symbols if s][:8])
+                primary = symbols[0].strip().upper() if symbols else "SPY"
+                await _publish_autopost_render(
+                    channel,
+                    render,
+                    builder="build_close_recap_render",
+                    label="recap",
+                    symbol=primary,
+                    context_mode="db",
+                    context_output_mode="strict",
+                )
+                _last_recap_et_date = now_et.date()
+                print(f"[OK] recap posted for {now_et.date()}")
+
+            await asyncio.sleep(poll_sec)
+
+        except ContractViolationError as exc:
+            print(f"[WARN] automation_recap_loop contract violation: {exc}")
+            if STRICT_CONTRACTS:
+                raise
+            await asyncio.sleep(poll_sec)
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_recap_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(poll_sec)
+
+
+async def automation_heartbeat_loop(channel):
+    await bot.wait_until_ready()
+    global _last_heartbeat_sent_ts
+
+    interval_min = float(os.getenv("TNT_HEARTBEAT_INTERVAL_MIN", "60") or "60")
+    rth_only = _env_bool("TNT_HEARTBEAT_RTH_ONLY", "1")
+    poll_sec = 30
+    print(f"[OK] automation_heartbeat_loop running (interval_min={interval_min})")
+
+    while not bot.is_closed():
+        try:
+            if not _env_bool("TNT_HEARTBEAT_ENABLED", "1") or interval_min <= 0:
+                await asyncio.sleep(poll_sec)
+                continue
+
+            now_ts = time_lib.time()
+            if _last_heartbeat_sent_ts is not None and (now_ts - _last_heartbeat_sent_ts) < interval_min * 60.0:
+                await asyncio.sleep(poll_sec)
+                continue
+
+            now_et = _now_et()
+            if now_et.weekday() >= 5:
+                await asyncio.sleep(60)
+                continue
+            if rth_only:
+                if not (RTH_OPEN <= now_et.time() <= RTH_CLOSE):
+                    await asyncio.sleep(poll_sec)
+                    continue
+
+            age = latest_bar_age_min("SPY", "1m")
+            queue_len = len(_QUEUE_HEAP) if isinstance(_QUEUE_HEAP, list) else 0
+
+            parts: list[str] = []
+            parts.append("online")
+            parts.append(f"SPY_1m_age_min={age if age is not None else 'n/a'}")
+            parts.append(f"queue_depth={queue_len}")
+            if _last_focus_list_et_date is not None:
+                parts.append(f"last_focus={_last_focus_list_et_date.isoformat()}")
+            if _last_intraday_update_et_date is not None:
+                parts.append(f"last_intraday={_last_intraday_update_et_date.isoformat()}")
+            if _last_recap_et_date is not None:
+                parts.append(f"last_recap={_last_recap_et_date.isoformat()}")
+
+            msg = _format_ops_event(
+                tag="heartbeat",
+                label="health",
+                symbols=["SPY"],
+                status="ok",
+                contracts={"agent": AUTOPOST_CONTRACT_VERSION, "chart": "1.0"},
+                violations=[" ".join(parts)],
+                audit_path=None,
+            )
+            await _notify_ops_quiet(client=bot, message=msg)
+            _last_heartbeat_sent_ts = now_ts
+            await asyncio.sleep(poll_sec)
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_heartbeat_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(poll_sec)
+
+
+def _ensure_tnt_automation_tasks() -> None:
+    """Schedules at most 4 automation tasks (go-live safe set). Idempotent."""
+    global _automation_focus_task, _automation_intraday_task, _automation_recap_task, _automation_heartbeat_task
+
+    if not _automation_enabled():
+        print("[OK] automation: disabled (TNT_AUTOMATION_ENABLED/AUTOPOST_ENABLED=0)")
+        return
+
+    channel = _resolve_automation_channel()
+    if channel is None:
+        return
+
+    if _env_bool("TNT_FOCUS_LIST_ENABLED", "1"):
+        if not _automation_focus_task or _automation_focus_task.done():
+            _automation_focus_task = bot.loop.create_task(automation_focus_list_loop(channel))
+            print("[OK] automation focus_list task scheduled")
+
+    if _env_bool("TNT_INTRADAY_UPDATE_ENABLED", "1"):
+        if not _automation_intraday_task or _automation_intraday_task.done():
+            _automation_intraday_task = bot.loop.create_task(automation_intraday_update_loop(channel))
+            print("[OK] automation intraday_update task scheduled")
+
+    if _env_bool("TNT_RECAP_ENABLED", "1"):
+        if not _automation_recap_task or _automation_recap_task.done():
+            _automation_recap_task = bot.loop.create_task(automation_recap_loop(channel))
+            print("[OK] automation recap task scheduled")
+
+    if _env_bool("TNT_HEARTBEAT_ENABLED", "1"):
+        if not _automation_heartbeat_task or _automation_heartbeat_task.done():
+            _automation_heartbeat_task = bot.loop.create_task(automation_heartbeat_loop(channel))
+            print("[OK] automation heartbeat task scheduled")
+
+
 @bot.event
 async def on_ready() -> None:
     user = bot.user
     guilds = ", ".join(g.name for g in bot.guilds) if bot.guilds else "n/a"
     print(f"[OK] Logged in as {user} (guilds: {guilds})")
-    if VIX_ALERTS_ENABLED:
-        fn = globals().get("vix_alert_loop")
-        if callable(fn):
-            bot.loop.create_task(fn())
-            print("[OK] vix_alert_loop scheduled")
+
+    # Startup verification: ensure TNT is reading the on-disk system prompt.
+    # Logs path + first ~60 chars + sha256 so we can spot stale/embedded prompts.
+    try:
+        load_tnt_system_prompt(log=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[TNT][PROMPT][ERROR] Failed to load tnt_system_prompt.txt: {exc}")
+    global _slash_tree_synced
+    if not _slash_tree_synced:
+        # IMPORTANT: This delivery bot shares the same Discord application/token as the
+        # dedicated slash bot (cli.discord_bot). Calling tree.sync() here will overwrite
+        # the application's slash commands with ONLY the small subset defined in this file.
+        # Default: do NOT sync from the delivery bot.
+        if _env_bool("TNT_DELIVERY_SYNC_SLASH", "0"):
+            try:
+                await bot.tree.sync()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARN] Slash command sync failed: {exc}")
+            else:
+                _slash_tree_synced = True
+                print("[OK] Slash command tree synced")
         else:
-            print("[WARN] VIX alerts enabled but vix_alert_loop() is missing; skipping.")
-    if MONDAY_PLAYBOOK_ENABLED and MONDAY_PLAYBOOK_CHANNEL_ID:
-        bot.loop.create_task(monday_playbook_loop())
-        print(
-            f"[OK] Monday playbook enabled: {MONDAY_PLAYBOOK_TIME_ET} ET -> channel_id={MONDAY_PLAYBOOK_CHANNEL_ID}"
-        )
-    if MORNING_BRIEF_ENABLED and MORNING_BRIEF_CHANNEL_ID:
-        bot.loop.create_task(morning_brief_loop())
-        print(
-            f"[OK] Morning brief enabled. time={MORNING_BRIEF_TIME_ET} ET channel_id={MORNING_BRIEF_CHANNEL_ID}"
-        )
-    if MORNING_OPT_ENABLED:
-        bot.loop.create_task(morning_opt_loop())
-        target_channel = MORNING_OPT_CHANNEL_ID or CHANNEL_ID
-        print(f"[OK] Morning options toolkit enabled: {MORNING_OPT_TIME_ET} ET -> channel_id={target_channel}")
+            _slash_tree_synced = True
+            print("[OK] Slash command sync skipped (TNT_DELIVERY_SYNC_SLASH=0)")
 
     try:
-        fn = globals().get("_ensure_autopost_task")
-        if callable(fn):
-            fn()
-        else:
-            print("[WARN] _ensure_autopost_task missing; autopost disabled.")
+        _ensure_tnt_automation_tasks()
     except Exception as exc:  # noqa: BLE001
-        print(f"[WARN] _ensure_autopost_task error: {exc}")
+        print(f"[WARN] automation scheduler error: {exc}")
 
 
 @bot.event
@@ -5663,11 +12346,14 @@ async def on_message(message: discord.Message) -> None:
             last_px, last_ts = price_info if price_info else (None, None)
 
             signal_bundle = build_signal_payload(sym)
-            clean_payload = signal_bundle[0] if signal_bundle else None
+            if signal_bundle:
+                clean_payload, _prob_stub, gate_info = signal_bundle
+            else:
+                clean_payload, gate_info = None, None
 
             ai_text = maybe_ai_analysis(sym)
             if ai_text:
-                ok, reason = validate_analysis_message(ai_text)
+                ok, reason = validate_analysis_message(ai_text, label=f"analyze_{sym.lower()}")
                 if ok:
                     await message.channel.send(ai_text)
                 else:
@@ -5680,22 +12366,36 @@ async def on_message(message: discord.Message) -> None:
                         except Exception:  # noqa: BLE001
                             pass
                     if clean_payload:
-                        fallback = format_signal_clean(sym, clean_payload, verbose=True)
+                        fallback = format_signal_clean(
+                            sym,
+                            clean_payload,
+                            verbose=True,
+                            now_et=_now_et(),
+                            gate=gate_info,
+                            price_snapshot=_get_last_price_snapshot(sym),
+                        )
                         if reason:
                             fallback += f"\n\n_Fallback reason: {reason}."
                     else:
                         note = reason or ""
                         fallback = build_safe_fallback(sym, pivots, note=note)
-                    fb_ok, fb_reason = validate_analysis_message(fallback)
+                    fb_ok, fb_reason = validate_analysis_message(fallback, label=f"analyze_{sym.lower()}")
                     if not fb_ok:
                         print(f"[ANALYZE] fallback flagged {sym}: {fb_reason}")
                     await message.channel.send(fallback)
             else:
                 if clean_payload:
-                    fallback = format_signal_clean(sym, clean_payload, verbose=True)
+                    fallback = format_signal_clean(
+                        sym,
+                        clean_payload,
+                        verbose=True,
+                        now_et=_now_et(),
+                        gate=gate_info,
+                        price_snapshot=_get_last_price_snapshot(sym),
+                    )
                 else:
                     fallback = build_safe_fallback(sym, pivots, note="no AI response")
-                fb_ok, fb_reason = validate_analysis_message(fallback)
+                fb_ok, fb_reason = validate_analysis_message(fallback, label=f"analyze_{sym.lower()}")
                 if not fb_ok:
                     print(f"[ANALYZE] fallback flagged {sym}: {fb_reason}")
                     if QUALITY_GATE_DEBUG and fb_reason:
@@ -5725,7 +12425,7 @@ async def on_message(message: discord.Message) -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"[MSG][ERROR] {exc}")
 
-    if not AI_ENABLED or _openai is None:
+    if not AI_ENABLED:
         await bot.process_commands(message)
         return
     if message.guild is None:
@@ -5846,28 +12546,34 @@ async def on_message(message: discord.Message) -> None:
 
     market_context = market_context.strip()
     print(f"[AI] responding to prompt={user_text!r}")
+    requested_symbol = requested or "SPY"
+    tnt_state = build_canonical_tnt_state([requested_symbol], mode="REALTIME")
     prompt = (
-        "You are TNT Trading Bot.\n"
-        "Use the market context below. If timestamps look stale, say so.\n"
-        "Be concise. No personalized financial advice.\n\n"
-        f"User: {user_text}\n"
-        f"{market_context}"
-    )
+        f"User: {user_text}\n\n"
+        "Answer using ONLY TNT_STATE. If stale or no_trade, stand down.\n"
+    ).strip()
 
     async with message.channel.typing():
         try:
-            resp = await _call_openai(prompt)
-            reply_text = (getattr(resp, "output_text", "") or "").strip() or _extract_ai_text(resp)
-            if not reply_text:
-                reply_text = "(No response text returned.)"
+            result = await call_tnt_agent_async(
+                tnt_state=tnt_state,
+                user_text=prompt,
+                label="discord_ai",
+                model=_ai_model(),
+                max_output_tokens=420,
+                temperature=0.25,
+            )
+            reply_text = (result.text or "").strip() or "(No response text returned.)"
             trimmed = reply_text[:AI_MAX_CHARS]
             await safe_send(
                 message.channel,
                 trimmed,
-                kind="analysis",
+                # This is free-form assistant text, not a structured analysis card.
+                kind="text",
                 symbol=requested or "",
                 pivots=pivots_for_gate,
                 output_mode="strict",
+                label="discord_ai",
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[AI ERROR] {exc}")
@@ -5890,7 +12596,7 @@ async def timeframe_cmd(ctx: commands.Context) -> None:
 
 @bot.command()
 async def health(ctx: commands.Context) -> None:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now_utc().isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         rows = _rows(conn, "SELECT symbol, max(ts) FROM prices GROUP BY symbol")
     lines = [f"🩺 Health Check (UTC {now})"]
@@ -5899,196 +12605,268 @@ async def health(ctx: commands.Context) -> None:
     await ctx.send("\n".join(lines))
 
 
-@bot.command(name="analyze")
-async def analyze_cmd(ctx: commands.Context, sym: str = "SPY", detail: str = "") -> None:
-    sym = (sym or "SPY").upper().strip()
-    detail_norm = (detail or "").lower().strip()
-    if detail_norm in {"v", "verbose", "full"}:
-        verbose = True
-    elif detail_norm in {"b", "brief", "short"}:
-        verbose = False
-    else:
-        verbose = VERBOSE_DEFAULT
+AnalyzeSendFn = Callable[[str], Awaitable[None]]
 
-    mode_setting = get_analysis_mode()
 
-    max_age = float(os.getenv("DATA_STALE_MAX_MIN", "3") or "3")
-    fresh = data_is_fresh(sym, tf="1m", max_min=max_age)
-    live_px: Optional[float] = None
-    live_ts: Optional[str] = None
-    live_src: str = ""
-    analysis_mode = "db"
-    analysis_source = "model"
+async def _dispatch_analyze_request(
+    *,
+    channel: discord.abc.Messageable,
+    symbol_input: str,
+    detail: str,
+    send: AnalyzeSendFn,
+    source: str,
+) -> None:
+    raw_symbol = (symbol_input or "").strip()
+    raw_detail = (detail or "").strip()
 
-    if not fresh:
-        try:
-            if not symbol_supported_polygon(sym):
-                await ctx.send(
-                    f"⚠️ **{sym}** live snapshot unavailable from Polygon right now. Please try again in a moment."
-                )
-                return
-        except Exception:
-            await ctx.send(
-                f"⚠️ **{sym}** Polygon availability check failed; try again later or pick another ticker."
-            )
-            return
+    def _is_mode_token(token: str) -> bool:
+        lowered = token.lower()
+        return lowered in {"insights", "verbose", "full", "strict", "brief", "short"}
 
-        live_px, live_ts, live_src = fetch_live_price(sym)
-        if live_px is None or live_ts is None:
-            await ctx.send(
-                f"⚠️ **{sym}** live price unavailable right now (source={live_src or 'polygon-live'})."
-            )
-            return
-        analysis_mode = "on_demand"
-        analysis_source = "polygon"
+    def _is_symbol_candidate(token: str) -> bool:
+        if not token:
+            return False
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", token)
+        if not cleaned:
+            return False
+        if len(cleaned) > 6:
+            return False
+        return cleaned.isalpha() or (cleaned[:-1].isalpha() and cleaned[-1].isdigit())
 
-    bootstrap_result = None
+    symbol_tokens = [token for token in re.split(r"\s+", raw_symbol) if token]
+    detail_tokens_field = [token for token in re.split(r"\s+", raw_detail) if token]
+
+    inferred_symbol = symbol_tokens[0] if symbol_tokens else ""
+    combined_detail_tokens: list[str] = []
+    if len(symbol_tokens) > 1:
+        combined_detail_tokens.extend(symbol_tokens[1:])
+    combined_detail_tokens.extend(detail_tokens_field)
+
+    if not inferred_symbol and combined_detail_tokens:
+        inferred_symbol = combined_detail_tokens[0]
+        combined_detail_tokens = combined_detail_tokens[1:]
+
+    if (not _is_symbol_candidate(inferred_symbol)
+            and combined_detail_tokens
+            and _is_symbol_candidate(combined_detail_tokens[0])):
+        inferred_symbol = combined_detail_tokens[0]
+        combined_detail_tokens = combined_detail_tokens[1:]
+
+    symbol_input = inferred_symbol.strip() or "SPY"
+
+    detail_tokens = [token.lower() for token in combined_detail_tokens if token]
+    refresh_tokens = {"refresh", "fresh", "force", "reload", "update"}
+    force_refresh = any(token in refresh_tokens for token in detail_tokens)
+    if force_refresh:
+        detail_tokens = [token for token in detail_tokens if token not in refresh_tokens]
+
+    cache_mode = "no-cache" if force_refresh else "prefer-cache"
+    print(f"[cmd] analyze ({source}) invoked symbol={symbol_input!r} detail_tokens={detail_tokens!r} mode={cache_mode}")
+
     try:
-        bootstrap_result = await asyncio.wait_for(
-            ensure_symbol_ready(sym),
-            timeout=ANALYZE_BOOTSTRAP_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        print(f"[BOOTSTRAP] ensure timeout for {sym} after {ANALYZE_BOOTSTRAP_TIMEOUT_S}s; scheduling background run")
-        _schedule_bootstrap(sym, ctx.channel)
+        render, _ = await _fetch_on_demand_render(symbol_input, allow_cache=not force_refresh)
     except Exception as exc:  # noqa: BLE001
-        print(f"[BOOTSTRAP] ensure error for {sym}: {exc}")
-        _schedule_bootstrap(sym, ctx.channel)
+        print(f"[ANALYZE][ERROR] build render failed for {symbol_input!r}: {exc}")
+        await send(f"⚠️ Analyze build failed for **{symbol_input.upper()}**: {exc}")
+        return
+
+    symbol_meta, context_mode, context_output_mode, meta = _trade_context_meta_from_render(render, symbol_input)
+
+    mode_token = next((token for token in detail_tokens if token in {"insights", "verbose", "full", "strict", "brief", "short"}), None)
+
+    if mode_token in {"insights", "verbose", "full"}:
+        context_output_mode = "insights"
+    elif mode_token in {"strict", "brief", "short"}:
+        context_output_mode = "strict"
+
+    payload = render.agent_payload
+    if isinstance(payload, dict):
+        meta_dict = payload.get("meta")
+        if not isinstance(meta_dict, dict):
+            meta_dict = {}
+            payload["meta"] = meta_dict
+        meta_dict["trade_context_mode"] = context_mode
+        meta_dict["analysis_mode"] = context_mode
+        meta_dict["trade_context_output_mode"] = context_output_mode
+        meta_dict["analysis_output_mode"] = context_output_mode
+
+    if channel is None:
+        await send("⚠️ Analyze aborted: channel unavailable.")
+        return
+
+    label = f"analyze_{symbol_meta.lower()}" if symbol_meta and symbol_meta != "N/A" else "analyze"
+
+    stand_down = bool(meta.get("stand_down")) if isinstance(meta, dict) else False
+
+    publish_kwargs: dict[str, object] = {}
+    if stand_down and DEV_ALLOW_VIOLATIONS:
+        publish_kwargs["strict_contracts"] = False
+        publish_kwargs["allow_contract_violations"] = True
 
     try:
-        payload, err = build_analysis_payload(sym)
-        if not payload:
-            dp = get_latest_daily_pivots(sym)
-            pivots = dp.get("piv") if dp and isinstance(dp, dict) else None
-
-            if analysis_mode == "on_demand" and live_px is not None and live_ts is not None:
-                snapshot = (
-                    "\n".join(
-                        [
-                            f"📊 **{sym} — Live Snapshot (On-Demand)**",
-                            "",
-                            f"💲 **Last Price:** {fmt_money(live_px)}",
-                            f"🕒 **Timestamp:** {live_ts} UTC",
-                            f"📡 **Source:** {live_src or 'Polygon'}",
-                            "",
-                            "🧭 **Context**",
-                            "• No stored model signal yet",
-                            "• No historical pivots cached",
-                            "• Live market snapshot only",
-                            "",
-                            "⚠️ This ticker is not yet ingested into TNT models.",
-                            "Levels & regimes will improve once data accumulates.",
-                            "",
-                            "_Not financial advice._",
-                        ]
-                    ).strip()
-                )
-                await ctx.send(snapshot)
-                _schedule_bootstrap(sym, ctx.channel)
-                return
-
-            note = err or "no signal data available"
-            if err:
-                print(f"[GATE] analyze {sym}: {err}")
-            await ctx.send(build_safe_fallback(sym, pivots, note=note))
-            return
-
-        payload["analysis_mode"] = analysis_mode
-        payload["analysis_source"] = analysis_source
-        payload["analysis_output_mode"] = mode_setting
-        if bootstrap_result is not None:
-            payload["bootstrap_result"] = bootstrap_result
-
-        packet, pivots_for_gate = build_analysis_packet(
-            sym,
-            payload,
-            analysis_mode=analysis_mode,
-            live_price=live_px,
-            live_price_ts=live_ts,
+        await _publish_autopost_render(
+            channel,
+            render,
+            builder="on_demand_analyze",
+            label=label,
+            symbol=symbol_meta,
+            context_mode=context_mode,
+            context_output_mode=context_output_mode,
+            **publish_kwargs,
         )
-        if not packet:
-            await ctx.send(f"⚠️ No data available for {sym} yet.")
-            if analysis_mode == "on_demand":
-                _schedule_bootstrap(sym, ctx.channel)
-            return
-
-        packet["analysis_output_mode"] = mode_setting
-        payload["analysis_packet"] = packet
-
-        if mode_setting == "insights":
-            ai_text, ai_err = await ai_render_trade_context(_openai, packet)
-            if ai_err:
-                print(f"[AI] analyze {sym} fallback: {ai_err}")
-            if ai_text:
-                ok, reason = validate_output(ai_text, mode=mode_setting)
-                if ok:
-                    await safe_send(
-                        ctx.channel,
-                        ai_text,
-                        kind="analysis",
-                        symbol=sym,
-                        pivots=pivots_for_gate,
-                        analysis_mode=analysis_mode,
-                        output_mode=mode_setting,
-                    )
-                    if analysis_mode == "on_demand":
-                        _schedule_bootstrap(sym, ctx.channel)
-                    return
-                print(f"[INSIGHTS] blocked {sym}: {reason}")
-
-        r_levels = packet.get("r_levels") or {}
-        s_levels = packet.get("s_levels") or {}
-        pivots_dict = {
-            "P": packet.get("pivot"),
-            "R1": r_levels.get("R1"),
-            "R2": r_levels.get("R2"),
-            "S1": s_levels.get("S1"),
-            "S2": s_levels.get("S2"),
-            "R3": r_levels.get("R3"),
-            "S3": s_levels.get("S3"),
-        }
-
-        last_px = packet.get("current_price")
-        last_ts = packet.get("current_price_ts")
-        vix_dir = payload.get("vix_trend")
-        sqqq_dir = payload.get("sqqq_dir")
-        bias = payload.get("bias")
-        conviction = payload.get("conviction")
-
-        msg = format_trade_context(
-            symbol=sym,
-            last_price=last_px,
-            last_price_ts_utc=last_ts,
-            last_price_tf=PRICE_TF_LABEL,
-            piv=pivots_dict,
-            bias=bias or "NEUTRAL",
-            conviction=conviction or "LOW",
-            vix_dir=vix_dir,
-            sqqq_dir=sqqq_dir,
-            prefer_mode=mode_setting,
-        )
-
-        gate_ok, gate_reason = validate_analysis_message(msg)
-        if not gate_ok:
-            await ctx.send(f"⚠️ analysis blocked: {gate_reason}\nUse !daily or !status.")
-            if analysis_mode == "on_demand":
-                _schedule_bootstrap(sym, ctx.channel)
-            return
-
-        await safe_send(
-            ctx.channel,
-            msg,
-            kind="analysis",
-            symbol=sym,
-            pivots=pivots_for_gate,
-            analysis_mode=analysis_mode,
-            output_mode="strict",
-        )
-        if analysis_mode == "on_demand":
-            _schedule_bootstrap(sym, ctx.channel)
+    except ContractViolationError as exc:
+        await send(f"⚠️ Analyze contract violation: {exc}")
+        print(f"[ANALYZE][VIOLATION] {symbol_meta}: {exc}")
         return
     except Exception as exc:  # noqa: BLE001
-        await ctx.send(f"⚠️ Analyze error: {type(exc).__name__}: {exc}")
+        await send(f"⚠️ Analyze autopost failed: {exc}")
+        print(f"[ANALYZE][ERROR] autopost failed for {symbol_meta}: {exc}")
+        return
+
+    missing_sections = meta.get("missing_sections") if isinstance(meta, dict) else []
+    missing_list = [str(item) for item in missing_sections] if isinstance(missing_sections, (list, tuple)) else []
+
+    if stand_down and symbol_meta not in {"", "N/A"}:
+        if not missing_list or "Model Signal" in missing_list:
+            _schedule_bootstrap(symbol_meta, channel)
+
+    print(f"[cmd] analyze posted symbol={symbol_meta} stand_down={stand_down} source={source}")
+    await send(f"✅ Posted analyze for **{symbol_meta}**.")
+
+
+@bot.command(name="analyze")
+async def analyze_cmd(ctx: commands.Context, sym: str = "SPY", detail: str = "") -> None:
+    channel = ctx.channel
+    if channel is None:
+        await ctx.reply("⚠️ Channel unavailable for analyze.")
+        return
+
+    await _dispatch_analyze_request(
+        channel=channel,
+        symbol_input=sym,
+        detail=detail,
+        send=ctx.send,
+        source="prefix",
+    )
+
+
+@bot.tree.command(name="analyze", description="Publish TNT analyze output to this channel")
+@app_commands.describe(symbol="Ticker symbol (add tokens like 'strict' or 'refresh' after the ticker)")
+async def analyze_slash(interaction: discord.Interaction, symbol: str = "SPY") -> None:
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("⚠️ Channel unavailable for analyze.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    async def _send(msg: str) -> None:
+        await interaction.followup.send(msg)
+
+    await _dispatch_analyze_request(
+        channel=channel,
+        symbol_input=symbol,
+        detail="",
+        send=_send,
+        source="slash",
+    )
+
+
+@bot.tree.command(name="ask", description="Ask the TNT coach about a symbol")
+@app_commands.describe(question="Trading question to ask the coach", symbol="Optional ticker override, e.g. TSLA")
+async def ask_slash(interaction: discord.Interaction, question: str, symbol: str = "") -> None:
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("⚠️ Channel unavailable for ask.", ephemeral=True)
+        return
+
+    question_clean = (question or "").strip()
+    if not question_clean:
+        await interaction.response.send_message("⚠️ Provide a question for the coach.", ephemeral=True)
+        return
+
+    override_symbol = _normalize_symbol_token(symbol) if symbol else None
+    detected_symbol = _extract_symbol_from_text(question_clean)
+    chosen_symbol = override_symbol or detected_symbol
+    if not chosen_symbol:
+        await interaction.response.send_message("Add a symbol like TSLA / SPY / NVDA so I can analyze it.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    try:
+        coach_text, render, status, cache_hit, latency_ms = await run_analyze_then_coach(chosen_symbol, question_clean)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ASK][ERROR] {chosen_symbol.upper()}: {exc}")
+        await interaction.followup.send(
+            _build_coach_error_response(chosen_symbol, "Internal error"),
+            ephemeral=True,
+        )
+        return
+
+    trimmed = coach_text[:AI_MAX_CHARS]
+    message = await safe_send(
+        interaction.followup,
+        trimmed,
+        kind="text",
+        symbol=chosen_symbol,
+        pivots=None,
+        analysis_mode="coach",
+        output_mode="coach",
+        label="ask",
+    )
+
+    if status in {"error", "format_error"}:
+        render_text = render.text if isinstance(render, RenderedPost) else ""
+        if render_text:
+            fallback_intro = "Here’s the latest /analyze output while the coach is offline:"
+            fallback = f"{fallback_intro}\n\n{render_text}"
+        else:
+            fallback = "Here’s the latest /analyze output while the coach is offline: (no render available)"
+
+        fallback_trimmed = fallback[:_ai_max_chars()]
+        await safe_send(
+            interaction.followup,
+            fallback_trimmed,
+            kind="analysis",
+            symbol=chosen_symbol,
+            pivots=None,
+            analysis_mode="coach",
+            output_mode="coach-fallback",
+            # Ensure the analysis validator treats this as on-demand analyze output.
+            label=f"analyze_{chosen_symbol.lower()}",
+        )
+
+    message_id = getattr(message, "id", None) if message is not None else None
+    try:
+        ask_audit_path = _write_ask_audit(
+            question=question_clean,
+            symbol=chosen_symbol,
+            status=status,
+            cache_hit=cache_hit,
+            coach_text=trimmed,
+            render=render,
+            channel=channel,
+            latency_ms=latency_ms,
+            message_id=message_id,
+        )
+
+        if status in {"error", "format_error"}:
+            try:
+                msg = _format_ops_event(
+                    tag="llm_fail",
+                    label="ask",
+                    symbols=[chosen_symbol.upper()],
+                    status=status,
+                    contracts={"agent": AUTOPOST_CONTRACT_VERSION, "chart": "1.0"},
+                    violations=["ASK_FAILED" if status == "error" else "ASK_FORMAT_ERROR"],
+                    audit_path=ask_audit_path,
+                )
+                await _notify_ops_quiet(client=bot, message=msg)
+            except Exception:
+                pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ASK][AUDIT][WARN] {chosen_symbol.upper()}: {exc}")
 
 
 @bot.command(name="mode")
@@ -6154,7 +12932,48 @@ async def watchlist_cmd(ctx: commands.Context) -> None:
 @bot.command(name="playbook")
 async def playbook_cmd(ctx: commands.Context) -> None:
     symbols = MONDAY_PLAYBOOK_SYMBOLS or ["SPY", "QQQ", "IWM"]
+
+    built = build_signal_payload("SPY")
+    payload = built[0] if built else None
+    tnt = payload.get("tnt") if isinstance(payload, dict) else None
+    tnt_regime = str((tnt or {}).get("regime") or "UNKNOWN").upper()
+
+    if tnt_regime not in {"TREND", "RANGE"}:
+        await ctx.send(tnt_no_trade_checklist(payload if isinstance(payload, dict) else None))
+        return
+
     await ctx.send(format_monday_playbook(symbols))
+
+
+@bot.command(name="why")
+async def why_cmd(ctx: commands.Context, symbol: str = "SPY") -> None:
+    sym = (symbol or "").strip().upper() or "SPY"
+    built = build_signal_payload(sym)
+    if not built:
+        await ctx.send(f"⚠️ No signal payload available for {sym}.")
+        return
+    payload, _prob, gate = built
+    why_ctx = tnt_why_payload(payload, gate)
+
+    tnt = payload.get("tnt") if isinstance(payload, dict) else None
+    tnt_regime = str((tnt or {}).get("regime") or "UNKNOWN").upper()
+    tnt_posture = str((tnt or {}).get("posture") or "UNKNOWN").upper()
+
+    conf = why_ctx.get("confirmation") if isinstance(why_ctx.get("confirmation"), dict) else {}
+    vix_gate = why_ctx.get("vix_gate") if isinstance(why_ctx.get("vix_gate"), dict) else {}
+
+    lines: list[str] = []
+    lines.append(f"🔍 **WHY — {sym}**")
+    lines.append(f"• Regime: **{tnt_regime}** | Posture: **{tnt_posture}**")
+    lines.append(
+        f"• Confirmation: **{conf.get('state','?')}** (VIX {conf.get('vix_trend','?')}, SQQQ {conf.get('sqqq_dir','?')})"
+    )
+    lines.append(f"• Pivot distance: **{why_ctx.get('distance_to_pivot','n/a')}**")
+    lines.append(f"• Edge/Conv: **{why_ctx.get('edge','n/a')}** / **{why_ctx.get('conviction','n/a')}**")
+    lines.append(f"• VIX gate: **{vix_gate.get('mode','?')}** | {vix_gate.get('reason','n/a')}")
+    lines.append(f"• Freshness: **{why_ctx.get('freshness','n/a')}**")
+    lines.append("_Not financial advice._")
+    await ctx.send("\n".join(lines))
 
 
 @bot.command(name="daily")
@@ -6162,9 +12981,10 @@ async def daily_cmd(ctx: commands.Context) -> None:
     await ctx.send(format_daily_summary(DAILY_SUMMARY_SYMBOLS))
 
 
-@bot.command(name="status")
-async def status_cmd(ctx: commands.Context, symbol: str = "SPY") -> None:
-    sym = (symbol or "SPY").upper()
+def _build_status_message(symbol: str) -> str:
+    """Return the TNT status summary for the requested symbol."""
+
+    sym = (symbol or "SPY").strip().upper() or "SPY"
 
     mode_setting = get_analysis_mode()
 
@@ -6214,7 +13034,19 @@ async def status_cmd(ctx: commands.Context, symbol: str = "SPY") -> None:
     lines.append(f"• {next_check}")
     lines.append("_Not financial advice._")
 
-    await ctx.send("\n".join(lines))
+    return "\n".join(lines)
+
+
+@bot.command(name="status")
+async def status_cmd(ctx: commands.Context, symbol: str = "SPY") -> None:
+    await ctx.send(_build_status_message(symbol))
+
+
+@bot.tree.command(name="status", description="Show TNT status summary for a symbol")
+@app_commands.describe(symbol="Ticker symbol to inspect, e.g. SPY")
+async def status_slash(interaction: discord.Interaction, symbol: str = "SPY") -> None:
+    message = _build_status_message(symbol)
+    await interaction.response.send_message(message)
 
 
 @bot.command(name="brief")
@@ -6238,7 +13070,7 @@ def build_opt_payload(sym: str) -> tuple[Optional[dict], Optional[str]]:
     conviction = conviction_from_edge(edge)
     bias = bias_from_prob(prob_up)
 
-    now_et = datetime.now(ET)
+    now_et = _now_et()
     session = market_session_et(now_et)
     macro_events = load_macro_events_for_date(now_et.strftime("%Y-%m-%d"))
     macro_risk = macro_within_minutes(macro_events, 60, now_et)
@@ -6644,6 +13476,51 @@ async def bias_cmd(ctx: commands.Context, tf: str | None = None) -> None:
     lines.append("• Bias confirmation is NEUTRAL/UNKNOWN")
     lines.append("• Price is chopping around pivot / mixed signals persist")
     lines.append("")
+    lines.append("_Not financial advice._")
+    await ctx.send("\n".join(lines))
+
+
+@bot.command(name="regime")
+async def regime_cmd(ctx: commands.Context, symbol: str = "SPY") -> None:
+    sym = (symbol or "").strip().upper() or "SPY"
+    built = build_signal_payload(sym)
+    if not built:
+        await ctx.send(f"⚠️ No signal payload available for {sym}.")
+        return
+
+    payload, _prob, _gate = built
+    tnt = payload.get("tnt") if isinstance(payload, dict) else None
+    if not isinstance(tnt, dict):
+        await ctx.send(f"⚠️ TNT regime unavailable for {sym}.")
+        return
+
+    regime = str(tnt.get("regime") or "UNKNOWN").upper()
+    posture = str(tnt.get("posture") or "UNKNOWN").upper()
+    conf = tnt.get("confidence")
+    conf_txt = "n/a"
+    if isinstance(conf, (int, float)):
+        conf_txt = f"{float(conf):.2f}"
+
+    perms = tnt.get("permissions") if isinstance(tnt.get("permissions"), dict) else {}
+    def _perm(k: str) -> str:
+        return str(perms.get(k) or "n/a").upper()
+
+    reasons = tnt.get("reasons") if isinstance(tnt.get("reasons"), list) else []
+    why = ", ".join(str(x) for x in reasons[:6]) if reasons else "n/a"
+
+    flips = tnt_flip_triggers(payload)
+
+    lines: list[str] = []
+    lines.append(f"🧭 **TNT Regime** — **{sym}**")
+    lines.append(f"• Regime: **{regime}** | Posture: **{posture}** | Confidence: **{conf_txt}**")
+    lines.append("• Permissions:")
+    lines.append(f"  - Trend: {_perm('trend_continuation')} | Pullbacks: {_perm('pullbacks')} | Breakouts: {_perm('breakouts')}")
+    lines.append(f"  - Mean reversion: {_perm('mean_reversion')} | Countertrend: {_perm('countertrend')} | Size: {_perm('size')}")
+    lines.append("• Flip Triggers:")
+    lines.append(f"  - {flips.get('bull')}")
+    lines.append(f"  - {flips.get('bear')}")
+    lines.append(f"  - {flips.get('neutral')}")
+    lines.append(f"• Why: {why}")
     lines.append("_Not financial advice._")
     await ctx.send("\n".join(lines))
 

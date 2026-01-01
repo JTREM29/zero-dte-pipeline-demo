@@ -1,17 +1,7 @@
 {
-  "ts": "2025-12-16T22:45:12-05:00",
-  "session_date": "2025-12-16",
-  "context": {
-    "session_date": "2025-12-16",
-    "on_high": null,
-    "on_low": null,
-    "on_vwap": null,
-    "rth_high": 6870.0,
-    "rth_low": 6840.75,
-    "prior_rth_high": null,
-    "prior_rth_low": null,
-    "prior_close": null,
-    "computed_ts": "2025-12-16T22:45:12-05:00"
-  },
-  "ok": true
+  "ts": "2025-12-20T18:45:27-05:00",
+  "session_date": "2025-12-20",
+  "context": {},
+  "ok": false,
+  "reason": "No session context yet."
 }

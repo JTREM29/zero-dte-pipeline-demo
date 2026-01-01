@@ -7,6 +7,7 @@ from analysis.indicators import compute_indicators_for_symbol
 from data.fetchers import get_global_context, get_symbol_context
 from data.ibkr_client import IBKRClient
 from data.massive_client import MassiveClient
+from delivery.state_builder import build_tnt_state
 from zero_dte_pipeline.config import config
 from zero_dte_pipeline.openai_client import OpenAIClient, OpenAIError
 
@@ -179,11 +180,23 @@ def _build_user_prompt(brief: dict) -> str:
 
 async def analyze_brief_with_openai(brief: dict) -> dict:
     user_prompt = _build_user_prompt(brief)
+    primary_symbol = "SPY"
+    try:
+        symbols = brief.get("symbols") if isinstance(brief, dict) else None
+        if isinstance(symbols, list) and symbols:
+            first = symbols[0]
+            if isinstance(first, dict) and first.get("symbol"):
+                primary_symbol = str(first.get("symbol") or "SPY").upper()
+    except Exception:  # noqa: BLE001
+        primary_symbol = "SPY"
+
+    tnt_state = build_tnt_state([primary_symbol], mode="ON_DEMAND")
     client = OpenAIClient()
     try:
         text = client.complete(
             system=SYSTEM_PROMPT,
             prompt=user_prompt,
+            tnt_state=tnt_state,
             model="gpt-4.1-mini",
             temperature=0.2,
         )

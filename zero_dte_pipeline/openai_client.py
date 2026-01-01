@@ -3,11 +3,9 @@ from __future__ import annotations
 
 import logging
 import os
-import time
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Mapping, Optional
 
-import httpx
-from openai import OpenAI, NotFoundError
+from delivery.tnt_llm import call_tnt_agent
 
 from zero_dte_pipeline.config import config
 
@@ -21,7 +19,11 @@ class OpenAIError(RuntimeError):
 
 
 class OpenAIClient:
-    """Thin wrapper around the OpenAI Chat Completions API."""
+    """Compatibility wrapper that routes calls through `delivery.tnt_llm`.
+
+    This enforces the "One Door" invariant: all model calls must include TNT_STATE
+    and flow through a single module.
+    """
 
     def __init__(
         self,
@@ -29,30 +31,14 @@ class OpenAIClient:
         model: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
         api_key: Optional[str] = None,
-        client: Optional[OpenAI] = None,
     ) -> None:
         key = api_key or config.openai_api_key or os.getenv("OPENAI_API_KEY")
-        if not key and client is None:
+        if not key:
             raise OpenAIError("OpenAI API key not configured; set OPENAI_API_KEY")
 
         self._api_key = key
         self.model = model or config.openai_model_name or DEFAULT_MODEL
         self.timeout_seconds = timeout_seconds or config.openai_timeout_seconds
-        self._client: Optional[OpenAI] = None
-        if client is not None:
-            self._client = client
-        else:
-            try:
-                self._client = OpenAI(api_key=key)
-            except TypeError as exc:  # httpx>=0.28 removed proxies arg
-                if "proxies" in str(exc).lower():
-                    logger.warning(
-                        "OpenAI SDK initialization failed due to proxies arg incompatibility; "
-                        "falling back to raw HTTP client (install httpx<0.28 to restore SDK).",
-                    )
-                    self._client = None
-                else:
-                    raise
 
     # --- low-level chat helper ------------------------------------------------
 
@@ -61,123 +47,33 @@ class OpenAIClient:
         system_prompt: str,
         user_prompt: str,
         *,
+        tnt_state: Mapping[str, object],
         temperature: float = 0.1,
         max_tokens: int = 600,
         model: Optional[str] = None,
     ) -> str:
-        """Single-turn chat completion against the configured model."""
+        """Single-turn call via TNT "One Door" wrapper."""
 
         active_model = model or self.model
-        fallback_candidates = [active_model]
-        if model is None and active_model != DEFAULT_MODEL:
-            fallback_candidates.append(DEFAULT_MODEL)
-
-        last_error: Optional[Exception] = None
-        for candidate_model in fallback_candidates:
-            try:
-                logger.info(
-                    "OpenAIClient.chat start model=%s temp=%.2f max_tokens=%d",
-                    candidate_model,
-                    temperature,
-                    max_tokens,
-                )
-
-                resp = self._chat_completion(
-                    candidate_model,
-                    system_prompt,
-                    user_prompt,
-                    temperature,
-                    max_tokens,
-                )
-
-                message = resp["message"]
-                content = message["content"] if isinstance(message, dict) else message.content
-                if not content:
-                    raise OpenAIError("OpenAI API returned empty content")
-
-                if model is None:
-                    self.model = candidate_model
-
-                logger.debug("OpenAIClient.chat response len=%d", len(content))
-                return content.strip()
-
-            except NotFoundError as exc:  # pragma: no cover - network failures
-                logger.warning(
-                    "OpenAI model '%s' not found (%s); attempting fallback '%s'",
-                    candidate_model,
-                    exc,
-                    DEFAULT_MODEL,
-                )
-                last_error = exc
-                continue
-            except Exception as exc:  # pragma: no cover - network failures
-                logger.exception("OpenAIClient.chat failed: %s", exc)
-                raise OpenAIError(str(exc)) from exc
-
-        assert last_error is not None
-        raise OpenAIError(str(last_error)) from last_error
-
-    def _chat_completion(
-        self,
-        model: str,
-        system_prompt: str,
-        user_prompt: str,
-        temperature: float,
-        max_tokens: int,
-    ) -> dict:
-        """Execute a chat completion via SDK or HTTP fallback."""
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        if self._client is not None:
-            resp = self._client.chat.completions.create(
-                model=model,
-                timeout=self.timeout_seconds,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            choice = resp.choices[0].message
-            return {"message": choice}
-
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-
         try:
-            response = httpx.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=self.timeout_seconds,
+            logger.info(
+                "OpenAIClient.chat start model=%s temp=%.2f max_tokens=%d",
+                active_model,
+                temperature,
+                max_tokens,
             )
-        except httpx.TimeoutException as exc:
-            raise OpenAIError("OpenAI REST request timed out") from exc
-        except httpx.HTTPError as exc:
-            raise OpenAIError(f"OpenAI REST request failed: {exc}") from exc
-
-        if response.status_code == 404:
-            raise NotFoundError("model_not_found")
-        if response.status_code >= 400:
-            raise OpenAIError(
-                f"OpenAI REST error {response.status_code}: {response.text.strip()}"
+            result = call_tnt_agent(
+                tnt_state=tnt_state,
+                user_text=user_prompt,
+                label="openai_client.chat",
+                model=active_model,
+                max_output_tokens=max_tokens,
+                temperature=temperature,
+                system_addendum=system_prompt,
             )
-
-        data = response.json()
-        choices = data.get("choices") or []
-        if not choices:
-            raise OpenAIError("OpenAI REST API returned no choices")
-        return {"message": choices[0].get("message", {})}
+            return result.text.strip()
+        except Exception as exc:  # pragma: no cover
+            raise OpenAIError(str(exc)) from exc
 
     # --- compat helpers with the previous wrapper ----------------------------
 
@@ -186,6 +82,7 @@ class OpenAIClient:
         system_prompt: str,
         user_prompt: str,
         *,
+        tnt_state: Mapping[str, object],
         model: Optional[str] = None,
         max_retries: int = 3,
         temperature: float = 0.2,
@@ -200,14 +97,15 @@ class OpenAIClient:
                 return self.chat(
                     system_prompt,
                     user_prompt,
+                    tnt_state=tnt_state,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     model=model,
                 )
-            except OpenAIError as exc:  # pragma: no cover - network failures
+            except OpenAIError as exc:  # pragma: no cover
                 last_error = exc
                 if attempt < attempts - 1:
-                    time.sleep(1.5)
+                    continue
         assert last_error is not None
         raise last_error
 
@@ -216,6 +114,7 @@ class OpenAIClient:
         *,
         prompt: str,
         system: Optional[str] = None,
+        tnt_state: Mapping[str, object],
         model: Optional[str] = None,
         max_retries: int = 3,
         temperature: float = 0.2,
@@ -227,6 +126,7 @@ class OpenAIClient:
         return self.generate(
             system_prompt=system_prompt,
             user_prompt=prompt,
+            tnt_state=tnt_state,
             model=model,
             max_retries=max_retries,
             temperature=temperature,
@@ -240,6 +140,7 @@ class OpenAIClient:
         headlines: Iterable[str],
         *,
         symbol: str,
+        tnt_state: Mapping[str, object],
         max_headlines: int = 12,
     ) -> str:
         """Summarize recent headlines for a symbol into a neutral bullet list."""
@@ -266,11 +167,17 @@ class OpenAIClient:
         )
 
         try:
-            return self.chat(system_prompt, user_prompt, temperature=0.2, max_tokens=220)
+            return self.chat(
+                system_prompt,
+                user_prompt,
+                tnt_state=tnt_state,
+                temperature=0.2,
+                max_tokens=220,
+            )
         except OpenAIError:
             return ""
 
-    def summarize_morning_brief(self, raw_report_text: str) -> str:
+    def summarize_morning_brief(self, raw_report_text: str, *, tnt_state: Mapping[str, object]) -> str:
         """Compress a long raw morning report into a short TL;DR."""
 
         if not raw_report_text.strip():
@@ -289,7 +196,13 @@ class OpenAIClient:
         )
 
         try:
-            return self.chat(system_prompt, user_prompt, temperature=0.1, max_tokens=200)
+            return self.chat(
+                system_prompt,
+                user_prompt,
+                tnt_state=tnt_state,
+                temperature=0.1,
+                max_tokens=200,
+            )
         except OpenAIError:
             return ""
 

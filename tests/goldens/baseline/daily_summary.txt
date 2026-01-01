@@ -1,17 +1,17 @@
 📌 **Daily Summary (signals + pivots)**
 ET date/time: 2025-12-17 15:23
 
-📊 Futures Context — **@ES#**
-• ON range: H 4835.25 / L 4818.75 / VWAP 4826.50
+📊 Futures Context — @ES#
+• ON range: H 4835.25 / L 4818.75 / Anchor 4826.50
 • Posture: ON holding inside prior RTH range.
 
 **SPY**
-• Prev RTH pivots: P 4832.25 | R1 4846.25 | S1 4818.25 | R2 4860.25 | S2 4804.25
+• Prev RTH pivots: P 679.00 | R1 681.00 | S1 677.00 | R2 683.00 | S2 675.00
 • Signal: prob_up 0.62 | edge 0.12 | conv HIGH | model fixture-model
 • Rolling acc: 75.0% (18/24)
 
 **QQQ**
-• Prev RTH pivots: P 415.10 | R1 417.25 | S1 412.95 | R2 419.40 | S2 410.80
+• Prev RTH pivots: P 615.10 | R1 617.25 | S1 612.95 | R2 619.40 | S2 610.80
 • Signal: prob_up 0.62 | edge 0.12 | conv HIGH | model fixture-model
 • Rolling acc: 75.0% (18/24)
 

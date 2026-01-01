@@ -2,9 +2,10 @@
 ET stamp: 2025-12-17 15:23 | Session: RTH
 Status: **ACTIVE** | Bias: **BULLISH** | Edge: 0.13
 
+🧾 Data Mode: OPEN (live snapshot)
 💵 **Last Price**
-• SPY: 678.47 (stale; last 1m close @ 16:51 ET)
-• QQQ: 611.04 (stale; last 1m close @ 16:51 ET)
+• SPY: 678.98 (live snapshot | 2025-12-17 15:22 ET | OPEN)
+• QQQ: 614.89 (live snapshot | 2025-12-17 15:22 ET | OPEN)
 🧭 **Directional Confirmation (VIX + SQQQ)**
 • TF: 1m | VIX trend: **down** | SQQQ dir: **down**
 • 🟢 Bias confirm: **BULLISH** — Fixture bias: VIX easing with SQQQ lower
@@ -21,16 +22,16 @@ Status: **ACTIVE** | Bias: **BULLISH** | Edge: 0.13
 🔎 Regime Read:
 • Transitioning at key levels — wait for cash tape confirmation.
 
-📊 Futures Context — **@ES#**
-• ON range: H 4835.25 / L 4818.75 / VWAP 4826.50
+📊 Futures Context — @ES#
+• ON range: H 4835.25 / L 4818.75 / Anchor 4826.50
 • RTH: H 4848.00 / L 4804.25
 • Prior RTH: H 4862.25 / L 4795.50 / Close 4832.75
 • Posture: Overnight holding inside prior RTH range.
-• Updated: 2025-12-17 | 2025-12-17 15:23:09 ET
+• Updated: 2025-12-17 | 2025-12-17 15:23 ET
 
 📐 Key Levels (RTH):
-• **SPY**: P 4832.25 | R1 4846.25 | S1 4818.25
-• **QQQ**: P 415.10 | R1 417.25 | S1 412.95
+• **SPY**: P 679.00 | R1 681.00 | S1 677.00
+• **QQQ**: P 615.10 | R1 617.25 | S1 612.95
 
 🧠 How Pros Would Trade It:
 • Trend setup: break + hold above Pivot/S1/R1 before adding risk.
@@ -41,7 +42,7 @@ Status: **ACTIVE** | Bias: **BULLISH** | Edge: 0.13
 
 🚫 Do Nothing If:
 • Confirmation flips NEUTRAL/UNKNOWN around Pivot.
-• Futures context stays stale or a high-impact macro release is <15m away.
+• Stand-down triggers remain unresolved (e.g., stand-down triggers remain).
 
 ET stamp: 2025-12-17 15:23 ET
 _Not financial advice._
