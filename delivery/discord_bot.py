@@ -1894,6 +1894,18 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
+# Optional: deterministic "Concierge" templates (no LLM).
+try:
+    from tnt_concierge.engine import schedule_concierge_nudge
+    from tnt_concierge import throttle as concierge_throttle
+    from tnt_concierge import lock as decision_lock
+    from tnt_concierge.templates import LockState as ConciergeLockState
+except Exception:  # noqa: BLE001
+    schedule_concierge_nudge = None  # type: ignore[assignment]
+    concierge_throttle = None  # type: ignore[assignment]
+    decision_lock = None  # type: ignore[assignment]
+    ConciergeLockState = None  # type: ignore[assignment]
+
 from delivery.state_builder import build_tnt_state as build_canonical_tnt_state
 from delivery.tnt_llm import call_tnt_agent_async
 
@@ -1940,6 +1952,8 @@ def _positive_env_float(name: str, default: str) -> float:
     except Exception:
         value = float(default)
     return value if value > 0 else float(default)
+
+# Chart Concierge integration is implemented in tnt_concierge.engine/throttle.
 
 
 QUALITY_GATE_ENABLED = os.getenv("QUALITY_GATE_ENABLED", "1") == "1"
@@ -12296,6 +12310,14 @@ async def on_ready() -> None:
     guilds = ", ".join(g.name for g in bot.guilds) if bot.guilds else "n/a"
     print(f"[OK] Logged in as {user} (guilds: {guilds})")
 
+    # Retired commands: these are handled via mention routing (cli.discord_bot).
+    # Prevent accidental re-registration if someone enables TNT_DELIVERY_SYNC_SLASH.
+    for name in ("ask", "analyze"):
+        try:
+            bot.tree.remove_command(name)
+        except Exception:
+            pass
+
     # Startup verification: ensure TNT is reading the on-disk system prompt.
     # Logs path + first ~60 chars + sha256 so we can spot stale/embedded prompts.
     try:
@@ -12328,8 +12350,13 @@ async def on_ready() -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.author.bot:
+    # Never respond to our own messages.
+    if bot.user and message.author.id == bot.user.id:
         return
+    # Default: ignore other bots. Optional: allow Concierge to react to alert-bot posts.
+    if message.author.bot:
+        if concierge_throttle is None or not concierge_throttle.allow_other_bot_messages_for_auto():
+            return
     try:
         content = message.content or ""
         if content.strip().lower().startswith("!analyze"):
@@ -12426,8 +12453,8 @@ async def on_message(message: discord.Message) -> None:
         print(f"[MSG][ERROR] {exc}")
 
     if not AI_ENABLED:
-        await bot.process_commands(message)
-        return
+        # Concierge is separate from LLM AI; it may still be enabled.
+        pass
     if message.guild is None:
         await bot.process_commands(message)
         return
@@ -12438,6 +12465,25 @@ async def on_message(message: discord.Message) -> None:
     mentioned_user = bool(bot.user and bot.user in message.mentions)
     mentioned_role = bool(AI_ROLE_ID) and any(r.id == AI_ROLE_ID for r in message.role_mentions)
     triggered = mentioned_user or mentioned_role
+
+    # --- Concierge (deterministic, throttled; non-blocking + additive) ---
+    if schedule_concierge_nudge is not None:
+        schedule_concierge_nudge(
+            message,
+            triggered=bool(triggered),
+            now_et_fn=_now_et,
+            get_last_price_snapshot=_get_last_price_snapshot,
+            get_latest_signal_context=get_latest_signal_context,
+            get_vix_context=get_vix_context,
+            vix_gating_action=vix_gating_action,
+            vix_gating_enabled=VIX_GATING_ENABLED,
+            safe_send=safe_send,
+        )
+
+    # --- LLM AI mention/channel mode ---
+    if not AI_ENABLED:
+        await bot.process_commands(message)
+        return
     if AI_MODE == "mention" and not triggered:
         await bot.process_commands(message)
         return
@@ -12455,6 +12501,43 @@ async def on_message(message: discord.Message) -> None:
         await message.reply("Ask me a question 🙂", mention_author=False)
         await bot.process_commands(message)
         return
+
+    # --- Decision Lock (from Concierge) ---
+    # If a HARD lock is active, constrain the LLM to risk-management only.
+    decision_lock_enabled = os.getenv("TNT_DECISION_LOCK_ENABLED", "1") == "1"
+    if decision_lock_enabled and triggered and decision_lock is not None and ConciergeLockState is not None:
+        try:
+            lock = decision_lock.get_lock(
+                guild_id=getattr(getattr(message, "guild", None), "id", None),
+                channel_id=getattr(getattr(message, "channel", None), "id", None),
+            )
+        except Exception:
+            lock = None
+        if lock is not None and getattr(lock, "state", None) == ConciergeLockState.HARD:
+            reason = str(getattr(lock, "reason", "") or "")
+            try:
+                ttl = int(float(os.getenv("TNT_DECISION_LOCK_TTL_SEC", "900") or "900"))
+            except Exception:
+                ttl = 900
+            try:
+                ch_name = getattr(message.channel, "name", None)
+                ch_name_s = ch_name if isinstance(ch_name, str) else "(unknown)"
+            except Exception:
+                ch_name_s = "(unknown)"
+            print(
+                "decision_lock_enforced level=HARD channel={channel} reason={reason} ttl={ttl}".format(
+                    channel=ch_name_s,
+                    reason=(reason or "").replace("\n", " ")[:200],
+                    ttl=ttl,
+                )
+            )
+            lock_banner = (
+                "DECISION LOCK: HARD\n"
+                + (f"Reason: {reason}\n" if reason else "")
+                + "Constraint: Do NOT provide trade entries/exits, sizing, or signals to initiate risk. "
+                + "Respond with risk-management, what to watch for to unlock, and how to stand down.\n"
+            )
+            user_text = lock_banner + "\nUser message: " + user_text
 
     symbols = [
         "SPY",
@@ -13618,14 +13701,95 @@ async def gating_cmd(ctx: commands.Context) -> None:
 
 
 def main() -> None:
-    token = os.getenv("DISCORD_BOT_TOKEN")
+    entrypoint = "delivery.discord_bot"
+    mode = (os.getenv("TNT_RUN_MODE", "dev") or "dev").strip().lower() or "dev"
+
+    def _normalize_env_value(value: str) -> str:
+        value = value.strip()
+        if len(value) >= 2:
+            if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+        return value.strip()
+
+    def _dotenv_get_value(path: Path, key: str) -> str | None:
+        if not path.exists() or not path.is_file():
+            return None
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() != key:
+                continue
+            return _normalize_env_value(v)
+        return None
+
+    def _resolve_discord_token() -> str | None:
+        for env_key in ("DISCORD_BOT_TOKEN", "DISCORD_TOKEN"):
+            raw = os.getenv(env_key)
+            if raw and raw.strip():
+                return _normalize_env_value(raw)
+        for env_path in (Path.cwd() / ".env.local", Path.cwd() / ".env"):
+            val = _dotenv_get_value(env_path, "DISCORD_BOT_TOKEN")
+            if val:
+                return val
+        return None
+
+    def _ensure_dir_writable(path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".tnt_write_probe"
+        probe.write_text("ok\n", encoding="utf-8")
+        try:
+            probe.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _env_onoff(name: str, default: str = "0") -> str:
+        return "on" if (os.getenv(name, default) == "1") else "off"
+
+    try:
+        print(f"[TNT][START] mode={mode} entrypoint={entrypoint} pid={os.getpid()}")
+        ttl = (os.getenv("TNT_DECISION_LOCK_TTL_SEC", "900") or "900").strip()
+        print(
+            "[TNT][ENV] concierge={concierge} auto_concierge={auto} bot_to_bot={bot_to_bot} decision_lock={dl} decision_lock_ttl={ttl} memory={mem}".format(
+                concierge=_env_onoff("TNT_CONCIERGE_ENABLED", "0"),
+                auto=_env_onoff("TNT_CONCIERGE_AUTO", "0"),
+                bot_to_bot=_env_onoff("TNT_CONCIERGE_ALLOW_BOT_MESSAGES", "0"),
+                dl=_env_onoff("TNT_DECISION_LOCK_ENABLED", "1"),
+                ttl=ttl,
+                mem=_env_onoff("TNT_CONCIERGE_MEMORY", "0"),
+            )
+        )
+    except Exception:
+        pass
+
+    # Filesystem preflight.
+    try:
+        for d in (Path("logs"), Path("config"), Path("cache")):
+            _ensure_dir_writable(d)
+    except Exception as exc:
+        print(f"[FATAL] Filesystem preflight failed: {exc}")
+        sys.exit(2)
+
+    token = _resolve_discord_token()
     if not token:
-        print("[FATAL] DISCORD_BOT_TOKEN not set")
+        print("[FATAL] DISCORD_BOT_TOKEN not set (env or .env.local/.env).")
+        print("        Set DISCORD_BOT_TOKEN in your shell, or add it to .env.local in the repo root.")
         sys.exit(1)
     try:
         bot.run(token)
     except KeyboardInterrupt:
         print("[STOP] Keyboard interrupt, shutting down bot")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[FATAL] Discord bot failed to start: {type(exc).__name__}: {exc}")
+        print("        Common causes: invalid token, missing privileged intents in Discord Dev Portal, or gateway connectivity issues.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

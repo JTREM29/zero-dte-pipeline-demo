@@ -15,7 +15,7 @@ from collections import OrderedDict, deque
 from pathlib import Path
 import threading
 import inspect
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import discord
 from discord import app_commands
@@ -26,10 +26,79 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+_TNT_ENTRYPOINT = "cli.discord_bot"
+
+
+def _tnt_mode() -> str:
+    raw = (os.getenv("TNT_RUN_MODE", "dev") or "dev").strip().lower()
+    return raw if raw else "dev"
+
+
+def _env_onoff(name: str, default: str = "0") -> str:
+    return "on" if (os.getenv(name, default) == "1") else "off"
+
+
+def _print_start_banner() -> None:
+    try:
+        print(f"[TNT][START] mode={_tnt_mode()} entrypoint={_TNT_ENTRYPOINT} pid={os.getpid()}")
+    except Exception:
+        pass
+
+
+def _print_env_snapshot() -> None:
+    # IMPORTANT: do not log secrets.
+    try:
+        sync_scope = (os.getenv("TNT_COMMAND_SYNC_SCOPE", "") or "").strip() or "(default)"
+        allow_multi = (os.getenv("TNT_ALLOW_MULTIPLE_BOTS", "") or "").strip() or "0"
+        ttl = (os.getenv("TNT_DECISION_LOCK_TTL_SEC", "900") or "900").strip()
+        print(
+            "[TNT][ENV] concierge={concierge} auto_concierge={auto} bot_to_bot={bot_to_bot} "
+            "decision_lock={dl} decision_lock_ttl={ttl} memory={mem} sync_scope={scope} allow_multi={am}".format(
+                concierge=_env_onoff("TNT_CONCIERGE_ENABLED", "0"),
+                auto=_env_onoff("TNT_CONCIERGE_AUTO", "0"),
+                bot_to_bot=_env_onoff("TNT_CONCIERGE_ALLOW_BOT_MESSAGES", "0"),
+                dl=_env_onoff("TNT_DECISION_LOCK_ENABLED", "1"),
+                ttl=ttl,
+                mem=_env_onoff("TNT_CONCIERGE_MEMORY", "0"),
+                scope=sync_scope,
+                am=allow_multi,
+            )
+        )
+    except Exception:
+        pass
+
+
+def _ensure_dir_writable(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise RuntimeError(f"failed to create dir {path}: {exc}")
+
+    probe = path / ".tnt_write_probe"
+    try:
+        probe.write_text("ok\n", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except Exception as exc:
+        raise RuntimeError(f"dir not writable {path}: {exc}")
+
+
+def _preflight_filesystem() -> None:
+    # Fresh machines fail here first; make it explicit.
+    for d in (Path("logs"), Path("config"), Path("cache")):
+        _ensure_dir_writable(d)
+
 import delivery.discord_bot as delivery
 from delivery.on_demand_data import build_on_demand_analyze_render
 from scripts.morning_brief_agent import build_morning_brief
 from delivery.tnt_chart_contract import FOOTER_DISCLAIMER
+
+# Optional: deterministic "Concierge" nudge (non-LLM).
+try:
+    from tnt_concierge.engine import schedule_concierge_nudge
+    from tnt_concierge import throttle as concierge_throttle
+except Exception:  # noqa: BLE001
+    schedule_concierge_nudge = None  # type: ignore[assignment]
+    concierge_throttle = None  # type: ignore[assignment]
 
 from cli.gprr import GPRRManager, ProfileLevel, RenderProfile
 
@@ -37,6 +106,7 @@ OWNER_ID = int(os.getenv("DISCORD_OWNER_ID", "0"))
 CANARY_ID = int(os.getenv("DISCORD_CANARY_CHANNEL_ID", "0"))
 
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -2256,7 +2326,13 @@ async def _write_heartbeat_once() -> None:
 
         payload = {
             "ts_utc": datetime.now(timezone.utc).isoformat(),
+            # Back/ops-friendly aliases
+            "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "pid": int(os.getpid()),
+            "mode": _tnt_mode(),
+            "entrypoint": _TNT_ENTRYPOINT,
             "uptime_sec": float(max(0.0, _now_s() - float(_START_TS))),
+            "uptime_s": float(max(0.0, _now_s() - float(_START_TS))),
             "render": {"cap": int(_MAX_CHART_RENDERS), "active": active, "waiting": waiting},
             "singleflight": {"inflight": inflight},
             "png_cache": {
@@ -12232,6 +12308,52 @@ async def on_ready() -> None:
     scope = _sync_scope()
     prune_other = _prune_other_enabled()
 
+    # Retired commands: ensure they are not registered locally and get removed remotely.
+    # These used to exist as slash commands but are now handled via mention routing.
+    retired = {"ask", "analyze"}
+    for name in retired:
+        try:
+            bot.tree.remove_command(name)
+        except Exception:
+            pass
+
+    async def _delete_remote_commands_by_name(*, names: set[str], guild: discord.Object | None) -> int:
+        deleted = 0
+        try:
+            fetch = getattr(bot.tree, "fetch_commands", None)
+            delete = getattr(bot.tree, "delete_command", None)
+            if fetch is None or delete is None:
+                return 0
+            remote_cmds = await fetch(guild=guild)
+        except Exception:
+            return 0
+
+        for c in list(remote_cmds or []):
+            try:
+                cname = str(getattr(c, "name", "") or "").lower().strip()
+                if cname not in names:
+                    continue
+                cid = getattr(c, "id", None)
+                if cid is not None:
+                    await delete(cid, guild=guild)
+                else:
+                    await delete(c, guild=guild)
+                deleted += 1
+            except Exception:
+                continue
+        return int(deleted)
+
+    # Delete any lingering remote registrations regardless of chosen sync scope.
+    try:
+        n_global = await _delete_remote_commands_by_name(names=retired, guild=None)
+        n_guild = 0
+        if guild_id_raw.isdigit():
+            n_guild = await _delete_remote_commands_by_name(names=retired, guild=discord.Object(id=int(guild_id_raw)))
+        if n_global or n_guild:
+            print(f"[TNT][SYNC] Deleted retired remote commands: global={n_global} guild={n_guild}")
+    except Exception:
+        pass
+
     if guild_id_raw.isdigit():
         try:
             gid = int(guild_id_raw)
@@ -12311,6 +12433,38 @@ async def on_ready() -> None:
             print(f"[TNT] Heartbeat enabled: {_heartbeat_path()}")
     except Exception:
         pass
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    # Never respond to our own messages.
+    if bot.user and message.author.id == bot.user.id:
+        return
+
+    # Default: ignore other bots. Optional: allow Concierge to react to alert-bot posts.
+    if message.author.bot:
+        if concierge_throttle is None or not concierge_throttle.allow_other_bot_messages_for_auto():
+            return
+
+    # Concierge is additive; it must not block normal command handling.
+    try:
+        if schedule_concierge_nudge is not None:
+            mentioned_user = bool(bot.user and bot.user in (message.mentions or []))
+            schedule_concierge_nudge(
+                message,
+                triggered=bool(mentioned_user),
+                now_et_fn=delivery._now_et,
+                get_last_price_snapshot=delivery._get_last_price_snapshot,
+                get_latest_signal_context=delivery.get_latest_signal_context,
+                get_vix_context=delivery.get_vix_context,
+                vix_gating_action=delivery.vix_gating_action,
+                vix_gating_enabled=getattr(delivery, "VIX_GATING_ENABLED", False),
+                safe_send=delivery.safe_send,
+            )
+    except Exception:
+        pass
+
+    await bot.process_commands(message)
 
     # GPRR (GPU Pressure Relief & Render Autopilot) V1a heuristic baseline.
     try:
@@ -12408,9 +12562,25 @@ if __name__ == "__main__":
         print("        Stop the other process or set TNT_ALLOW_MULTIPLE_BOTS=1 to override.")
         raise SystemExit(2)
 
+    _print_start_banner()
+    _print_env_snapshot()
+    try:
+        _preflight_filesystem()
+    except Exception as exc:
+        print(f"[FATAL] Filesystem preflight failed: {exc}")
+        raise SystemExit(2)
+
     token = _resolve_discord_token()
     if not token:
         print("[FATAL] DISCORD_BOT_TOKEN not set (env or .env.local/.env).")
         print("        Set DISCORD_BOT_TOKEN in your shell, or use run_discord_v1_beta.ps1 to manage .env.local.")
         raise SystemExit(1)
-    bot.run(token)
+    try:
+        bot.run(token)
+    except KeyboardInterrupt:
+        print("[STOP] Keyboard interrupt, shutting down bot")
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # Make the common failure modes actionable (invalid token, intents, gateway).
+        print(f"[FATAL] Discord bot failed to start: {type(exc).__name__}: {exc}")
+        raise SystemExit(1)
