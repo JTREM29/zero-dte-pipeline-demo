@@ -1,0 +1,191 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AlertIntent v1",
+  "type": "object",
+  "required": ["version", "source", "targets", "condition", "lifecycle", "actions"],
+  "properties": {
+    "version": { "type": "string", "enum": ["1.0"] },
+
+    "source": {
+      "type": "object",
+      "required": ["user_id", "channel_id", "request_text", "created_at_utc"],
+      "properties": {
+        "user_id": { "type": "string" },
+        "channel_id": { "type": "string" },
+        "request_text": { "type": "string" },
+        "created_at_utc": { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "targets": {
+      "type": "object",
+      "required": ["type", "max_symbols"],
+      "properties": {
+        "type": { "enum": ["symbols", "watchlist"] },
+        "symbols": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "watchlist": { "type": ["string", "null"] },
+        "max_symbols": { "type": "integer", "minimum": 1, "maximum": 50 }
+      }
+    },
+
+    "condition": {
+      "type": "object",
+      "required": ["type", "timeframe", "confirm"],
+      "oneOf": [
+        {
+          "properties": {
+            "type": { "const": "cross" },
+            "op": { "enum": ["crosses_above", "crosses_below"] },
+            "left": { "$ref": "#/definitions/series" },
+            "right": { "$ref": "#/definitions/series" }
+          },
+          "required": ["op", "left", "right"]
+        },
+        {
+          "properties": {
+            "type": { "const": "break" },
+            "op": { "enum": ["breaks_above", "breaks_below"] },
+            "level": { "$ref": "#/definitions/level" }
+          },
+          "required": ["op", "level"]
+        },
+        {
+          "properties": {
+            "type": { "const": "touch" },
+            "left": { "$ref": "#/definitions/series" },
+            "right": { "$ref": "#/definitions/level" }
+          },
+          "required": ["left", "right"]
+        },
+        {
+          "properties": {
+            "type": { "const": "new_extreme" },
+            "kind": { "enum": ["new_high", "new_low"] },
+            "lookback_bars": { "type": "integer", "minimum": 2 }
+          },
+          "required": ["kind", "lookback_bars"]
+        },
+        {
+          "properties": {
+            "type": { "const": "rvol" },
+            "threshold": { "type": "number", "minimum": 0 },
+            "lookback_bars": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["threshold", "lookback_bars"]
+        }
+      ],
+      "properties": {
+        "timeframe": {
+          "enum": ["1m", "2m", "3m", "5m", "10m", "15m", "30m", "60m", "1D"]
+        },
+        "confirm": { "enum": ["close", "intrabar"] }
+      }
+    },
+
+    "gates": {
+      "type": "object",
+      "properties": {
+        "regime": {
+          "type": "object",
+          "properties": {
+            "allowed": {
+              "type": "array",
+              "items": { "enum": ["BULLISH", "NEUTRAL", "BEARISH", "TRANSITION"] }
+            },
+            "min_confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "market_hours": {
+          "type": "object",
+          "properties": {
+            "session": { "enum": ["RTH", "ETH", "CUSTOM"] },
+            "time_window_et": {
+              "type": ["array", "null"],
+              "items": { "type": "string" }
+            }
+          }
+        },
+        "cooldown": { "type": "object", "properties": { "seconds": { "type": "integer" } } },
+        "max_triggers": { "type": "object", "properties": { "count": { "type": "integer" } } },
+        "data_freshness": {
+          "type": "object",
+          "properties": { "price_age_seconds": { "type": "integer" } }
+        }
+      }
+    },
+
+    "lifecycle": {
+      "type": "object",
+      "properties": {
+        "start": { "const": "now" },
+        "expires": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "type": { "const": "relative" },
+                "minutes": { "type": "integer" },
+                "hours": { "type": "integer" },
+                "days": { "type": "integer" }
+              }
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": { "const": "date" },
+                "date": { "type": "string", "format": "date" }
+              }
+            }
+          ]
+        }
+      }
+    },
+
+    "actions": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "properties": {
+              "type": { "const": "discord_notify" },
+              "style": { "enum": ["compact", "verbose"] }
+            }
+          },
+          {
+            "properties": {
+              "type": { "const": "include_chart" },
+              "chart": { "enum": ["execution", "context"] }
+            }
+          }
+        ]
+      }
+    },
+
+    "tags": { "type": "object" }
+  },
+
+  "definitions": {
+    "series": {
+      "type": "object",
+      "properties": {
+        "type": { "enum": ["price", "indicator"] },
+        "field": { "type": ["string", "null"] },
+        "name": { "enum": ["vwap", "sma", "ema"] },
+        "params": { "type": "object" }
+      }
+    },
+    "level": {
+      "type": "object",
+      "properties": {
+        "type": { "enum": ["number", "pivot", "ref"] },
+        "value": { "type": "number" },
+        "pivot": { "enum": ["P", "R1", "R2", "S1", "S2"] },
+        "ref": { "enum": ["y_high", "y_low", "or_high", "or_low"] },
+        "params": { "type": "object" }
+      }
+    }
+  }
+}
