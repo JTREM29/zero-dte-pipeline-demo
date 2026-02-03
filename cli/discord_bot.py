@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import io
 import json
 import math
@@ -40,7 +41,8 @@ def _env_onoff(name: str, default: str = "0") -> str:
 
 def _print_start_banner() -> None:
     try:
-        print(f"[TNT][START] mode={_tnt_mode()} entrypoint={_TNT_ENTRYPOINT} pid={os.getpid()}")
+        node_role = (os.getenv("TNT_NODE_ROLE") or "").strip() or "(unset)"
+        print(f"[TNT][START] mode={_tnt_mode()} entrypoint={_TNT_ENTRYPOINT} pid={os.getpid()} node_role={node_role}")
     except Exception:
         pass
 
@@ -64,8 +66,74 @@ def _print_env_snapshot() -> None:
                 am=allow_multi,
             )
         )
+
+        oi_mode = (os.getenv("TNT_OI_WORKER_MODE") or "").strip() or "(default)"
+        if not oi_mode:
+            oi_mode = "(default)"
+        worker_url = (os.getenv("TNT_WORKER_URL") or "").strip() or "(missing)"
+        sanitize_always = (os.getenv("TNT_WORKER_SANITIZE_ALWAYS") or "").strip() or "0"
+        node_role = (os.getenv("TNT_NODE_ROLE") or "").strip() or "(unset)"
+        print(
+            f"[TNT][OI][ENV] worker_mode={oi_mode} worker_url={worker_url} sanitize_always={sanitize_always}"
+        )
+        print(f"[TNT][NODE] role={node_role}")
+        try:
+            parity_mode = _oi_worker_parity_mode()
+        except Exception:
+            parity_mode = "(unknown)"
+        print(f"[TNT][WORKER] url={worker_url} parity_mode={parity_mode}")
     except Exception:
         pass
+
+
+def _normalize_worker_base(url: str) -> str:
+    """Normalize TNT worker base URL for stable keys and requests.
+
+    Normalizes common equivalents:
+    - strips trailing slashes
+    - lowercases scheme + hostname
+    - removes default ports (:80 for http, :443 for https)
+    """
+
+    raw = (str(url or "") or "").strip()
+    if not raw:
+        return ""
+    raw = raw.rstrip("/")
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(raw)
+        if not parts.scheme or not parts.netloc:
+            return raw
+
+        scheme = parts.scheme.lower()
+
+        host = (parts.hostname or "").strip().lower()
+        port = parts.port
+        userinfo = ""
+        try:
+            if parts.username:
+                userinfo = parts.username
+                if parts.password:
+                    userinfo = f"{userinfo}:{parts.password}"
+                userinfo = f"{userinfo}@"
+        except Exception:
+            userinfo = ""
+
+        keep_port = port
+        if scheme == "http" and port == 80:
+            keep_port = None
+        if scheme == "https" and port == 443:
+            keep_port = None
+
+        netloc = f"{userinfo}{host}"
+        if keep_port:
+            netloc = f"{netloc}:{int(keep_port)}"
+
+        normalized = urlunsplit((scheme, netloc, parts.path.rstrip("/"), parts.query, parts.fragment))
+        return normalized.rstrip("/")
+    except Exception:
+        return raw
 
 
 def _ensure_dir_writable(path: Path) -> None:
@@ -92,6 +160,14 @@ from delivery.on_demand_data import build_on_demand_analyze_render
 from scripts.morning_brief_agent import build_morning_brief
 from delivery.tnt_chart_contract import FOOTER_DISCLAIMER
 
+# Channel-aware behavior router (paper trades ack, redirects, etc.)
+try:
+    from delivery.channel_router import decide_route as _decide_route
+    from delivery.channel_router import router_enabled as _router_enabled
+except Exception:  # noqa: BLE001
+    _decide_route = None  # type: ignore[assignment]
+    _router_enabled = None  # type: ignore[assignment]
+
 # Optional: deterministic "Concierge" nudge (non-LLM).
 try:
     from tnt_concierge.engine import schedule_concierge_nudge
@@ -102,12 +178,373 @@ except Exception:  # noqa: BLE001
 
 from cli.gprr import GPRRManager, ProfileLevel, RenderProfile
 
+
+_MACRO_EVENTS_FILE = (os.getenv("TNT_MACRO_EVENTS_FILE") or os.getenv("MACRO_EVENTS_FILE") or "data/macro_events.csv").strip() or "data/macro_events.csv"
+
+
+def _parse_iso_utc(ts: str) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        raw = str(ts).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _macro_calendar_requested_type(text: str) -> str | None:
+    t = (text or "").lower()
+    if not t:
+        return None
+    if "fomc" in t or "rate decision" in t or "fed decision" in t or "powell" in t:
+        return "FOMC"
+    if "cpi" in t or "consumer price" in t:
+        return "CPI"
+    if "ppi" in t or "producer price" in t:
+        return "PPI"
+    if "pce" in t or "personal consumption" in t:
+        return "PCE"
+    if "nonfarm" in t or "non-farm" in t or "payroll" in t or "nfp" in t:
+        return "NFP"
+    if "jobless" in t or "initial claims" in t or "unemployment claims" in t:
+        return "JOBLESS"
+    if "gdp" in t:
+        return "GDP"
+    if "retail sales" in t:
+        return "RETAIL_SALES"
+    if "pmi" in t or ("ism" in t and ("manufact" in t or "services" in t)):
+        return "PMI"
+    return None
+
+
+def _macro_calendar_load_upcoming_from_csv(*, start_utc: datetime, end_utc: datetime, limit: int = 25) -> list[dict[str, object]]:
+    path = Path(_MACRO_EVENTS_FILE)
+    if not path.exists():
+        return []
+
+    out: list[dict[str, object]] = []
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if not isinstance(row, dict):
+                    continue
+                ts_utc = _parse_iso_utc(str(row.get("ts_utc") or ""))
+                if ts_utc is None:
+                    continue
+                if ts_utc < start_utc or ts_utc > end_utc:
+                    continue
+
+                out.append(
+                    {
+                        "ts_utc": ts_utc,
+                        "type": (str(row.get("type") or "") or "").strip().upper(),
+                        "title": (str(row.get("title") or "") or "").strip(),
+                        "impact": (str(row.get("impact") or "MED") or "MED").strip().upper(),
+                        "source": (str(row.get("source") or "") or "csv").strip(),
+                    }
+                )
+    except Exception:
+        return []
+
+    out.sort(key=lambda x: x.get("ts_utc") or datetime.max.replace(tzinfo=timezone.utc))
+    return out[: max(1, int(limit))]
+
+
+def _macro_calendar_load_upcoming_from_redis(*, start_utc: datetime, end_utc: datetime, limit: int = 25) -> list[dict[str, object]]:
+    try:
+        from services.redis_env import redis_client
+        from services.calendar.calendar_service import CalendarService
+
+        r = redis_client(timeout_s=2.0, decode_responses=True)
+        events = CalendarService(r).macro_events_between(start_utc=start_utc, end_utc=end_utc)
+    except Exception:
+        return []
+
+    out: list[dict[str, object]] = []
+    for ev in events or []:
+        if not isinstance(ev, dict):
+            continue
+        ts_utc = _parse_iso_utc(str(ev.get("ts_utc") or ""))
+        if ts_utc is None:
+            continue
+        typ = (str(ev.get("type") or "") or "").strip().upper()
+        if not typ:
+            continue
+        out.append({"ts_utc": ts_utc, "type": typ, "title": "", "impact": "", "source": "redis"})
+
+    out.sort(key=lambda x: x.get("ts_utc") or datetime.max.replace(tzinfo=timezone.utc))
+    return out[: max(1, int(limit))]
+
+
+def _macro_calendar_load_upcoming(*, start_utc: datetime, end_utc: datetime, limit: int = 25) -> list[dict[str, object]]:
+    # Prefer CSV for display (title/impact). Redis is a fallback for gating-only installs.
+    items = _macro_calendar_load_upcoming_from_csv(start_utc=start_utc, end_utc=end_utc, limit=limit)
+    if items:
+        return items
+    return _macro_calendar_load_upcoming_from_redis(start_utc=start_utc, end_utc=end_utc, limit=limit)
+
+
+def _macro_calendar_render_reply(*, query: str, now_utc: datetime | None = None) -> str | None:
+    t = (query or "").strip().lower()
+    if not t:
+        return None
+
+    wants_macro = any(k in t for k in ("macro", "econ", "economic", "cpi", "fomc", "nfp", "pce", "ppi", "jobless", "payroll", "gdp", "pmi", "fed"))
+    if not wants_macro:
+        return None
+
+    now = now_utc or datetime.now(timezone.utc)
+    end = now + timedelta(days=7)
+    items = _macro_calendar_load_upcoming(start_utc=now, end_utc=end, limit=20)
+
+    req_type = _macro_calendar_requested_type(query)
+    if req_type:
+        items_t = [x for x in items if str(x.get("type") or "").upper() == req_type]
+        if not items_t:
+            return f"No upcoming {req_type} events found in the next 7d. (Macro calendar file: {_MACRO_EVENTS_FILE})"
+
+        ev = items_t[0]
+        ts = ev.get("ts_utc")
+        if isinstance(ts, datetime):
+            ts_et = ts.astimezone(getattr(delivery, "ET", timezone.utc))
+            minutes = int(round((ts - now).total_seconds() / 60.0))
+            title = str(ev.get("title") or req_type).strip() or req_type
+            impact = str(ev.get("impact") or "").strip().upper()
+            impact_txt = f" | {impact}" if impact else ""
+            return f"Next {req_type}: {ts_et.strftime('%a %Y-%m-%d %H:%M ET')} ({minutes} min){impact_txt} — {title}".strip()
+        return f"Next {req_type}: scheduled (time unknown)"
+
+    if not items:
+        return f"No upcoming macro events found in the next 7d. (Macro calendar file: {_MACRO_EVENTS_FILE})"
+
+    lines: list[str] = []
+    lines.append("📅 Macro calendar (next 7d, ET)")
+    for ev in items[:8]:
+        ts = ev.get("ts_utc")
+        if not isinstance(ts, datetime):
+            continue
+        ts_et = ts.astimezone(getattr(delivery, "ET", timezone.utc))
+        typ = str(ev.get("type") or "").strip().upper() or "(event)"
+        title = str(ev.get("title") or "").strip()
+        impact = str(ev.get("impact") or "").strip().upper()
+        rhs = typ
+        if title and title.upper() != typ:
+            rhs = f"{typ} — {title}"
+        if impact:
+            rhs = f"{rhs} ({impact})"
+        lines.append(f"• {ts_et.strftime('%a %m/%d %H:%M')} — {rhs}")
+
+    return "\n".join(lines).strip()
+
 OWNER_ID = int(os.getenv("DISCORD_OWNER_ID", "0"))
 CANARY_ID = int(os.getenv("DISCORD_CANARY_CHANNEL_ID", "0"))
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# IMPORTANT: `delivery.discord_bot` defines a lot of the legacy automation loops and helpers,
+# but we want a *single* Discord gateway session. Re-bind the delivery module's `bot`
+# reference to this instance so delivery's automation scheduler can run safely here.
+try:
+    delivery.bot = bot  # type: ignore[attr-defined]
+except Exception:
+    pass
+
+
+def _route_channel_id(ch: object) -> int:
+    """Return routing channel id (thread routes by parent channel id)."""
+
+    try:
+        if isinstance(ch, discord.Thread):
+            return int(getattr(ch, "parent_id", 0) or 0)
+    except Exception:
+        pass
+    try:
+        return int(getattr(ch, "id", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or str(default))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or str(default))
+    except Exception:
+        return float(default)
+
+
+def _env_str(name: str, default: str = "") -> str:
+    try:
+        v = os.getenv(name, default)
+        return (v or default).strip()
+    except Exception:
+        return str(default)
+
+
+def _format_alert_trigger_line(job: dict[str, Any]) -> str:
+    sym = str(job.get("symbol") or "?").strip().upper() or "?"
+    tf = str(job.get("tf") or "").strip() or "?"
+    ts = str(job.get("ts_utc") or "").strip() or ""
+    aid = str(job.get("alert_id") or "").strip() or ""
+    url = str(job.get("worker_artifact_url") or "").strip() or ""
+
+    parts: list[str] = []
+    parts.append(f"{sym} {tf}")
+    if ts:
+        parts.append(ts)
+    if aid:
+        parts.append(f"alert_id={aid}")
+    if url:
+        parts.append(url)
+    return " — ".join(parts)
+
+
+async def _alerts_delivery_loop() -> None:
+    """Consumes TNT alerts delivery queue and posts to Discord.
+
+    Producer(s): massive_service.redis_worker (alert_trigger jobs) or scripts/run_alerts_mvp_live.py
+    Queue: TNT_ALERTS_DISCORD_QUEUE (default: tnt:alerts:discord_queue)
+    Channel: TNT_ALERTS_CHANNEL_ID
+    """
+
+    await bot.wait_until_ready()
+
+    if not _truthy_env("TNT_ALERTS_DISCORD_DELIVERY_ENABLED", "0"):
+        print("[TNT][ALERTS][DELIVERY] disabled (TNT_ALERTS_DISCORD_DELIVERY_ENABLED=0)")
+        return
+
+    channel_id = _env_int("TNT_ALERTS_CHANNEL_ID", 0)
+    if channel_id <= 0:
+        print("[TNT][ALERTS][DELIVERY][WARN] missing TNT_ALERTS_CHANNEL_ID; delivery loop disabled")
+        return
+
+    queue_key = (_env_str("TNT_ALERTS_DISCORD_QUEUE", "tnt:alerts:discord_queue") or "tnt:alerts:discord_queue").strip()
+    poll_timeout = max(1, _env_int("TNT_REDIS_BLPOP_TIMEOUT", 5))
+    bundle_window_sec = max(0.0, _env_float("TNT_ALERTS_BUNDLE_WINDOW_SEC", 0.0))
+    dry_run = _truthy_env("DRY_RUN", "0")
+
+    # Create Redis client (sync) and call it via executor to avoid blocking the loop.
+    # NOTE: BLPOP is a blocking command; the Redis socket timeout must exceed the BLPOP timeout.
+    try:
+        from services.redis_env import redis_client
+
+        socket_timeout = max(5.0, float(poll_timeout) + 2.0)
+        r = redis_client(timeout_s=socket_timeout, decode_responses=True)
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, r.ping)
+        except Exception as exc:
+            print(f"[TNT][ALERTS][DELIVERY][WARN] Redis ping failed: {type(exc).__name__}: {exc}")
+    except Exception as exc:
+        print(f"[TNT][ALERTS][DELIVERY][WARN] Redis unavailable: {type(exc).__name__}: {exc}")
+        return
+
+    async def _resolve_channel() -> discord.abc.Messageable | None:
+        try:
+            ch = bot.get_channel(channel_id)
+            if ch is not None:
+                return ch
+        except Exception:
+            pass
+        try:
+            return await bot.fetch_channel(channel_id)
+        except Exception as exc:
+            print(f"[TNT][ALERTS][DELIVERY][WARN] fetch_channel failed id={channel_id}: {type(exc).__name__}: {exc}")
+            return None
+
+    channel = await _resolve_channel()
+    if channel is None:
+        print(f"[TNT][ALERTS][DELIVERY][WARN] channel not found id={channel_id}; delivery loop disabled")
+        return
+
+    print(
+        "[TNT][ALERTS][DELIVERY] enabled=1 "
+        f"channel_id={channel_id} queue={queue_key} poll_timeout={poll_timeout} "
+        f"bundle_window_sec={bundle_window_sec} dry_run={int(bool(dry_run))}"
+    )
+
+    while not bot.is_closed():
+        try:
+            item = await asyncio.get_running_loop().run_in_executor(None, lambda: r.blpop([queue_key], timeout=poll_timeout))
+        except Exception as exc:
+            print(f"[TNT][ALERTS][DELIVERY][WARN] BLPOP failed: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(1.0)
+            continue
+
+        if not item:
+            continue
+
+        _q, raw = item
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+
+        jobs: list[dict[str, Any]] = []
+        try:
+            j0 = json.loads(raw)
+            if isinstance(j0, dict):
+                jobs.append(j0)
+        except Exception:
+            continue
+
+        print(f"[TNT][ALERTS][DELIVERY][POP] queue={queue_key} n=1")
+
+        # Optional bundling: gather more items for a short window.
+        if bundle_window_sec > 0:
+            t_end = time.time() + float(bundle_window_sec)
+            while time.time() < t_end and len(jobs) < 12:
+                try:
+                    raw2 = await asyncio.get_running_loop().run_in_executor(None, lambda: r.lpop(queue_key))
+                except Exception:
+                    raw2 = None
+                if not raw2:
+                    await asyncio.sleep(0.05)
+                    continue
+                try:
+                    j2 = json.loads(raw2)
+                    if isinstance(j2, dict):
+                        jobs.append(j2)
+                except Exception:
+                    continue
+            if len(jobs) > 1:
+                print(f"[TNT][ALERTS][DELIVERY][BUNDLE] queue={queue_key} n={len(jobs)}")
+
+        lines: list[str] = []
+        for jb in jobs:
+            if str(jb.get("type") or jb.get("job_type") or "") not in {"alert_trigger", "ALERT_TRIGGER"}:
+                continue
+            lines.append(_format_alert_trigger_line(jb))
+            if len(lines) >= 12:
+                break
+
+        if not lines:
+            continue
+
+        if len(lines) == 1:
+            content = "🚨 ALERT TRIGGERED — " + lines[0]
+        else:
+            content = "🚨 ALERTS TRIGGERED (bundle)\n" + "\n".join([f"- {ln}" for ln in lines])
+
+        if dry_run:
+            print(f"[TNT][ALERTS][DELIVERY][POSTED] DRY_RUN=1 bytes={len(content)}")
+            continue
+
+        try:
+            await channel.send(content)
+            print(f"[TNT][ALERTS][DELIVERY][POSTED] n={len(lines)}")
+        except Exception as exc:
+            print(f"[TNT][ALERTS][DELIVERY][WARN] send failed: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(0.5)
+
 
 
 # --- Burst-scale throttles/caches (in-process) ---
@@ -489,8 +926,9 @@ def _render_oi_iv_png_warm(
     put_color = "#ff3344"
     line_color = "#ffa657"
 
-    ax.bar(xs, oi_calls, color=call_color, alpha=0.45, label="Calls OI")
-    ax.bar(xs, oi_puts, bottom=oi_calls, color=put_color, alpha=0.38, label="Puts OI")
+    width = 0.38
+    ax.bar([x - width / 2.0 for x in xs], oi_calls, width=width, color=call_color, alpha=0.55, label="Calls OI")
+    ax.bar([x + width / 2.0 for x in xs], oi_puts, width=width, color=put_color, alpha=0.48, label="Puts OI")
     ax.set_ylabel("Open interest", color="#c9d1d9")
     ax.grid(True, alpha=0.12, linestyle="--")
     ax.yaxis.tick_right()
@@ -503,11 +941,47 @@ def _render_oi_iv_png_warm(
         ax2.tick_params(colors="#c9d1d9")
         for spine in ax2.spines.values():
             spine.set_color("#2d333b")
-        ax2.plot(xs, list(iv_pct) if iv_pct else [math.nan] * n, color=line_color, linewidth=1.6, alpha=0.95, label="IV")
+        ax2.plot(
+            xs,
+            list(iv_pct) if iv_pct else [math.nan] * n,
+            color=line_color,
+            linewidth=1.25,
+            alpha=0.60,
+            linestyle="--",
+            label="IV",
+        )
         ax2.set_ylabel("IV (%)", color="#c9d1d9")
 
     ax.set_title(title, color="#c9d1d9")
     ax.set_xlabel("Strike", color="#c9d1d9")
+
+    # One-line takeaway (top-right). Keep it decisive.
+    try:
+        put_i = int(max(range(n), key=lambda i: float(oi_puts[i]) if oi_puts else 0.0))
+        call_i = int(max(range(n), key=lambda i: float(oi_calls[i]) if oi_calls else 0.0))
+        put_max = float(oi_puts[put_i])
+        call_max = float(oi_calls[call_i])
+        takeaway = ""
+        if put_max >= max(1.0, call_max) * 1.15:
+            takeaway = f"Put wall @ {x_labels[put_i]}"
+        elif call_max >= max(1.0, put_max) * 1.15:
+            takeaway = f"Call wall @ {x_labels[call_i]}"
+        else:
+            takeaway = "Balanced OI"
+        ax.text(
+            0.985,
+            0.92,
+            takeaway,
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=9,
+            color="#c9d1d9",
+            alpha=0.92,
+            bbox={"facecolor": "#0b0f14", "edgecolor": "#2d333b", "alpha": 0.75, "pad": 3.0},
+        )
+    except Exception:
+        pass
 
     max_ticks = 18
     step = max(1, int(math.ceil(float(n) / float(max_ticks))))
@@ -536,7 +1010,7 @@ def _render_oi_iv_png_warm(
     except Exception:
         dpi_used = 150
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=int(dpi_used))
+    fig.savefig(buf, format="png", dpi=int(dpi_used), metadata=_tnt_png_metadata())
     plt.close(fig)
     return buf.getvalue()
 
@@ -712,7 +1186,35 @@ async def run_cache_warm_cycle() -> None:
                         top_n = 25
                         strike_window_pct = 0.07
                         max_contracts = 250
-                        base = f"oi_png:v2:{sym}:strike:{exp}:{int(top_n)}:{int(strike_window_pct*100)}:{int(max_contracts)}"
+                        # Prefer absolute strike fan-out for OI (default ±$10).
+                        window_abs = None
+                        try:
+                            window_abs = float(os.getenv("TNT_OI_WINDOW_ABS", "10"))
+                        except Exception:
+                            window_abs = 10.0
+                        if not (
+                            isinstance(window_abs, (int, float))
+                            and window_abs
+                            and window_abs > 0
+                            and window_abs < 1_000_000
+                        ):
+                            window_abs = None
+                        if window_abs is not None:
+                            w_abs = float(window_abs)
+                            window_key = f"abs{int(round(w_abs * 100.0))}"
+                        else:
+                            window_key = f"pct{int(round(float(strike_window_pct) * 100.0))}"
+
+                        include_iv = bool(getattr(prof, "include_iv_overlay", True)) if prof is not None else True
+                        iv_key = "iv1" if include_iv else "iv0"
+                        # IMPORTANT: include a stamp-visibility bit so debug-stamped renders
+                        # never poison the default (no-visible-stamp) cache.
+                        truthy = {"1", "true", "yes", "y", "on"}
+                        allow_stamp = (os.getenv("TNT_RENDER_STAMP_ALLOW", "0") or "0").strip().lower()
+                        v_stamp = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
+                        stamp_key = "sv1" if (allow_stamp in truthy and v_stamp in truthy) else "sv0"
+
+                        base = f"oi_png:v5:{sym}:strike:{exp}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
                         key = _gprr_cache_key(base)
                         existing = await _png_cache_get(key, family="oi")
                         if existing is not None and existing[0]:
@@ -887,6 +1389,520 @@ def _file_from_png_bytes(png_bytes: bytes, *, filename: str) -> discord.File:
     return discord.File(fp=io.BytesIO(png_bytes), filename=str(filename or "chart.png"))
 
 
+def _tnt_png_metadata() -> dict[str, str]:
+    """Invisible PNG metadata for attribution/auditing (no visible stamp)."""
+
+    meta: dict[str, str] = {}
+    try:
+        truthy = {"1", "true", "yes", "y", "on"}
+        allow = (os.getenv("TNT_RENDER_STAMP_ALLOW", "0") or "0").strip().lower()
+        v = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
+        if allow in truthy and v in truthy:
+            meta["tnt_debug"] = "1"
+    except Exception:
+        pass
+    try:
+        tag = (os.getenv("TNT_RENDER_TAG") or "").strip() or (os.getenv("COMPUTERNAME") or "").strip()
+        if tag:
+            meta["tnt_render_tag"] = str(tag)
+    except Exception:
+        pass
+    try:
+        build = (os.getenv("TNT_BUILD") or "").strip()
+        if build:
+            meta["tnt_build"] = str(build)
+    except Exception:
+        pass
+    return meta
+
+
+def _oi_worker_mode() -> str:
+    """Worker policy for /oi.
+
+    - preferred (default): use worker when healthy; fall back to local but log loudly.
+    - required: if worker fails, do not render; return an error to the user.
+    """
+
+    raw = (os.getenv("TNT_OI_WORKER_MODE") or "").strip().lower()
+    if raw in {"required", "require", "strict", "worker_required"}:
+        return "required"
+    if raw in {"preferred", "prefer", "default", ""}:
+        return "preferred"
+
+    # Back-compat toggles
+    truthy = {"1", "true", "yes", "y", "on"}
+    if (os.getenv("TNT_OI_WORKER_REQUIRED", "0") or "0").strip().lower() in truthy:
+        return "required"
+    return "preferred"
+
+
+def _oi_log_worker_fallback(*, symbol: str, reason: str, key: str | None = None, worker: str | None = None) -> None:
+    try:
+        w = (worker or (os.getenv("TNT_WORKER_URL", "") or "")).strip()
+        k = (key or "").strip()
+        k_part = f" key={k}" if k else ""
+        print(f"[TNT][OI][WARN] WORKER_FALLBACK reason={reason} symbol={symbol} worker={w}{k_part}")
+    except Exception:
+        pass
+
+
+def _sanitize_worker_png_bytes(png_bytes: bytes, *, force: bool = False) -> tuple[bytes, bool, str]:
+    """Best-effort: strip any visible worker tag from a returned PNG.
+
+    Returns: (png_bytes_out, did_sanitize, reason)
+    """
+
+    try:
+        truthy = {"1", "true", "yes", "y", "on"}
+        allow = (os.getenv("TNT_RENDER_STAMP_ALLOW", "0") or "0").strip().lower() in truthy
+        visible = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower() in truthy
+        if allow and visible:
+            return png_bytes, False, "env_debug_visible_allow"
+    except Exception:
+        pass
+
+    sanitize_always = False
+    try:
+        truthy = {"1", "true", "yes", "y", "on"}
+        sanitize_always = (os.getenv("TNT_WORKER_SANITIZE_ALWAYS", "0") or "0").strip().lower() in truthy
+    except Exception:
+        sanitize_always = False
+
+    # When asked to sanitize worker OI charts, treat redaction as non-negotiable.
+    force = bool(force)
+
+    try:
+        from PIL import Image
+        from PIL.PngImagePlugin import PngInfo
+
+        img = Image.open(io.BytesIO(png_bytes))
+        img.load()
+        w, h = img.size
+        if w <= 0 or h <= 0:
+            return png_bytes, False, "bad_dimensions"
+
+        # Only sanitize when worker explicitly indicates visible stamping (preferred)
+        # or when forced by env for safety testing.
+        stamp_debug = False
+        stamp_pos = ""
+        try:
+            info = getattr(img, "text", None)
+            if isinstance(info, dict):
+                stamp_debug = (str(info.get("tnt_debug") or "").strip() == "1")
+                stamp_pos = str(info.get("tnt_render_pos") or info.get("tnt_stamp_pos") or "").strip().lower()
+        except Exception:
+            stamp_debug = False
+            stamp_pos = ""
+
+        # If metadata doesn't explicitly indicate debug stamping, still attempt a
+        # conservative heuristic in the bottom corners. We only wipe when a
+        # text-like bright signature is detected, so unstamped images remain
+        # unchanged.
+
+        # Only wipe when we detect a text-like bright signature in that corner.
+        out_img = img.convert("RGBA")
+
+        def _bright_ratio(im: Image.Image) -> float:
+            try:
+                im2 = im.convert("RGBA")
+                px = im2.getdata()
+                total = 0
+                bright = 0
+                for r, g, b, a in px:
+                    total += 1
+                    if a < 10:
+                        continue
+                    # Detect light text (not necessarily pure white).
+                    if max(r, g, b) >= 215:
+                        bright += 1
+                return float(bright) / float(max(1, total))
+            except Exception:
+                return 0.0
+
+        def _corner_has_stamp(x0: int, x1: int, y0: int, y1: int) -> bool:
+            try:
+                box = img.crop((x0, y0, x1, y1))
+                box_h = max(1, y1 - y0)
+                src_y1 = max(0, y0 - 2)
+                src_y0 = max(0, src_y1 - box_h)
+                if src_y1 <= src_y0:
+                    return False
+                above = img.crop((x0, src_y0, x1, src_y1))
+                rb = _bright_ratio(box)
+                ra = _bright_ratio(above)
+                # Require a meaningful bright-signal increase vs above-region.
+                return (rb >= 0.002) and ((rb - ra) >= 0.0015)
+            except Exception:
+                return False
+
+        def _wipe_box(x0: int, x1: int, y0: int, y1: int) -> bool:
+            box_w = x1 - x0
+            box_h = y1 - y0
+            if box_w < 20 or box_h < 10:
+                return False
+            src_y1 = max(0, y0 - 2)
+            src_y0 = max(0, src_y1 - box_h)
+            if src_y1 <= src_y0:
+                return False
+            src = img.crop((x0, src_y0, x1, src_y1))
+            out_img.paste(src, (x0, y0))
+            return True
+
+        # Target common stamp placements:
+        # 1) bottom margin (legacy)
+        # 2) lower plot area (some charts stamp above x-axis labels)
+        bands: list[tuple[int, int, str]] = [
+            (max(0, int(h * 0.955)), min(h, int(h * 0.995)), "bottom_margin"),
+            (max(0, int(h * 0.80)), min(h, int(h * 0.92)), "lower_plot"),
+        ]
+
+        corners: list[str] = ["bl", "br"]
+        if stamp_pos in {"bl", "bottom-left", "left"}:
+            corners = ["bl"]
+        elif stamp_pos in {"br", "bottom-right", "right"}:
+            corners = ["br"]
+
+        did = False
+        for y0, y1, band_name in bands:
+            # Use a wider box for the lower-plot band (covers longer hostnames).
+            bl_x0 = max(0, int(w * 0.01))
+            bl_x1 = min(w, int(w * (0.16 if band_name == "bottom_margin" else 0.22)))
+            br_x1 = min(w, int(w * 0.99))
+            br_x0 = max(0, int(w * (0.84 if band_name == "bottom_margin" else 0.70)))
+
+            if "bl" in corners:
+                must = sanitize_always or (force and band_name == "lower_plot")
+                if must or _corner_has_stamp(bl_x0, bl_x1, y0, y1):
+                    did = _wipe_box(bl_x0, bl_x1, y0, y1) or did
+
+            if "br" in corners:
+                must = sanitize_always or (force and band_name == "lower_plot")
+                if must or _corner_has_stamp(br_x0, br_x1, y0, y1):
+                    did = _wipe_box(br_x0, br_x1, y0, y1) or did
+
+        if not did:
+            return png_bytes, False, "no_stamp_detected"
+
+        out = io.BytesIO()
+        pnginfo = None
+        try:
+            pnginfo = PngInfo()
+            info = getattr(img, "text", None)
+            if isinstance(info, dict):
+                for k, v in info.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        try:
+                            pnginfo.add_text(k, v)
+                        except Exception:
+                            pass
+        except Exception:
+            pnginfo = None
+
+        if pnginfo is not None:
+            out_img.save(out, format="PNG", pnginfo=pnginfo)
+        else:
+            out_img.save(out, format="PNG")
+        if sanitize_always:
+            reason = "forced"
+        elif force:
+            reason = "forced_corners"
+        else:
+            reason = "sanitized"
+        return out.getvalue(), True, reason
+    except Exception:
+        return png_bytes, False, "sanitize_exception"
+
+
+async def _worker_render_oi_iv_payload_png(payload: dict[str, object]) -> bytes:
+    """Ask TNT worker to render OI/IV from a deterministic payload."""
+
+    return await _worker_post_oi_iv_png(payload, sanitize=True)
+
+
+async def _worker_post_oi_iv_png(payload: dict[str, object], *, sanitize: bool) -> bytes:
+    base = _normalize_worker_base(os.getenv("TNT_WORKER_URL", "") or "")
+    if not base:
+        raise RuntimeError("TNT_WORKER_URL not set")
+
+    import aiohttp
+
+    try:
+        timeout_s = float(os.getenv("TNT_WORKER_TIMEOUT_SEC", "10"))
+    except Exception:
+        timeout_s = 10.0
+    timeout_s = float(max(2.0, min(timeout_s, 45.0)))
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        url = f"{base}/v1/render/oi_iv"
+        async with session.post(url, json=payload, headers={"Accept": "image/png"}) as resp:
+            if int(resp.status) != 200:
+                body = ""
+                try:
+                    body = await resp.text()
+                except Exception:
+                    body = ""
+                raise RuntimeError(f"worker render failed status={resp.status} body={(body or '')[:200]}")
+            data = await resp.read()
+            if not data:
+                raise RuntimeError("worker render returned empty")
+            png = bytes(data)
+            if not sanitize:
+                return png
+            out_png, did, reason = _sanitize_worker_png_bytes(png, force=True)
+            try:
+                print(f"[TNT][OI][SANITIZE] SANITIZE={1 if did else 0} reason={reason}")
+            except Exception:
+                pass
+            return out_png
+
+
+_OI_WORKER_OI_IV_PARITY: dict[str, object] = {
+    "checked": False,
+    "ok": False,
+    "reason": "",
+    "worker": "",
+    "mode": "",
+    "checked_ts": 0.0,
+}
+
+
+def _oi_worker_parity_mode() -> str:
+    """Parity policy for enabling worker payload rendering.
+
+    - strict (default): require worker pixels == local pixels for deterministic payload
+    - deterministic: require worker pixels stable across repeated renders; warn if local differs
+    """
+
+    raw = (os.getenv("TNT_OI_WORKER_PARITY_MODE", "") or "").strip().lower()
+    if raw in {"deterministic", "self", "selfcheck", "worker"}:
+        return "deterministic"
+    return "strict"
+
+
+def _sha256_pixels_png(png: bytes) -> str | None:
+    try:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(png)).convert("RGBA")
+        return __import__("hashlib").sha256(im.tobytes()).hexdigest()
+    except Exception:
+        return None
+
+
+async def _oi_worker_payload_renderer_ok() -> bool:
+    """One-time capability check: only use worker if its payload renderer matches local pixels."""
+
+    try:
+        base = _normalize_worker_base(os.getenv("TNT_WORKER_URL", "") or "")
+    except Exception:
+        base = ""
+    if not base:
+        return False
+
+    mode = _oi_worker_parity_mode()
+
+    state = _OI_WORKER_OI_IV_PARITY
+    if bool(state.get("checked")) and str(state.get("worker") or "") == base and str(state.get("mode") or "") == mode:
+        # TTL cache: prevents probe chatter over time.
+        try:
+            checked_ts = float(state.get("checked_ts") or 0.0)
+        except Exception:
+            checked_ts = 0.0
+        age = (time.time() - checked_ts) if checked_ts else 1e9
+        ok_cached = bool(state.get("ok"))
+
+        try:
+            ttl_ok = float(os.getenv("TNT_OI_WORKER_PARITY_OK_TTL_SEC", "180"))
+        except Exception:
+            ttl_ok = 180.0
+        try:
+            ttl_fail = float(os.getenv("TNT_OI_WORKER_PARITY_FAIL_TTL_SEC", "10"))
+        except Exception:
+            ttl_fail = 10.0
+
+        ttl = float(ttl_ok if ok_cached else ttl_fail)
+        if ttl > 0 and age <= ttl:
+            try:
+                truthy = {"1", "true", "yes", "y", "on"}
+                if (os.getenv("TNT_OI_WORKER_PARITY_PROBE_LOG", "0") or "0").strip().lower() in truthy:
+                    print(f"[TNT][OI][WORKER][PARITY] probe_cache_hit ok={1 if ok_cached else 0} age_s={age:.1f} ttl_s={ttl:.0f} mode={mode} worker={base}")
+            except Exception:
+                pass
+            return ok_cached
+
+        # Expired: allow re-check.
+        state["checked"] = False
+
+    # Coalesce concurrent parity probes across different /oi cache keys.
+    # Key includes normalized base + parity mode so equivalent URLs don't fragment.
+    sf_key = f"oi_worker_parity:{base}:{mode}"
+
+    async def _do_check() -> bool:
+        state["checked"] = True
+        state["checked_ts"] = float(time.time())
+        state["worker"] = base
+        state["mode"] = mode
+        state["ok"] = False
+        state["reason"] = ""
+
+        try:
+            truthy = {"1", "true", "yes", "y", "on"}
+            if (os.getenv("TNT_OI_WORKER_PARITY_PROBE_LOG", "0") or "0").strip().lower() in truthy:
+                print(f"[TNT][OI][WORKER][PARITY] probe_start mode={mode} worker={base}")
+        except Exception:
+            pass
+
+        # Deterministic payload (mirrors scripts/parity_check_oi_iv.py)
+        payload = {
+            "symbol": "SPY",
+            "strikes": [480.0, 485.0, 490.0, 495.0, 500.0],
+            "call_oi": [12000, 18000, 35000, 42000, 78000],
+            "put_oi": [9000, 15000, 24000, 38000, 66000],
+            "call_iv": [22.1, 21.7, 21.4, 21.2, 20.9],
+            "put_iv": None,
+            "title": "PARITY-PROBE — deterministic payload",
+        }
+
+        # Always verify worker self-determinism first.
+        try:
+            w1 = await _worker_post_oi_iv_png(dict(payload), sanitize=True)
+            w2 = await _worker_post_oi_iv_png(dict(payload), sanitize=True)
+            if not w1 or not w2:
+                state["reason"] = "worker_empty"
+                return False
+        except Exception as exc:
+            state["reason"] = f"worker_fail:{type(exc).__name__}"
+            return False
+
+        w1h = _sha256_pixels_png(bytes(w1))
+        w2h = _sha256_pixels_png(bytes(w2))
+        if not (w1h and w2h and w1h == w2h):
+            state["reason"] = "worker_nondeterministic"
+            try:
+                print(f"[TNT][OI][WORKER][PARITY][WARN] disabling worker render: worker_nondeterministic mode={mode} worker={base}")
+            except Exception:
+                pass
+            return False
+
+        if mode != "strict":
+            state["ok"] = True
+            state["reason"] = "ok_deterministic"
+            try:
+                truthy = {"1", "true", "yes", "y", "on"}
+                if (os.getenv("TNT_OI_WORKER_PARITY_PROBE_LOG", "0") or "0").strip().lower() in truthy:
+                    print(f"[TNT][OI][WORKER][PARITY] probe_ok mode={mode} worker={base} reason={state.get('reason')}")
+            except Exception:
+                pass
+            return True
+
+        # Strict mode: require local pixels match worker pixels.
+        try:
+            from delivery.oi_iv_render import render_oi_iv_png as _shared_render
+
+            labels = [f"{float(s):g}" for s in payload["strikes"]]
+            local_png = _shared_render(
+                title=str(payload["title"]),
+                x_labels=labels,
+                iv_pct=[float(x) for x in payload["call_iv"]],
+                oi_calls=[float(x) for x in payload["call_oi"]],
+                oi_puts=[float(x) for x in payload["put_oi"]],
+                dpi=150,
+                include_iv_overlay=True,
+            )
+            if not isinstance(local_png, (bytes, bytearray)) or not local_png:
+                state["reason"] = "local_empty"
+                return False
+        except Exception as exc:
+            state["reason"] = f"local_fail:{type(exc).__name__}"
+            return False
+
+        lh = _sha256_pixels_png(bytes(local_png))
+        wh = w1h
+        if lh and wh and lh == wh:
+            state["ok"] = True
+            state["reason"] = "ok"
+            try:
+                truthy = {"1", "true", "yes", "y", "on"}
+                if (os.getenv("TNT_OI_WORKER_PARITY_PROBE_LOG", "0") or "0").strip().lower() in truthy:
+                    print(f"[TNT][OI][WORKER][PARITY] probe_ok mode={mode} worker={base} reason={state.get('reason')}")
+            except Exception:
+                pass
+            return True
+
+        state["reason"] = "pixels_mismatch"
+        try:
+            print(f"[TNT][OI][WORKER][PARITY][WARN] disabling worker render: pixels_mismatch mode={mode} worker={base}")
+        except Exception:
+            pass
+        try:
+            truthy = {"1", "true", "yes", "y", "on"}
+            if (os.getenv("TNT_OI_WORKER_PARITY_PROBE_LOG", "0") or "0").strip().lower() in truthy:
+                print(f"[TNT][OI][WORKER][PARITY] probe_fail mode={mode} worker={base} reason={state.get('reason')}")
+        except Exception:
+            pass
+        return False
+
+    ok = await _singleflight(sf_key, _do_check)
+    return bool(ok)
+
+
+async def _worker_render_oi_png(*, symbol: str) -> bytes:
+    """Ask TNT worker to render an OI chart and return PNG bytes.
+
+    Tries (in order):
+    - GET `${TNT_WORKER_URL}/v1/render/oi_iv?symbol=...` (current worker API)
+    - POST `${TNT_WORKER_URL}/v1/render/oi` with JSON `{symbol: ...}` (fallback)
+
+    Raises on failure.
+    """
+
+    base = _normalize_worker_base(os.getenv("TNT_WORKER_URL", "") or "")
+    if not base:
+        raise RuntimeError("TNT_WORKER_URL not set")
+
+    import aiohttp
+
+    # Fail fast: prefer quick local fallback over blocking on worker timeouts.
+    try:
+        timeout_s = float(os.getenv("TNT_WORKER_TIMEOUT_SEC", "6"))
+    except Exception:
+        timeout_s = 6.0
+    timeout_s = float(max(2.0, min(timeout_s, 30.0)))
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        url_oi_iv = f"{base}/v1/render/oi_iv"
+        try:
+            async with session.get(url_oi_iv, params={"symbol": str(symbol)}, headers={"Accept": "image/png"}) as resp:
+                if int(getattr(resp, "status", 0)) == 200:
+                    data = await resp.read()
+                    if data:
+                        out_png, _did, _reason = _sanitize_worker_png_bytes(bytes(data), force=True)
+                        return out_png
+        except Exception:
+            pass
+
+        url_oi = f"{base}/v1/render/oi"
+        async with session.post(url_oi, json={"symbol": str(symbol)}, headers={"Accept": "image/png"}) as resp:
+            if int(getattr(resp, "status", 0)) != 200:
+                body = ""
+                try:
+                    body = await resp.text()
+                except Exception:
+                    body = ""
+                raise RuntimeError(f"worker render failed status={resp.status} body={(body or '')[:200]}")
+            data2 = await resp.read()
+            if not data2:
+                raise RuntimeError("worker render returned empty")
+            out_png2, _did2, _reason2 = _sanitize_worker_png_bytes(bytes(data2), force=True)
+            return out_png2
+
+
+# Redis ops in this module are best-effort; if Redis is down, back off briefly.
+_REDIS_SF_DISABLE_UNTIL = 0.0
+
+
 async def run_heavy_chart(
     *,
     interaction: discord.Interaction,
@@ -896,6 +1912,11 @@ async def run_heavy_chart(
     cache_get,
     cache_set,
     post_to_channel: bool = False,
+    redis_sf_namespace: str | None = None,
+    redis_sf_work_key: str | None = None,
+    redis_sf_lock_ttl_s: int = 60,
+    redis_sf_wait_timeout_s: int = 25,
+    redis_sf_poll_ms: int = 250,
 ) -> None:
     """Standardized heavy command execution.
 
@@ -905,43 +1926,64 @@ async def run_heavy_chart(
 
     ack = await _instant_ack_editor(interaction)
 
+    def _maybe_log_render_proof(*, meta: dict[str, object] | None) -> None:
+        try:
+            if str(cmd) != "oi":
+                return
+            m = meta if isinstance(meta, dict) else {}
+            render_mode = str(m.get("render_mode") or m.get("mode") or "unknown")
+            sym = str(m.get("symbol") or m.get("sym") or "")
+            worker = (os.getenv("TNT_WORKER_URL", "") or "").strip()
+            print(f"[TNT][OI][PROOF] render_mode={render_mode} symbol={sym} worker={worker}")
+        except Exception:
+            pass
+
+    async def _serve_cached(_cached) -> bool:
+        if not _cached:
+            return False
+        try:
+            png_bytes = _cached.get("png_bytes")
+            caption = _cached.get("caption")
+            filename = _cached.get("filename") or f"{str(cmd).lower()}_cached.png"
+            cached_ts = _cached.get("cached_asof_ts")
+            meta = _cached.get("meta") if isinstance(_cached.get("meta"), dict) else None
+        except Exception:
+            png_bytes, caption, filename, cached_ts, meta = None, None, None, None, None
+
+        if not (isinstance(png_bytes, (bytes, bytearray)) and png_bytes):
+            return False
+
+        content = _append_gprr_banner_cached(str(caption or ""), cached_asof_ts=float(cached_ts) if cached_ts else None)
+        posted = False
+        try:
+            if post_to_channel and (interaction.channel is not None) and bool(getattr(ack, "_ephemeral", False)):
+                await interaction.channel.send(
+                    content=content,
+                    files=[_file_from_png_bytes(bytes(png_bytes), filename=str(filename))],
+                )
+                posted = True
+        except Exception:
+            pass
+
+        _maybe_log_render_proof(meta=meta)
+
+        if posted:
+            await ack.edit(content=content + "\n\n(Posted to channel)")
+        else:
+            await ack.edit(
+                content=content,
+                attachments=[_file_from_png_bytes(bytes(png_bytes), filename=str(filename))],
+            )
+        return True
+
     # 2️⃣ cache-first
     try:
         cached = await cache_get(cache_key)
     except Exception:
         cached = None
 
-    if cached:
-        try:
-            png_bytes = cached.get("png_bytes")
-            caption = cached.get("caption")
-            filename = cached.get("filename") or f"{str(cmd).lower()}_cached.png"
-            cached_ts = cached.get("cached_asof_ts")
-        except Exception:
-            png_bytes, caption, filename, cached_ts = None, None, None, None
-
-        if isinstance(png_bytes, (bytes, bytearray)) and png_bytes:
-            content = _append_gprr_banner_cached(str(caption or ""), cached_asof_ts=float(cached_ts) if cached_ts else None)
-            posted = False
-            try:
-                if post_to_channel and (interaction.channel is not None) and bool(getattr(ack, "_ephemeral", False)):
-                    await interaction.channel.send(
-                        content=content,
-                        files=[_file_from_png_bytes(bytes(png_bytes), filename=str(filename))],
-                    )
-                    posted = True
-            except Exception:
-                pass
-
-            # If we posted publicly, keep the ephemeral ack text-only to avoid duplicates.
-            if posted:
-                await ack.edit(content=content + "\n\n(Posted to channel)")
-            else:
-                await ack.edit(
-                    content=content,
-                    attachments=[_file_from_png_bytes(bytes(png_bytes), filename=str(filename))],
-                )
-            return
+    if cached and await _serve_cached(cached):
+        return
 
     # 3️⃣ GPRR gate (cache-miss renders)
     try:
@@ -984,6 +2026,48 @@ async def run_heavy_chart(
         finally:
             await _release_render_slot_global()
 
+    # Optional Redis singleflight (cross-process): best-effort and fail-open.
+    got_redis_lock = False
+    lock_key = None
+    if redis_sf_namespace and redis_sf_work_key and time.time() >= float(_REDIS_SF_DISABLE_UNTIL):
+        try:
+            from tnt_redis import redis_client as _tnt_redis_client, rkey as _tnt_rkey
+
+            lock_key = _tnt_rkey("sf", str(redis_sf_namespace), str(redis_sf_work_key), "lock")
+
+            def _try_lock() -> bool:
+                try:
+                    return bool(_tnt_redis_client().set(lock_key, "1", nx=True, ex=int(redis_sf_lock_ttl_s)))
+                except Exception:
+                    return False
+
+            try:
+                got_redis_lock = bool(await asyncio.wait_for(asyncio.to_thread(_try_lock), timeout=0.75))
+            except Exception:
+                got_redis_lock = False
+                try:
+                    globals()["_REDIS_SF_DISABLE_UNTIL"] = time.time() + 30.0
+                except Exception:
+                    pass
+
+            if not got_redis_lock:
+                deadline = time.time() + float(redis_sf_wait_timeout_s)
+                poll_s = max(0.05, float(redis_sf_poll_ms) / 1000.0)
+                while time.time() < deadline:
+                    try:
+                        cached2 = await cache_get(cache_key)
+                    except Exception:
+                        cached2 = None
+                    if cached2 and await _serve_cached(cached2):
+                        return
+                    await asyncio.sleep(poll_s)
+        except Exception:
+            got_redis_lock = False
+            lock_key = None
+            try:
+                globals()["_REDIS_SF_DISABLE_UNTIL"] = time.time() + 30.0
+            except Exception:
+                pass
     try:
         result = await _singleflight(str(cache_key), _work, on_join=_join_notice)
     except Exception:
@@ -992,6 +2076,20 @@ async def run_heavy_chart(
         except Exception:
             pass
         return
+    finally:
+        if got_redis_lock and lock_key:
+            try:
+                from tnt_redis import redis_client as _tnt_redis_client
+
+                def _unlock() -> None:
+                    try:
+                        _tnt_redis_client().delete(lock_key)
+                    except Exception:
+                        pass
+
+                await asyncio.wait_for(asyncio.to_thread(_unlock), timeout=0.75)
+            except Exception:
+                pass
 
     if not isinstance(result, dict):
         await ack.edit(content="Unable to render right now — please retry shortly.")
@@ -1010,6 +2108,7 @@ async def run_heavy_chart(
     caption = str(result.get("caption") or "")
     filename = str(result.get("filename") or f"{str(cmd).lower()}.png")
     ttl_sec = int(result.get("ttl_sec") or 30)
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else None
 
     if not isinstance(png_bytes, (bytes, bytearray)) or not png_bytes:
         await ack.edit(content="Unable to render right now — please retry shortly.")
@@ -1044,7 +2143,8 @@ async def run_heavy_chart(
     except Exception:
         pass
 
-    # If we posted publicly, keep the ephemeral ack text-only to avoid duplicates.
+    _maybe_log_render_proof(meta=meta)
+
     if posted:
         await ack.edit(content=content + "\n\n(Posted to channel)")
     else:
@@ -2159,12 +3259,13 @@ async def tnt_health(interaction: discord.Interaction) -> None:
         any_present = 0
         fresh_present = 0
         for s in OI_WARMED:
-            prefix = f"oi_png:v2:{s}:"
+            # v3 is current; keep v2 for backward visibility while it drains.
+            prefixes = (f"oi_png:v5:{s}:", f"oi_png:v4:{s}:", f"oi_png:v3:{s}:", f"oi_png:v2:{s}:")
             has_any = False
             has_fresh = False
             for k, entry in _oi_items:
                 try:
-                    if not str(k).startswith(prefix):
+                    if not any(str(k).startswith(pfx) for pfx in prefixes):
                         continue
                     # entry = (png_bytes, meta, expires_ts, size_bytes, stored_ts, png_err)
                     expires_ts = float(entry[2])
@@ -2324,10 +3425,10 @@ async def _write_heartbeat_once() -> None:
             active = int(_RENDER_ACTIVE)
             waiting = int(_RENDER_WAITING)
 
+        ts_utc = datetime.now(timezone.utc).isoformat()
         payload = {
-            "ts_utc": datetime.now(timezone.utc).isoformat(),
-            # Back/ops-friendly aliases
-            "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "ts_utc": ts_utc,
+            "ts": ts_utc.replace("+00:00", "Z"),
             "pid": int(os.getpid()),
             "mode": _tnt_mode(),
             "entrypoint": _TNT_ENTRYPOINT,
@@ -2555,24 +3656,71 @@ def _age_days_et(ts: float, now_ts: float | None = None) -> int | None:
         return None
 
 
-def _add_tnt_watermark(ax: Any, text: str = "TNT") -> None:
+def _add_tnt_watermark(
+    ax: Any,
+    text: str = "TNT",
+    *,
+    alpha: float = 0.045,
+    fontsize: int = 64,
+    fontweight: str = "bold",
+) -> None:
     """Add a subtle TNT watermark behind plotted data. Best-effort; never raises."""
 
+    def _stamp_visible() -> bool:
+        truthy = {"1", "true", "yes", "y", "on"}
+        allow = (os.getenv("TNT_RENDER_STAMP_ALLOW", "0") or "0").strip().lower()
+        if allow not in truthy:
+            return False
+        v = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
+        return v in truthy
+
+    def _stamp(fig: Any) -> None:
+        try:
+            if fig is None:
+                return
+            if not _stamp_visible():
+                return
+            if bool(getattr(fig, "_tnt_render_tag_stamped", False)):
+                return
+            tag = (os.getenv("TNT_RENDER_TAG") or "").strip() or (os.getenv("COMPUTERNAME") or "").strip() or "TNT?"
+            fig.text(
+                0.01,
+                0.01,
+                str(tag),
+                transform=fig.transFigure,
+                fontsize=9,
+                color="#c9d1d9",
+                alpha=0.70,
+                ha="left",
+                va="bottom",
+                zorder=10,
+            )
+            setattr(fig, "_tnt_render_tag_stamped", True)
+        except Exception:
+            return
+
     try:
+        _stamp(getattr(ax, "figure", None))
+
         # Ensure the axes background patch is behind the watermark.
         try:
             ax.patch.set_zorder(0)
         except Exception:
             pass
+        a = float(alpha)
+        if not (0.0 <= a <= 1.0):
+            a = 0.045
+        fs = int(fontsize) if int(fontsize) > 0 else 64
+
         ax.text(
             0.5,
             0.5,
             str(text),
             transform=ax.transAxes,
-            fontsize=64,
-            fontweight="bold",
+            fontsize=fs,
+            fontweight=str(fontweight or "bold"),
             color="white",
-            alpha=0.045,
+            alpha=a,
             ha="center",
             va="center",
             zorder=0.5,
@@ -2584,7 +3732,34 @@ def _add_tnt_watermark(ax: Any, text: str = "TNT") -> None:
 def _add_tnt_watermark_fig(fig: Any, text: str = "TNT") -> None:
     """Centered watermark for multi-subplot charts, behind all axes. Best-effort; never raises."""
 
+    def _stamp_visible() -> bool:
+        truthy = {"1", "true", "yes", "y", "on"}
+        allow = (os.getenv("TNT_RENDER_STAMP_ALLOW", "0") or "0").strip().lower()
+        if allow not in truthy:
+            return False
+        v = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
+        return v in truthy
+
     try:
+        try:
+            if fig is not None and _stamp_visible() and (not bool(getattr(fig, "_tnt_render_tag_stamped", False))):
+                tag = (os.getenv("TNT_RENDER_TAG") or "").strip() or (os.getenv("COMPUTERNAME") or "").strip() or "TNT?"
+                fig.text(
+                    0.01,
+                    0.01,
+                    str(tag),
+                    transform=fig.transFigure,
+                    fontsize=9,
+                    color="#c9d1d9",
+                    alpha=0.70,
+                    ha="left",
+                    va="bottom",
+                    zorder=10,
+                )
+                setattr(fig, "_tnt_render_tag_stamped", True)
+        except Exception:
+            pass
+
         # Force subplot backgrounds behind the watermark.
         try:
             for ax in list(getattr(fig, "axes", []) or []):
@@ -3063,6 +4238,69 @@ def _dotenv_get_value(path: Path, key: str) -> str | None:
             continue
         return _normalize_env_value(v)
     return None
+
+
+def _dotenv_load_file_into_environ(path: Path, *, preserve_existing: set[str]) -> dict[str, str]:
+    """Best-effort: load KEY=VALUE lines into os.environ.
+
+    - Does not overwrite keys that existed before this loader ran.
+    - Supports optional leading `export `.
+    - Ignores blank lines and comments.
+    """
+
+    loaded: dict[str, str] = {}
+    if not path.exists() or not path.is_file():
+        return loaded
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return loaded
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        key = k.strip()
+        if not key:
+            continue
+        if key in preserve_existing:
+            continue
+        val = _normalize_env_value(v)
+        try:
+            os.environ[key] = val
+            loaded[key] = val
+        except Exception:
+            continue
+
+    return loaded
+
+
+def _dotenv_load_into_environ() -> None:
+    """Load repo `.env` and `.env.local` into `os.environ`.
+
+    This repo often configures run-mode gates via env files. Python won't load
+    them automatically, so we do it here (without overriding *real* env vars).
+    """
+
+    preserve_existing = set(os.environ.keys())
+
+    loaded_env = _dotenv_load_file_into_environ(PROJECT_ROOT / ".env", preserve_existing=preserve_existing)
+    # Allow .env.local to override values that came from .env (but not values that
+    # existed in the process environment before we started).
+    preserve_existing2 = preserve_existing.difference(set(loaded_env.keys()))
+    loaded_local = _dotenv_load_file_into_environ(PROJECT_ROOT / ".env.local", preserve_existing=preserve_existing2)
+
+    try:
+        if loaded_env or loaded_local:
+            print(f"[TNT][ENV] loaded_dotenv env={len(loaded_env)} local={len(loaded_local)}")
+    except Exception:
+        pass
 
 
 def _resolve_discord_token() -> str | None:
@@ -4632,22 +5870,29 @@ async def chart(
                 h = highs[i]
                 l = lows[i]
                 color = up_color if c >= o else down_color
-                ax_price.vlines(xnums[i], l, h, color=wick_color, linewidth=0.6, alpha=0.9)
+
                 body_low = min(o, c)
                 body_h = abs(c - o)
                 if body_h <= 0:
                     body_h = max((hi - lo) * 0.0002, 1e-6)
-                rect = Rectangle(
-                    (xnums[i] - candle_width / 2.0, body_low),
-                    candle_width,
-                    body_h,
-                    facecolor=color,
-                    edgecolor=color,
-                    linewidth=0.0,
-                    alpha=0.95,
-                    antialiased=False,
+
+                ax_price.add_patch(
+                    Rectangle(
+                        (xnums[i] - candle_width / 2.0, body_low),
+                        candle_width,
+                        body_h,
+                        facecolor=color,
+                        edgecolor="none",
+                        linewidth=0.0,
+                        alpha=0.95,
+                        antialiased=False,
+                        zorder=2.0,
+                    )
                 )
-                ax_price.add_patch(rect)
+                try:
+                    ax_price.vlines([xnums[i]], [l], [h], color=wick_color, linewidth=0.9, alpha=0.85, zorder=2.0)
+                except Exception:
+                    pass
 
         # Support/Resistance: draw R/S pivot ladder straight across.
         # Per user preference: resistance=green, support=red.
@@ -4951,7 +6196,7 @@ async def chart(
             dpi_used = 240
 
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=int(dpi_used), facecolor=fig.get_facecolor())
+        fig.savefig(buf, format="png", dpi=int(dpi_used), facecolor=fig.get_facecolor(), metadata=_tnt_png_metadata())
         plt.close(fig)
         return buf.getvalue(), None, stats
 
@@ -5563,7 +6808,7 @@ async def vwap_range(
 
         fig.tight_layout()
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=160)
+        fig.savefig(buf, format="png", dpi=160, metadata=_tnt_png_metadata())
         plt.close(fig)
         return buf.getvalue(), None, meta
 
@@ -5797,7 +7042,7 @@ async def rs(
 
         fig.tight_layout()
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=160)
+        fig.savefig(buf, format="png", dpi=160, metadata=_tnt_png_metadata())
         plt.close(fig)
 
         meta = {
@@ -6179,7 +7424,7 @@ async def crypto_rs(interaction: discord.Interaction) -> None:
 
         fig.tight_layout()
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=160)
+        fig.savefig(buf, format="png", dpi=160, metadata=_tnt_png_metadata())
         plt.close(fig)
 
         def _chg20(series: list[float]) -> float | None:
@@ -6576,7 +7821,7 @@ async def crypto_vol(interaction: discord.Interaction) -> None:
 
         fig.tight_layout()
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=160)
+        fig.savefig(buf, format="png", dpi=160, metadata=_tnt_png_metadata())
         plt.close(fig)
 
         try:
@@ -7306,7 +8551,7 @@ async def risk_on_off(
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=160)
+        fig.savefig(buf, format="png", dpi=160, metadata=_tnt_png_metadata())
         plt.close(fig)
 
         meta = {
@@ -7885,7 +9130,7 @@ async def pcr(
 
         fig.tight_layout()
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=int(dpi_used))
+        fig.savefig(buf, format="png", dpi=int(dpi_used), metadata=_tnt_png_metadata())
         plt.close(fig)
 
         meta = {"points": len(xs), "last": ys[-1] if ys else None}
@@ -7950,7 +9195,7 @@ async def pcr(
 @app_commands.describe(
     symbol="Underlying ticker (e.g., SPY, SPX, QQQ)",
     by="Group by strike or expiration",
-    expiration="Expiration YYYY-MM-DD (only used when grouping by strike)",
+    expiration="Strike view: YYYY-MM-DD or {0dte|today|next|auto}",
     top="Strike view only: keep top-N OI buckets (0=all)",
     window="Strike window % around spot for chain fetch (default 7; set 10 for wider)",
 )
@@ -8025,6 +9270,11 @@ async def oi(
         return
     sym = sym_norm.upper().strip()
 
+    try:
+        print(f"[TNT][OI][REQ] raw_symbol={str(symbol or '').strip()} normalized_symbol={sym}")
+    except Exception:
+        pass
+
     if sym not in OI_UNIVERSE_SET:
         await _reply(f"Symbol not in TNT OI universe (52 supported). Try: {', '.join(OI_WARMED[:6])} ...")
         return
@@ -8067,9 +9317,13 @@ async def oi(
         by_norm = "strike"
 
     exp_clean = (expiration or "").strip()
-    if exp_clean:
+    exp_mode = exp_clean.lower().strip() if exp_clean else ""
+    if exp_mode in {"0dte", "today", "next", "auto"}:
+        # Resolve after we can query expirations.
+        exp_clean = exp_mode
+    elif exp_clean:
         if len(exp_clean) != 10 or exp_clean[4] != "-" or exp_clean[7] != "-":
-            await _reply("Expiration must be `YYYY-MM-DD` (example: `2025-12-27`).")
+            await _reply("Expiration must be `YYYY-MM-DD` or one of: `0dte`, `today`, `next`, `auto`.")
             return
 
     channel = interaction.channel
@@ -8084,17 +9338,104 @@ async def oi(
         window_pct = 7
     window_pct = max(5, min(12, int(window_pct)))
     strike_window_pct = float(window_pct) / 100.0
-    max_contracts = 250
-
-    # Best-effort: cache expiry selection to reduce metadata calls during bursts.
-    exp_hint = ""
+    # Keep bounded: if spot lookup fails, the only remaining bound is this limit.
     try:
-        if by_norm == "strike" and not exp_clean:
-            expiries_hint = await _oi_get_expiries_cached(sym, api_key=api_key, max_expiries=1)
-            if expiries_hint:
-                exp_hint = str(expiries_hint[0]).strip()
+        max_contracts = int(os.getenv("TNT_OI_MAX_CONTRACTS", "120"))
     except Exception:
-        exp_hint = ""
+        max_contracts = 120
+    max_contracts = max(50, min(500, int(max_contracts)))
+
+    # Prefer absolute strike fan-out for OI: default ±$10.
+    window_abs = None
+    try:
+        window_abs = float(os.getenv("TNT_OI_WINDOW_ABS", "10"))
+    except Exception:
+        window_abs = 10.0
+    if not (isinstance(window_abs, (int, float)) and window_abs and window_abs > 0 and window_abs < 1_000_000):
+        window_abs = None
+
+    if window_abs is not None:
+        w_abs = float(window_abs)
+        w_abs_label = f"{int(w_abs)}" if abs(w_abs - float(int(w_abs))) < 1e-9 else f"{w_abs:g}"
+        window_label = f"±${w_abs_label} Window"
+        window_key = f"abs{int(round(w_abs * 100.0))}"
+    else:
+        window_label = f"±{int(round(float(strike_window_pct) * 100.0))}% Window"
+        window_key = f"pct{int(round(float(strike_window_pct) * 100.0))}"
+
+    async def _resolve_oi_expiration(*, requested: str) -> tuple[str, str]:
+        """Resolve /oi strike-view expiration.
+
+        Returns (expiration_ymd, label_for_display).
+        """
+
+        now_et = delivery._now_et()
+        today = now_et.date().isoformat()
+        req = (requested or "").strip().lower()
+
+        # Explicit YYYY-MM-DD always wins.
+        if req and len(req) == 10 and req[4] == "-" and req[7] == "-":
+            return req, req
+
+        # Default is auto.
+        if not req:
+            req = "auto"
+
+        expiries = []
+        try:
+            expiries = await _oi_get_expiries_cached(sym, api_key=api_key, max_expiries=12)
+        except Exception:
+            expiries = []
+
+        expiries = [str(x).strip()[:10] for x in (expiries or []) if str(x).strip()]
+        expiries = sorted(set(expiries))
+        if not expiries:
+            # If we can't discover expirations, fall back to today.
+            return today, today
+
+        def _first_ge(x: str) -> str | None:
+            for e in expiries:
+                if e >= x:
+                    return e
+            return None
+
+        def _first_gt(x: str) -> str | None:
+            for e in expiries:
+                if e > x:
+                    return e
+            return None
+
+        if req in {"0dte", "today"}:
+            if today in expiries:
+                return today, f"{today} (0DTE)"
+            nearest = _first_ge(today) or expiries[-1]
+            raise RuntimeError(f"No 0DTE expirations today. Nearest is {nearest}.")
+
+        if req == "next":
+            nxt = _first_gt(today)
+            if nxt:
+                return nxt, nxt
+            return expiries[-1], expiries[-1]
+
+        # auto: prefer 0DTE, else nearest >= today.
+        if today in expiries:
+            return today, f"{today} (0DTE)"
+        nearest = _first_ge(today) or expiries[-1]
+        return nearest, nearest
+
+    exp_for_fetch = ""
+    exp_label_resolved = ""
+    if by_norm == "strike":
+        try:
+            exp_for_fetch, exp_label_resolved = await _resolve_oi_expiration(requested=exp_clean)
+        except Exception as exc:
+            await _reply(str(exc))
+            return
+
+        try:
+            print(f"[TNT][OI][EXP] requested={str(exp_clean or '')} resolved={str(exp_for_fetch)} label={str(exp_label_resolved)}")
+        except Exception:
+            pass
 
     try:
         top_n = int(top)
@@ -8118,9 +9459,36 @@ async def oi(
         pass
 
     # Cache-first / busy-mode (avoid option-chain stampedes under load).
-    exp_for_key = exp_clean or exp_hint or "auto"
-    cache_key_png = f"oi_png:v2:{sym}:{by_norm}:{exp_for_key}:{int(top_n)}:{int(strike_window_pct*100)}:{int(max_contracts)}"
+    # IMPORTANT: key uses resolved YYYY-MM-DD (not a selector token like "0dte").
+    exp_for_key = exp_for_fetch or exp_clean or "auto"
+    # IMPORTANT: include IV-overlay bit so degraded modes (IV hidden) never
+    # serve a cached PNG rendered with IV overlay (and vice versa).
+    try:
+        prof_for_key = _gprr_profile() if _gprr_enabled() else None
+        include_iv_key = bool(getattr(prof_for_key, "include_iv_overlay", True)) if prof_for_key is not None else True
+    except Exception:
+        include_iv_key = True
+    iv_key = "iv1" if include_iv_key else "iv0"
+    # IMPORTANT: include a stamp-visibility bit so debug-stamped renders
+    # never poison the default (no-visible-stamp) cache.
+    truthy = {"1", "true", "yes", "y", "on"}
+    allow_stamp = (os.getenv("TNT_RENDER_STAMP_ALLOW", "0") or "0").strip().lower()
+    v_stamp = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
+    stamp_key = "sv1" if (allow_stamp in truthy and v_stamp in truthy) else "sv0"
+
+    cache_key_png = f"oi_png:v5:{sym}:{by_norm}:{exp_for_key}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
     cache_key_png_full = _gprr_cache_key(cache_key_png)
+
+    # Always print the cache key used for this request (helps debug stale cache vs fresh render).
+    try:
+        print(
+            "[TNT][OI][KEY] "
+            + f"symbol={sym} by={by_norm} exp={exp_for_key} top={int(top_n)} max_contracts={int(max_contracts)} "
+            + f"window_key={window_key} window_abs={window_abs} iv_key={iv_key} stamp_key={stamp_key} "
+            + f"key={cache_key_png_full}"
+        )
+    except Exception:
+        pass
 
     async def _cache_get(_key: str):
         # Fresh cache hit.
@@ -8131,6 +9499,10 @@ async def oi(
         if cached is not None:
             c_png, c_err, c_meta = cached
             if c_png and not c_err:
+                try:
+                    print(f"[TNT][OI][CACHE] hit key={_key}")
+                except Exception:
+                    pass
                 cached_ts = None
                 caption = None
                 filename = None
@@ -8141,7 +9513,7 @@ async def oi(
                 if not filename:
                     filename = f"{sym.lower()}_oi_{by_norm}.png"
                 if not caption:
-                    exp_label_fallback = exp_clean or "auto"
+                    exp_label_fallback = exp_for_fetch or exp_label_resolved or exp_clean or "auto"
                     caption = f"🧾 **Options OI/IV** — **{sym}** | by **{by_norm}** | exp **{exp_label_fallback}** | _cached_"
                 caption = _append_oi_universe_hint(str(caption))
                 return {"png_bytes": c_png, "caption": caption, "filename": filename, "cached_asof_ts": cached_ts, "meta": c_meta}
@@ -8168,12 +9540,72 @@ async def oi(
                             if not filename:
                                 filename = f"{sym.lower()}_oi_{by_norm}.png"
                             if not caption:
-                                exp_label_fallback = exp_clean or "auto"
+                                exp_label_fallback = exp_for_fetch or exp_label_resolved or exp_clean or "auto"
                                 caption = f"🧾 **Options OI/IV** — **{sym}** | by **{by_norm}** | exp **{exp_label_fallback}** | _stale cache under load_"
                             caption = _append_oi_universe_hint(str(caption))
                             return {"png_bytes": s_png, "caption": caption, "filename": filename, "cached_asof_ts": cached_ts, "meta": s_meta}
             except Exception:
                 pass
+
+        # Redis cache (short TTL) to collapse cross-process bursts.
+        try:
+            if time.time() < float(_REDIS_SF_DISABLE_UNTIL):
+                return None
+        except Exception:
+            pass
+        try:
+            import base64
+
+            from tnt_cache import cache_get as _tnt_cache_get
+            from tnt_redis import rkey as _tnt_rkey
+
+            redis_key = _tnt_rkey("oi", "png", str(_key))
+
+            def _do_get():
+                return _tnt_cache_get(redis_key)
+
+            hit = await asyncio.wait_for(asyncio.to_thread(_do_get), timeout=0.75)
+            if hit.hit and isinstance(hit.value, dict):
+                d = hit.value
+                b64 = d.get("png_b64")
+                if b64:
+                    try:
+                        png_bytes = base64.b64decode(str(b64).encode("ascii"))
+                    except Exception:
+                        png_bytes = None
+                    if isinstance(png_bytes, (bytes, bytearray)) and png_bytes:
+                        c_meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
+                        cached_ts = d.get("stored_at")
+                        try:
+                            ttl_mem = max(int(os.getenv("TNT_TTL_OI_PNG_SEC", "45")), 5)
+                            await _png_cache_set(_key, (bytes(png_bytes), None, dict(c_meta) if isinstance(c_meta, dict) else {}), ttl_mem)
+                        except Exception:
+                            pass
+
+                        caption = None
+                        filename = None
+                        if isinstance(c_meta, dict):
+                            caption = c_meta.get("caption")
+                            filename = c_meta.get("filename")
+                        if not filename:
+                            filename = str(d.get("filename") or "") or f"{sym.lower()}_oi_{by_norm}.png"
+                        if not caption:
+                            exp_label_fallback = exp_for_fetch or exp_label_resolved or exp_clean or "auto"
+                            caption = f"🧾 **Options OI/IV** — **{sym}** | by **{by_norm}** | exp **{exp_label_fallback}** | _cached_"
+                        caption = _append_oi_universe_hint(str(caption))
+                        return {
+                            "png_bytes": bytes(png_bytes),
+                            "caption": caption,
+                            "filename": filename,
+                            "cached_asof_ts": float(cached_ts) if isinstance(cached_ts, (int, float)) else None,
+                            "meta": c_meta,
+                        }
+        except Exception:
+            try:
+                globals()["_REDIS_SF_DISABLE_UNTIL"] = time.time() + 30.0
+            except Exception:
+                pass
+            pass
 
         return None
 
@@ -8218,6 +9650,45 @@ async def oi(
             ttl = int(result.get("ttl_sec") or max(int(os.getenv("TNT_TTL_OI_PNG_SEC", "45")), 5))
             await _png_cache_set(_key, (png_bytes, png_err, meta), ttl)
         except Exception:
+            pass
+
+        # Best-effort Redis mirror (short TTL) for cross-process cache hits.
+        try:
+            if time.time() < float(_REDIS_SF_DISABLE_UNTIL):
+                return
+        except Exception:
+            pass
+        try:
+            if png_err:
+                return
+            if not isinstance(png_bytes, (bytes, bytearray)) or not png_bytes:
+                return
+
+            import base64
+            import time
+
+            from tnt_cache import cache_set as _tnt_cache_set
+            from tnt_redis import rkey as _tnt_rkey
+
+            redis_key = _tnt_rkey("oi", "png", str(_key))
+            payload = {
+                "png_b64": base64.b64encode(bytes(png_bytes)).decode("ascii"),
+                "png_err": None,
+                "meta": meta if isinstance(meta, dict) else {},
+                "caption": result.get("caption"),
+                "filename": result.get("filename"),
+                "stored_at": float(time.time()),
+            }
+
+            def _do_set() -> None:
+                _tnt_cache_set(redis_key, payload, ttl_s=120)
+
+            await asyncio.wait_for(asyncio.to_thread(_do_set), timeout=0.75)
+        except Exception:
+            try:
+                globals()["_REDIS_SF_DISABLE_UNTIL"] = time.time() + 30.0
+            except Exception:
+                pass
             pass
 
     async def _probe_polygon_options_access(
@@ -8472,8 +9943,9 @@ async def oi(
         line_color = "#ffa657"
 
         if oi_calls is not None and oi_puts is not None:
-            ax.bar(xs, oi_calls, color=call_color, alpha=0.45, label="Calls OI")
-            ax.bar(xs, oi_puts, bottom=oi_calls, color=put_color, alpha=0.38, label="Puts OI")
+            width = 0.38
+            ax.bar([x - width / 2.0 for x in xs], oi_calls, width=width, color=call_color, alpha=0.55, label="Calls OI")
+            ax.bar([x + width / 2.0 for x in xs], oi_puts, width=width, color=put_color, alpha=0.48, label="Puts OI")
         else:
             ax.bar(xs, oi_total or [], color=call_color, alpha=0.45, label="OI")
         ax.set_ylabel("Open interest", color="#c9d1d9")
@@ -8491,7 +9963,7 @@ async def oi(
             iv_plot = list(iv_pct) if iv_pct else [math.nan] * n
             if smooth_iv_window > 1:
                 iv_plot = _smooth_nan(iv_plot, smooth_iv_window)
-            ax2.plot(xs, iv_plot, color=line_color, linewidth=1.6, alpha=0.95, label="IV")
+            ax2.plot(xs, iv_plot, color=line_color, linewidth=1.25, alpha=0.60, linestyle="--", label="IV")
             ax2.set_ylabel("IV (%)", color="#c9d1d9")
 
         if isinstance(spot_idx, int) and 0 <= spot_idx < n:
@@ -8514,6 +9986,49 @@ async def oi(
 
         ax.set_title(title, color="#c9d1d9")
         ax.set_xlabel(x_label, color="#c9d1d9")
+
+        # One decisive takeaway (top-right).
+        try:
+            if oi_calls is not None and oi_puts is not None:
+                put_i = int(max(range(n), key=lambda i: float(oi_puts[i]) if oi_puts else 0.0))
+                call_i = int(max(range(n), key=lambda i: float(oi_calls[i]) if oi_calls else 0.0))
+                put_max = float(oi_puts[put_i])
+                call_max = float(oi_calls[call_i])
+                takeaway = ""
+                if put_max >= max(1.0, call_max) * 1.15:
+                    takeaway = f"Put wall @ {x_labels[put_i]}"
+                elif call_max >= max(1.0, put_max) * 1.15:
+                    takeaway = f"Call wall @ {x_labels[call_i]}"
+                else:
+                    skew = None
+                    try:
+                        iv_clean = [float(v) for v in (iv_pct or []) if isinstance(v, (int, float)) and not math.isnan(float(v))]
+                        if iv_clean and len(iv_clean) >= 6:
+                            k = max(2, int(len(iv_clean) // 3))
+                            iv_low = sum(iv_clean[:k]) / float(k)
+                            iv_high = sum(iv_clean[-k:]) / float(k)
+                            if (iv_low - iv_high) >= 2.0:
+                                skew = "IV skew favors downside"
+                            elif (iv_high - iv_low) >= 2.0:
+                                skew = "IV skew favors upside"
+                    except Exception:
+                        skew = None
+                    takeaway = skew or "Balanced OI"
+
+                ax.text(
+                    0.985,
+                    0.92,
+                    takeaway,
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=9,
+                    color="#c9d1d9",
+                    alpha=0.92,
+                    bbox={"facecolor": "#0b0f14", "edgecolor": "#2d333b", "alpha": 0.75, "pad": 3.0},
+                )
+        except Exception:
+            pass
 
         # Thin x tick labels so the chart stays readable.
         max_ticks = 18
@@ -8548,7 +10063,7 @@ async def oi(
         if dpi_used is None or dpi_used <= 0:
             dpi_used = 150
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=int(dpi_used))
+        fig.savefig(buf, format="png", dpi=int(dpi_used), metadata=_tnt_png_metadata())
         plt.close(fig)
         return buf.getvalue()
 
@@ -8607,15 +10122,30 @@ async def oi(
 
     if by_norm == "strike":
         async def _render_fn(*, profile: RenderProfile | None = None):
+            import time
+
+            render_mode = "local"
+            t0 = time.perf_counter()
+
+            tf0 = time.perf_counter()
             df = await delivery._fetch_polygon_options_chain_df(
                 sym,
-                expiration_ymd=(exp_clean or exp_hint or None),
+                expiration_ymd=(exp_for_fetch or None),
                 strike_window_pct=strike_window_pct,
                 max_contracts=max_contracts,
                 concurrency=8,
             )
+            try:
+                rows = int(len(df)) if df is not None else 0
+                print(f"[TNT][OI][PERF] render_mode=local symbol={sym} fetch_s={time.perf_counter()-tf0:.2f} rows={rows} total_s={time.perf_counter()-t0:.2f}")
+            except Exception:
+                pass
+            try:
+                print(f"[TNT][OI][PROOF] render_mode=local symbol={sym} key={cache_key_png_full}")
+            except Exception:
+                pass
             if df is None or getattr(df, "empty", True):
-                exp_label0 = exp_clean or delivery._now_et().date().isoformat()
+                exp_label0 = exp_for_fetch or delivery._now_et().date().isoformat()
                 contracts_status, snap_status, detail = await _probe_polygon_options_access(exp=exp_label0)
                 extra = f" ({detail})" if detail else ""
                 if contracts_status in {401, 403}:
@@ -8663,46 +10193,171 @@ async def oi(
             # Spot marker (best-effort) using underlying_price from snapshots.
             spot_idx = None
             spot_label = None
+            spot_px = None
             try:
                 import pandas as pd
 
                 spot_series = pd.to_numeric(df.get("underlying_price"), errors="coerce")
                 spot_vals = [float(v) for v in spot_series.dropna().tolist() if isinstance(v, (int, float))]
                 if spot_vals:
-                    spot_px = sorted(spot_vals)[len(spot_vals) // 2]
+                    spot_px = float(sorted(spot_vals)[len(spot_vals) // 2])
                     nearest_i = min(range(len(strikes2)), key=lambda i: abs(float(strikes2[i]) - float(spot_px)))
                     spot_idx = int(nearest_i)
                     spot_label = f"Spot {spot_px:.2f}"
             except Exception:
                 spot_idx = None
                 spot_label = None
+                spot_px = None
 
-            exp_label0 = exp_clean or str(df.get("expiration").iloc[0]) if hasattr(df, "get") else (exp_clean or "")
-            window_pct = int(strike_window_pct * 100)
+            # Strong sanity check: chain-derived spot should roughly match our snapshot spot for the requested symbol.
+            try:
+                snap = delivery._get_last_price_snapshot(sym)
+                snap_px = float(snap.px) if (snap is not None and snap.px is not None) else None
+            except Exception:
+                snap_px = None
+
+            try:
+                if isinstance(snap_px, (int, float)) and isinstance(spot_px, (int, float)) and snap_px and spot_px:
+                    rel = abs(float(snap_px) - float(spot_px)) / max(1.0, abs(float(snap_px)))
+                    if rel >= 0.15:
+                        return {
+                            "error": (
+                                f"Symbol mismatch suspected for **{sym}** exp **{exp_for_fetch}**: "
+                                f"snapshot spot {float(snap_px):.2f} vs chain spot {float(spot_px):.2f}. "
+                                "Refusing to render."
+                            ),
+                            "ttl_sec": 5,
+                        }
+            except Exception:
+                pass
+
+            # Hard sanity check: a correct chain should bracket spot.
+            try:
+                if isinstance(spot_px, (int, float)) and spot_px and strikes2:
+                    tol = 5.0 if sym in {"SPX", "SPXW"} else 1.0
+                    if float(spot_px) < (float(min(strikes2)) - tol) or float(spot_px) > (float(max(strikes2)) + tol):
+                        return {
+                            "error": (
+                                f"Symbol/expiry mismatch for **{sym}** exp **{exp_for_fetch}**: "
+                                f"spot {float(spot_px):.2f} not bracketed by strikes [{float(min(strikes2)):.2f}, {float(max(strikes2)):.2f}]. "
+                                "Refusing to render."
+                            ),
+                            "ttl_sec": 5,
+                        }
+            except Exception:
+                pass
+
+            exp_label0 = exp_label_resolved or exp_for_fetch or exp_for_key
             top_tag = f" | Top {top_n}" if top_n > 0 else ""
             include_iv = bool(getattr(profile, "include_iv_overlay", True)) if profile is not None else True
-            title = f"{sym} Options — OI by Strike + IV Overlay | Exp {exp_label0} | ±{window_pct}% Window{top_tag}"
-            if not include_iv:
-                title = title.replace(" + IV Overlay", "") + " | IV hidden"
-            png = await asyncio.to_thread(
-                _render_oi_iv_png,
-                title=title,
-                x_labels=labels,
-                iv_pct=iv_pct2,
-                x_label="Strike",
-                oi_calls=oi_calls2,
-                oi_puts=oi_puts2,
-                spot_idx=spot_idx,
-                spot_label=spot_label,
-                smooth_iv_window=3,
-                profile=profile,
-                include_iv_overlay=include_iv,
-            )
+            title = f"OI/IV — {sym} — exp {exp_label0} — {window_label}{top_tag}"
+            if spot_label:
+                title = f"{title} — {spot_label}"
+            try:
+                title = f"{title} — contracts {int(len(df))}"
+            except Exception:
+                pass
+
+            # Preferred: worker renders from our deterministic payload (parity, no symbol ambiguity).
+            try:
+                if not (await _oi_worker_payload_renderer_ok()):
+                    raise RuntimeError("worker_parity_disabled")
+                tw0 = time.perf_counter()
+                payload: dict[str, object] = {
+                    "symbol": sym,
+                    "strikes": [float(x) for x in strikes2],
+                    "call_oi": [float(x) for x in oi_calls2],
+                    "put_oi": [float(x) for x in oi_puts2],
+                    "call_iv": [float(x) for x in (iv_pct2 if include_iv else [])],
+                    "put_iv": None,
+                    "title": title,
+                    "include_iv_overlay": bool(include_iv),
+                    "x_label": "Strike",
+                }
+                png0 = await _worker_render_oi_iv_payload_png(payload)
+                render_mode = "worker"
+                try:
+                    print(f"[TNT][OI][PERF] render_mode=worker symbol={sym} worker_s={time.perf_counter()-tw0:.2f}")
+                except Exception:
+                    pass
+                try:
+                    worker = (os.getenv("TNT_WORKER_URL", "") or "").strip()
+                    print(f"[TNT][OI][PROOF] render_mode=worker symbol={sym} worker={worker} key={cache_key_png_full}")
+                except Exception:
+                    pass
+
+                footer = _format_footer()
+                text = f"🧾 **Options OI/IV** — **{sym}** | by **strike** | exp **{exp_label0}** | {window_label}"
+                if spot_label:
+                    text = f"{text} | {spot_label}"
+                if footer:
+                    text = f"{text}\n_{footer}_"
+
+                try:
+                    macro_line = await _get_macro_regime_line()
+                    if macro_line:
+                        text = text + "\n" + macro_line
+                        text = await _maybe_append_crypto_context_if_macro(text, macro_line, sep="\n")
+                except Exception:
+                    pass
+
+                text = _append_oi_universe_hint(text)
+
+                return {
+                    "png_bytes": bytes(png0),
+                    "png_err": None,
+                    "meta": {"mode": "strike", "exp": str(exp_for_fetch or exp_label0), "symbol": sym, "render_mode": render_mode},
+                    "caption": text,
+                    "filename": f"{sym.lower()}_oi_strike.png",
+                    "ttl_sec": max(int(os.getenv("TNT_TTL_OI_PNG_SEC", "45")), 5),
+                }
+            except Exception as exc:
+                _oi_log_worker_fallback(symbol=sym, reason=str(exc), key=cache_key_png_full)
+                if _oi_worker_mode() == "required":
+                    return {
+                        "error": (
+                            f"Worker required for **{sym}** /oi but worker render failed: {exc}. "
+                            "(Set TNT_OI_WORKER_MODE=preferred to allow local fallback.)"
+                        ),
+                        "ttl_sec": 3,
+                    }
+
+            tr0 = time.perf_counter()
+            def _render_local_shared() -> bytes | None:
+                try:
+                    from delivery.oi_iv_render import render_oi_iv_png as _shared_render
+                except Exception:
+                    return None
+
+                dpi_used = 150
+                try:
+                    if profile is not None:
+                        dpi_used = int(getattr(profile, "dpi", 150) or 150)
+                except Exception:
+                    dpi_used = 150
+
+                return _shared_render(
+                    title=title,
+                    x_labels=labels,
+                    iv_pct=(iv_pct2 if include_iv else []),
+                    oi_calls=oi_calls2,
+                    oi_puts=oi_puts2,
+                    dpi=int(dpi_used),
+                    include_iv_overlay=bool(include_iv),
+                )
+
+            png = await asyncio.to_thread(_render_local_shared)
+            try:
+                print(f"[TNT][OI][PERF] render_mode=local symbol={sym} mpl_s={time.perf_counter()-tr0:.2f}")
+            except Exception:
+                pass
             if not png:
                 return {"error": "Failed to render options chart (matplotlib missing or render error).", "ttl_sec": 5}
 
             footer = _format_footer()
-            text = f"🧾 **Options OI/IV** — **{sym}** | by **strike** | exp **{exp_label0}** | bounded chain (±{int(strike_window_pct*100)}% window, max {max_contracts})"
+            text = f"🧾 **Options OI/IV** — **{sym}** | by **strike** | exp **{exp_label0}** | {window_label}"
+            if spot_label:
+                text = f"{text} | {spot_label}"
             if footer:
                 text = f"{text}\n_{footer}_"
 
@@ -8719,7 +10374,7 @@ async def oi(
             return {
                 "png_bytes": png,
                 "png_err": None,
-                "meta": {"mode": "strike", "exp": str(exp_label0)},
+                "meta": {"mode": "strike", "exp": str(exp_label0), "symbol": sym, "render_mode": render_mode},
                 "caption": text,
                 "filename": f"{sym.lower()}_oi_strike.png",
                 "ttl_sec": max(int(os.getenv("TNT_TTL_OI_PNG_SEC", "45")), 5),
@@ -8732,6 +10387,11 @@ async def oi(
             render_fn=_render_fn,
             cache_get=_cache_get,
             cache_set=_cache_set,
+            redis_sf_namespace="oi",
+            redis_sf_work_key=cache_key_png_full,
+            redis_sf_lock_ttl_s=60,
+            redis_sf_wait_timeout_s=25,
+            redis_sf_poll_ms=250,
         )
         return
 
@@ -8779,7 +10439,7 @@ async def oi(
         exp_labels, oi_sums, iv_pct = _bucket_oi_iv_by_expiration(summaries)
         window_pct = int(strike_window_pct * 100)
         include_iv = bool(getattr(profile, "include_iv_overlay", True)) if profile is not None else True
-        title = f"{sym} Options — OI by Expiration + IV Overlay | Next {len(exp_labels)} Exps | ±{window_pct}% Window"
+        title = f"{sym} Options — OI by Expiration + IV Overlay | Next {len(exp_labels)} Exps | {window_label}"
         if not include_iv:
             title = title.replace(" + IV Overlay", "") + " | IV hidden"
         png = await asyncio.to_thread(
@@ -8796,7 +10456,7 @@ async def oi(
             return {"error": "Failed to render options chart (matplotlib missing or render error).", "ttl_sec": 5}
 
         footer = _format_footer()
-        text = f"🧾 **Options OI/IV** — **{sym}** | by **expiration** | bounded chain (±{int(strike_window_pct*100)}% window, per-exp cap)"
+        text = f"🧾 **Options OI/IV** — **{sym}** | by **expiration** | bounded chain ({window_label}, per-exp cap)"
         if footer:
             text = f"{text}\n_{footer}_"
 
@@ -8813,7 +10473,7 @@ async def oi(
         return {
             "png_bytes": png,
             "png_err": None,
-            "meta": {"mode": "expiration", "exp": "auto"},
+            "meta": {"mode": "expiration", "exp": "auto", "symbol": sym, "render_mode": "local"},
             "caption": text,
             "filename": f"{sym.lower()}_oi_expiration.png",
             "ttl_sec": max(int(os.getenv("TNT_TTL_OI_PNG_SEC", "45")), 5),
@@ -9630,7 +11290,7 @@ async def _render_pressure_chart_result(
             dpi_used = None
         if dpi_used is None or dpi_used <= 0:
             dpi_used = 170
-        fig.savefig(buf, format="png", dpi=int(dpi_used))
+        fig.savefig(buf, format="png", dpi=int(dpi_used), metadata=_tnt_png_metadata())
         plt.close(fig)
 
         meta = {
@@ -9951,7 +11611,7 @@ async def htf(
         pass
 
     ttl_sec = max(int(os.getenv("TNT_TTL_HTF_PNG_SEC", "60")), 10)
-    cache_key_base = f"chart_htf_png:v1:{sym_fetch}:1d"
+    cache_key_base = f"chart_htf_png:v2:{sym_fetch}:1d"
     cache_key = _gprr_cache_key(cache_key_base)
 
     async def _cache_get(_key: str):
@@ -10318,6 +11978,12 @@ async def htf(
         except Exception:
             strength = 0.0
 
+        try:
+            strength_min = float(os.getenv("TNT_HTF_STRENGTH_LABEL_MIN", "0.15"))
+        except Exception:
+            strength_min = 0.15
+        show_strength = abs(float(strength)) >= float(strength_min)
+
         def _try_render_htf_png():
             try:
                 import matplotlib
@@ -10330,21 +11996,31 @@ async def htf(
             except Exception:
                 return None, "matplotlib_missing", None
 
-            fig, (ax, ax_strip) = plt.subplots(
-                nrows=2,
-                ncols=1,
-                sharex=True,
-                figsize=(11.6, 6.9),
-                gridspec_kw={"height_ratios": [6.0, 0.55]},
-            )
-            fig.patch.set_facecolor("#0b0f14")
-            for a in (ax, ax_strip):
-                a.set_facecolor("#0b0f14")
-                a.tick_params(colors="#c9d1d9")
-                for spine in a.spines.values():
+            if show_strength:
+                fig, (ax, ax_strip) = plt.subplots(
+                    nrows=2,
+                    ncols=1,
+                    sharex=True,
+                    figsize=(11.6, 6.9),
+                    gridspec_kw={"height_ratios": [6.0, 0.55]},
+                )
+                fig.patch.set_facecolor("#0b0f14")
+                for a in (ax, ax_strip):
+                    a.set_facecolor("#0b0f14")
+                    a.tick_params(colors="#c9d1d9")
+                    for spine in a.spines.values():
+                        spine.set_color("#2d333b")
+            else:
+                fig, ax = plt.subplots(figsize=(11.6, 6.2))
+                ax_strip = None
+                fig.patch.set_facecolor("#0b0f14")
+                ax.set_facecolor("#0b0f14")
+                ax.tick_params(colors="#c9d1d9")
+                for spine in ax.spines.values():
                     spine.set_color("#2d333b")
 
-            _add_tnt_watermark(ax)
+            # HTF watermark should whisper, not compete with price action.
+            _add_tnt_watermark(ax, alpha=0.025, fontsize=52)
 
             xnums = mdates.date2num(xs_p)
             dx = (xnums[1] - xnums[0]) if len(xnums) > 1 else 1.0
@@ -10419,6 +12095,21 @@ async def htf(
                 except Exception:
                     pass
 
+            # Tight y-axis bounds based on visible data (after overlays).
+            try:
+                lows_clean = [float(v) for v in lows_p if isinstance(v, (int, float)) and float(v) > 0 and (not math.isnan(float(v)))]
+                highs_clean = [float(v) for v in highs_p if isinstance(v, (int, float)) and float(v) > 0 and (not math.isnan(float(v)))]
+                if lows_clean and highs_clean:
+                    lo = min(lows_clean)
+                    hi = max(highs_clean)
+                    pad = (hi - lo) * 0.05 if hi > lo else (hi * 0.01)
+                    ymin = (lo - pad) if pad > 0 else (lo * 0.995)
+                    ymax = (hi + pad) if pad > 0 else (hi * 1.005)
+                    if ymax > ymin:
+                        ax.set_ylim(float(ymin), float(ymax))
+            except Exception:
+                pass
+
             ax.grid(True, alpha=0.14, linestyle="--")
             ax.yaxis.tick_right()
             ax.yaxis.set_label_position("right")
@@ -10426,9 +12117,28 @@ async def htf(
             ax.set_title(f"{sym} — TNT HTF Reversal Context", color="#c9d1d9")
 
             try:
-                badge = f"HTF: {state}"
-                if state == "ON":
-                    badge = badge + f" ({direction})"
+                # Reasoned state badge.
+                badge_state = "ACTIVE" if state == "ON" else str(state)
+                reason = ""
+                if state == "WATCH":
+                    if bool(vol_rising):
+                        reason = "Range Expansion Risk"
+                    elif bool(near_key):
+                        reason = "Compression"
+                    elif bool(rsi_os or rsi_ob or stoch_os or stoch_ob):
+                        reason = "Momentum Extremes"
+                    elif (rvol is not None and float(rvol) >= 1.25):
+                        reason = "Volume Spike"
+                    else:
+                        reason = "Setup Forming"
+                elif state == "ON":
+                    reason = "Trend Resuming"
+
+                badge = f"HTF: {badge_state}"
+                if reason:
+                    badge = badge + f" ({reason})"
+                if state == "ON" and direction in {"BULL", "BEAR"}:
+                    badge = badge + f" \u2022 {direction}"
                 ax.text(
                     0.985,
                     0.03,
@@ -10443,39 +12153,44 @@ async def htf(
             except Exception:
                 pass
 
-            ax_strip.set_ylim(0, 1)
-            ax_strip.set_yticks([])
-            ax_strip.grid(False)
-            ax_strip.set_ylabel("", color="#c9d1d9")
-            ax_strip.set_xlabel("ET", color="#c9d1d9")
-            ax_strip.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
-            ax_strip.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=10))
-            try:
-                col = up if strength >= 0 else down
-                ax_strip.add_patch(
-                    Rectangle(
-                        (0.0, 0.0),
-                        1.0,
-                        1.0,
-                        transform=ax_strip.transAxes,
-                        facecolor=col,
-                        edgecolor="none",
-                        alpha=min(0.65, 0.10 + abs(float(strength)) * 0.65),
-                        zorder=0.2,
+            if ax_strip is not None:
+                ax_strip.set_ylim(0, 1)
+                ax_strip.set_yticks([])
+                ax_strip.grid(False)
+                ax_strip.set_ylabel("", color="#c9d1d9")
+                ax_strip.set_xlabel("ET", color="#c9d1d9")
+                ax_strip.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+                ax_strip.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=10))
+                try:
+                    col = up if strength >= 0 else down
+                    ax_strip.add_patch(
+                        Rectangle(
+                            (0.0, 0.0),
+                            1.0,
+                            1.0,
+                            transform=ax_strip.transAxes,
+                            facecolor=col,
+                            edgecolor="none",
+                            alpha=min(0.65, 0.10 + abs(float(strength)) * 0.65),
+                            zorder=0.2,
+                        )
                     )
-                )
-                ax_strip.text(
-                    0.01,
-                    0.5,
-                    f"Strength: {strength:+.2f}",
-                    transform=ax_strip.transAxes,
-                    ha="left",
-                    va="center",
-                    fontsize=8,
-                    color="#c9d1d9",
-                )
-            except Exception:
-                pass
+                    ax_strip.text(
+                        0.01,
+                        0.5,
+                        f"Strength: {strength:+.2f}",
+                        transform=ax_strip.transAxes,
+                        ha="left",
+                        va="center",
+                        fontsize=8,
+                        color="#c9d1d9",
+                    )
+                except Exception:
+                    pass
+            else:
+                ax.set_xlabel("ET", color="#c9d1d9")
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+                ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=10))
 
             handles, labels = ax.get_legend_handles_labels()
             if labels:
@@ -10491,7 +12206,7 @@ async def htf(
                 dpi_used = None
             if dpi_used is None or dpi_used <= 0:
                 dpi_used = 180
-            fig.savefig(buf, format="png", dpi=int(dpi_used), facecolor=fig.get_facecolor())
+            fig.savefig(buf, format="png", dpi=int(dpi_used), facecolor=fig.get_facecolor(), metadata=_tnt_png_metadata())
             plt.close(fig)
 
             meta = {
@@ -10910,7 +12625,7 @@ async def gex(
 
         fig.tight_layout()
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=int(dpi_used))
+        fig.savefig(buf, format="png", dpi=int(dpi_used), metadata=_tnt_png_metadata())
         plt.close(fig)
 
         meta = {
@@ -11408,7 +13123,7 @@ async def ddp(
                 dpi = max(60, int(getattr(prof, "dpi", dpi) or dpi))
         except Exception:
             dpi = 150
-        fig.savefig(buf, format="png", dpi=dpi)
+        fig.savefig(buf, format="png", dpi=dpi, metadata=_tnt_png_metadata())
         plt.close(fig)
 
         meta = {
@@ -12082,7 +13797,7 @@ async def trade(interaction: discord.Interaction, symbol: str = "SPY", tier: str
 
     async def _htf_summary_line_from_cache(sym_key: str) -> str | None:
         try:
-            cache_key_base = f"chart_htf_png:v1:{sym_key}:1d"
+            cache_key_base = f"chart_htf_png:v2:{sym_key}:1d"
             cache_key = _gprr_cache_key(cache_key_base)
             cached = await _png_cache_get(cache_key, family="htf")
         except Exception:
@@ -12426,11 +14141,70 @@ async def on_ready() -> None:
     if bot.user is not None:
         print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
+    # Worker health probe (ops visibility): if OI is worker-required and the worker is on an
+    # older build, layout fixes will not appear even after restarting this bot.
+    try:
+        base = (os.getenv("TNT_WORKER_URL") or "").strip().rstrip("/")
+        if base:
+            import subprocess
+
+            local_build = (os.getenv("TNT_BUILD") or "").strip()
+            if not local_build:
+                try:
+                    local_build = (
+                        subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=str(Path(__file__).resolve().parents[1]))
+                        .decode("utf-8", errors="ignore")
+                        .strip()
+                    )
+                except Exception:
+                    local_build = ""
+
+            import aiohttp
+
+            async def _probe() -> None:
+                try:
+                    timeout = aiohttp.ClientTimeout(total=2.0)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.get(f"{base}/healthz") as resp:
+                            d = await resp.json(content_type=None)
+                    ok = bool(d.get("ok")) if isinstance(d, dict) else False
+                    build = str(d.get("build") or "") if isinstance(d, dict) else ""
+                    uptime_s = d.get("uptime_s") if isinstance(d, dict) else None
+                    print(f"[TNT][WORKER][HEALTH] url={base} ok={ok} build={build} uptime_s={uptime_s}")
+                    if local_build and build and build != local_build:
+                        print(f"[TNT][WORKER][WARN] build mismatch: worker={build} local={local_build} (deploy/restart worker to pick up chart fixes)")
+                except Exception as exc:
+                    print(f"[TNT][WORKER][HEALTH][WARN] probe failed url={base} err={type(exc).__name__}:{exc}")
+
+            asyncio.create_task(_probe())
+    except Exception:
+        pass
+
     # Heartbeat for watchdogs / ops.
     try:
         if not hasattr(bot, "_tnt_heartbeat_task") or getattr(bot, "_tnt_heartbeat_task") is None or getattr(bot, "_tnt_heartbeat_task").done():
             setattr(bot, "_tnt_heartbeat_task", asyncio.create_task(_heartbeat_loop()))
             print(f"[TNT] Heartbeat enabled: {_heartbeat_path()}")
+    except Exception:
+        pass
+
+    # Legacy automation loops (earnings autopost, outlooks, heartbeat, etc).
+    # Uses the env gates in delivery.discord_bot; safe to call even when disabled.
+    try:
+        if hasattr(delivery, "_ensure_tnt_automation_tasks"):
+            delivery._ensure_tnt_automation_tasks()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    # Alerts delivery loop (Redis -> Discord).
+    # This is independent of earnings + /oi and is gated by TNT_ALERTS_DISCORD_DELIVERY_ENABLED.
+    try:
+        if (
+            not hasattr(bot, "_tnt_alerts_delivery_task")
+            or getattr(bot, "_tnt_alerts_delivery_task") is None
+            or getattr(bot, "_tnt_alerts_delivery_task").done()
+        ):
+            setattr(bot, "_tnt_alerts_delivery_task", asyncio.create_task(_alerts_delivery_loop()))
     except Exception:
         pass
 
@@ -12445,6 +14219,455 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         if concierge_throttle is None or not concierge_throttle.allow_other_bot_messages_for_auto():
             return
+
+    # Channel router: enforce channel purpose rules (paper trades ack, redirects, silence).
+    try:
+        if _router_enabled is not None and _router_enabled() and _decide_route is not None:
+            ch_name = None
+            try:
+                ch_name = str(getattr(getattr(message, "channel", None), "name", None) or "")
+            except Exception:
+                ch_name = None
+
+            decision = _decide_route(channel_id=_route_channel_id(message.channel), content=message.content or "", channel_name=ch_name)
+            if decision.action == "silent":
+                return
+            if decision.action == "ack_trade_log":
+                # Prefer reaction (quiet), fallback to reply.
+                try:
+                    await message.add_reaction("✅")
+                except Exception:
+                    if decision.reply_text:
+                        try:
+                            await message.reply(decision.reply_text, mention_author=False)
+                        except Exception:
+                            pass
+                return
+            if decision.action in {"redirect", "review_only"}:
+                if decision.reply_text:
+                    try:
+                        await message.reply(decision.reply_text, mention_author=False)
+                    except Exception:
+                        pass
+                return
+    except Exception:
+        pass
+
+    # Deterministic #ask-tnt earnings embed (legacy-style, premium fields).
+    # This keeps `/oi` working by allowing a single gateway session to serve both.
+    try:
+        if await delivery.maybe_handle_ask_tnt_earnings_embed(message):
+            return
+    except Exception:
+        pass
+
+    # Deterministic macro/econ calendar (CPI/FOMC/NFP/etc). Prefer CSV (rich) with Redis fallback (gating).
+    try:
+        content = (message.content or "").strip()
+        if content and len(content) <= 220:
+            reply = _macro_calendar_render_reply(query=content)
+            if reply:
+                await message.reply(reply, mention_author=False)
+                return
+    except Exception:
+        pass
+
+    # Deterministic VWAP distance reply for common asks (e.g., "how close is spy to vwap?").
+    # Uses local DB 1m RTH bars (same pipeline source as other intraday features).
+    try:
+        content = (message.content or "").strip()
+        t = content.lower()
+        if content and len(content) <= 220 and ("vwap" in t):
+            sym = None
+            try:
+                sym = delivery._extract_symbol_from_text(content)
+            except Exception:
+                sym = None
+            if sym:
+                try:
+                    sym_norm = delivery._normalize_symbol_token(sym)
+                except Exception:
+                    sym_norm = None
+                sym = sym_norm or sym
+                # Skip crypto shorthand / non-equity tickers for this quick handler.
+                if str(sym).upper().startswith("X:"):
+                    sym = None
+
+            if sym:
+                try:
+                    print(f"[TNT][ASK][VWAP] sym={sym} channel_id={_route_channel_id(message.channel)}")
+                except Exception:
+                    pass
+
+                snap = None
+                try:
+                    snap = delivery._get_last_price_snapshot(sym)
+                except Exception:
+                    snap = None
+
+                last_px = None
+                if snap is not None and getattr(snap, "price", None) is not None:
+                    try:
+                        last_px = float(snap.price)
+                    except Exception:
+                        last_px = None
+
+                # Prefer RTH VWAP from latest session bars (volume-weighted typical price).
+                session = None
+                try:
+                    session = getattr(delivery, "_latest_session_bars")(sym)
+                except Exception:
+                    session = None
+
+                vwap = None
+                try:
+                    bars = session.get("bars") if isinstance(session, dict) else None
+                    if isinstance(bars, list) and bars:
+                        num = 0.0
+                        den = 0.0
+                        for b in bars:
+                            if not isinstance(b, dict):
+                                continue
+                            vol = float(b.get("volume") or 0.0)
+                            if vol <= 0:
+                                continue
+                            h = float(b.get("high") or 0.0)
+                            l = float(b.get("low") or 0.0)
+                            c = float(b.get("close") or 0.0)
+                            tp = (h + l + c) / 3.0
+                            num += tp * vol
+                            den += vol
+                        if den > 0:
+                            vwap = num / den
+                except Exception:
+                    vwap = None
+
+                if last_px is None:
+                    await message.reply(f"{sym} — price snapshot unavailable right now. Try `/oi {sym}`.", mention_author=False)
+                    return
+
+                if vwap is None or not math.isfinite(float(vwap)) or float(vwap) == 0.0:
+                    await message.reply(
+                        f"{sym} — VWAP unavailable right now (no fresh RTH 1m bars). Try `/vwap_range {sym}`.",
+                        mention_author=False,
+                    )
+                    return
+
+                delta = last_px - float(vwap)
+                pct = (delta / float(vwap)) * 100.0
+                side = "above" if delta >= 0 else "below"
+                await message.reply(
+                    f"{sym} VWAP (RTH): {float(vwap):.2f} | Last: {last_px:.2f} | Δ: {delta:+.2f} ({pct:+.2f}%) — {side}",
+                    mention_author=False,
+                )
+                return
+    except Exception:
+        pass
+
+    # Deterministic technical indicators for any detected ticker in #ask-tnt.
+    # Examples: "mstr rsi", "rsi mstr", "mstr macd", "mstr sma 20", "mstr ema 9", "mstr technicals".
+    # Uses local DB 1m RTH bars + last price snapshot.
+    try:
+        content = (message.content or "").strip()
+        t = content.lower()
+        full_pack = any(k in t for k in ("technicals", "technical", "indicators", "indicator", "ta"))
+        # If user posts only a bare ticker (e.g. "MSTR"), treat it like a full-pack technicals ask.
+        try:
+            bare = content.strip()
+            while bare.endswith("?") or bare.endswith("!") or bare.endswith("."):
+                bare = bare[:-1]
+            bare = bare.strip()
+            if bare.startswith("$"):
+                bare = bare[1:]
+            symbol_only = (" " not in bare) and (1 <= len(bare) <= 6) and bare.isalpha()
+        except Exception:
+            symbol_only = False
+        full_pack = full_pack or bool(symbol_only)
+
+        if content and len(content) <= 220 and (full_pack or any(k in t for k in ("rsi", "macd", "sma", "ema"))):
+            sym = None
+            try:
+                sym = delivery._extract_symbol_from_text(content)
+            except Exception:
+                sym = None
+            if sym:
+                try:
+                    sym_norm = delivery._normalize_symbol_token(sym)
+                except Exception:
+                    sym_norm = None
+                sym = sym_norm or sym
+                if str(sym).upper().startswith("X:"):
+                    sym = None
+
+            if sym:
+                snap = None
+                try:
+                    snap = delivery._get_last_price_snapshot(sym)
+                except Exception:
+                    snap = None
+
+                last_px = None
+                if snap is not None and getattr(snap, "price", None) is not None:
+                    try:
+                        last_px = float(snap.price)
+                    except Exception:
+                        last_px = None
+
+                session = None
+                try:
+                    session = getattr(delivery, "_latest_session_bars")(sym)
+                except Exception:
+                    session = None
+
+                bars = session.get("bars") if isinstance(session, dict) else None
+                if not isinstance(bars, list) or not bars:
+                    await message.reply(
+                        f"{sym} — no fresh RTH 1m bars available right now. Try `/chart {sym}`.",
+                        mention_author=False,
+                    )
+                    return
+
+                closes: list[float] = []
+                highs: list[float] = []
+                lows: list[float] = []
+                vols: list[float] = []
+                for b in bars:
+                    if not isinstance(b, dict):
+                        continue
+                    try:
+                        c = float(b.get("close"))
+                        h = float(b.get("high"))
+                        l = float(b.get("low"))
+                        v = float(b.get("volume") or 0.0)
+                    except Exception:
+                        continue
+                    closes.append(c)
+                    highs.append(h)
+                    lows.append(l)
+                    vols.append(v)
+
+                if last_px is None and closes:
+                    last_px = float(closes[-1])
+
+                if last_px is None:
+                    await message.reply(f"{sym} — price unavailable right now. Try `/oi {sym}`.", mention_author=False)
+                    return
+
+                # Parse optional periods (defaults chosen for intraday quick look).
+                words = [w for w in (t.replace("?", " ").replace(",", " ").replace("/", " ").split()) if w]
+
+                def _parse_period(keyword: str, default: int) -> int:
+                    try:
+                        for i, w in enumerate(words):
+                            if w == keyword and i + 1 < len(words) and words[i + 1].isdigit():
+                                return max(2, min(int(words[i + 1]), 500))
+                            if w.startswith(keyword) and w[len(keyword) :].isdigit():
+                                return max(2, min(int(w[len(keyword) :]), 500))
+                        return int(default)
+                    except Exception:
+                        return int(default)
+
+                rsi_n = _parse_period("rsi", 14)
+                sma_n = _parse_period("sma", 20)
+                ema_n = _parse_period("ema", 20)
+
+                def _sma_last(vals: list[float], n: int) -> float | None:
+                    if n <= 0 or len(vals) < n:
+                        return None
+                    return float(sum(vals[-n:]) / float(n))
+
+                def _ema_last(vals: list[float], n: int) -> float | None:
+                    if n <= 0 or len(vals) < n:
+                        return None
+                    alpha = 2.0 / (float(n) + 1.0)
+                    ema_val = float(vals[0])
+                    for v in vals[1:]:
+                        ema_val = (float(v) * alpha) + (ema_val * (1.0 - alpha))
+                    return float(ema_val)
+
+                # RSI + MACD via shared indicator module (fast, lightweight).
+                rsi_val = None
+                macd_val = None
+                macd_sig = None
+                macd_hist = None
+                try:
+                    from analysis import indicators as _ind
+
+                    rsi_val = _ind.rsi(closes, int(rsi_n))
+                    macd_val, macd_sig, macd_hist = _ind.macd(closes, 12, 26, 9)
+                except Exception:
+                    rsi_val = None
+                    macd_val = None
+                    macd_sig = None
+                    macd_hist = None
+
+                sma_val = _sma_last(closes, int(sma_n))
+                ema_val = _ema_last(closes, int(ema_n))
+
+                # VWAP is sometimes asked as part of "technicals"; include if user mentioned it (or asked for full pack).
+                vwap_val = None
+                if full_pack or ("vwap" in t):
+                    try:
+                        num = 0.0
+                        den = 0.0
+                        for (h, l, c, v) in zip(highs, lows, closes, vols):
+                            if v <= 0:
+                                continue
+                            tp = (float(h) + float(l) + float(c)) / 3.0
+                            num += tp * float(v)
+                            den += float(v)
+                        if den > 0:
+                            vwap_val = num / den
+                    except Exception:
+                        vwap_val = None
+
+                parts: list[str] = []
+                if full_pack or ("rsi" in t):
+                    if isinstance(rsi_val, (int, float)):
+                        tag = "neutral"
+                        if float(rsi_val) >= 70:
+                            tag = "overbought"
+                        elif float(rsi_val) <= 30:
+                            tag = "oversold"
+                        parts.append(f"RSI({int(rsi_n)}): {float(rsi_val):.1f} ({tag})")
+                    else:
+                        parts.append(f"RSI({int(rsi_n)}): n/a")
+
+                if full_pack or ("macd" in t):
+                    if all(isinstance(x, (int, float)) for x in (macd_val, macd_sig, macd_hist)):
+                        parts.append(f"MACD: {float(macd_val):+.3f} | Sig: {float(macd_sig):+.3f} | Hist: {float(macd_hist):+.3f}")
+                    else:
+                        parts.append("MACD: n/a")
+
+                if full_pack or ("sma" in t):
+                    if isinstance(sma_val, (int, float)):
+                        d = float(last_px) - float(sma_val)
+                        p = (d / float(sma_val) * 100.0) if float(sma_val) else 0.0
+                        side = "above" if d >= 0 else "below"
+                        parts.append(f"SMA({int(sma_n)}): {float(sma_val):.2f} (Δ {d:+.2f} {p:+.2f}%, {side})")
+                    else:
+                        parts.append(f"SMA({int(sma_n)}): n/a")
+
+                if full_pack or ("ema" in t):
+                    if isinstance(ema_val, (int, float)):
+                        d = float(last_px) - float(ema_val)
+                        p = (d / float(ema_val) * 100.0) if float(ema_val) else 0.0
+                        side = "above" if d >= 0 else "below"
+                        parts.append(f"EMA({int(ema_n)}): {float(ema_val):.2f} (Δ {d:+.2f} {p:+.2f}%, {side})")
+                    else:
+                        parts.append(f"EMA({int(ema_n)}): n/a")
+
+                if vwap_val is not None and math.isfinite(float(vwap_val)) and float(vwap_val) != 0.0:
+                    d = float(last_px) - float(vwap_val)
+                    p = (d / float(vwap_val) * 100.0)
+                    side = "above" if d >= 0 else "below"
+                    parts.append(f"VWAP(RTH): {float(vwap_val):.2f} (Δ {d:+.2f} {p:+.2f}%, {side})")
+
+                if parts:
+                    await message.reply(f"{sym} | Last: {float(last_px):.2f} | " + " • ".join(parts), mention_author=False)
+                    return
+    except Exception:
+        pass
+
+    # Deterministic paper-trade summary (lightweight). Answers questions like "any paper trades today?".
+    try:
+        content = (message.content or "").strip()
+        t = content.lower()
+        if content and len(content) <= 160 and ("paper" in t) and ("trade" in t or "trades" in t) and ("today" in t):
+            et_date = None
+            try:
+                et_date = delivery._now_et().date()
+            except Exception:
+                et_date = None
+
+            # Canonical source of truth: SQLite paperdesk_trades.
+            try:
+                import sqlite3
+
+                day = et_date.isoformat() if et_date else None
+                db_path = (os.getenv("DB_PATH") or "db/tnt.db").strip() or "db/tnt.db"
+                conn = sqlite3.connect(db_path)
+                try:
+                    if day:
+                        row = conn.execute(
+                            "SELECT "
+                            "SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) AS open_n, "
+                            "SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) AS closed_n, "
+                            "COALESCE(SUM(CASE WHEN status='CLOSED' THEN result_r ELSE 0 END), 0) AS net_r "
+                            "FROM paperdesk_trades WHERE day=?",
+                            (day,),
+                        ).fetchone()
+                        open_n = int(row[0] or 0) if row else 0
+                        closed_n = int(row[1] or 0) if row else 0
+                        net_r = float(row[2] or 0.0) if row else 0.0
+
+                        if open_n or closed_n:
+                            await message.reply(
+                                f"Paper trades today ({day} ET): open={open_n} | closed={closed_n} | netR={net_r:+.2f}",
+                                mention_author=False,
+                            )
+                            return
+
+                    last = conn.execute("SELECT MAX(day) FROM paperdesk_trades").fetchone()
+                    last_day = (str(last[0]) if last and last[0] else "")
+                finally:
+                    conn.close()
+
+                if et_date and last_day:
+                    await message.reply(
+                        f"No paper trades recorded today ({et_date.isoformat()} ET). Last paperdesk trade day in DB: {last_day}.",
+                        mention_author=False,
+                    )
+                elif et_date:
+                    await message.reply(f"No paper trades recorded today ({et_date.isoformat()} ET).", mention_author=False)
+                else:
+                    await message.reply("No paper trades recorded today.", mention_author=False)
+                return
+            except Exception:
+                # DB not available / schema missing. Fall back to the old log-based behavior.
+                if et_date:
+                    await message.reply(f"No paper trades recorded today ({et_date.isoformat()} ET).", mention_author=False)
+                else:
+                    await message.reply("No paper trades recorded today.", mention_author=False)
+                return
+    except Exception:
+        pass
+
+    # Deterministic SPY quick reply for plain-text asks (avoid AI routes / silence).
+    # This is intentionally narrow to avoid chatter.
+    try:
+        content = (message.content or "").strip()
+        t = content.lower()
+        if content and len(content) <= 140 and ("earnings" not in t):
+            # Only fire for lightweight "what is SPY doing" / "SPY price" style asks.
+            mentions_spy = "spy" in t.split() or t.startswith("spy") or " spy" in t
+            asks_pricey = any(k in t for k in ("price", "quote", "status", "doing", "today", "now", "at "))
+            if mentions_spy and asks_pricey:
+                try:
+                    print(f"[TNT][ASK][SNAPSHOT] sym=SPY channel_id={_route_channel_id(message.channel)}")
+                except Exception:
+                    pass
+                snap = None
+                try:
+                    snap = delivery._get_last_price_snapshot("SPY")
+                except Exception:
+                    snap = None
+
+                # delivery._get_last_price_snapshot returns market_data.last_price.LastPrice.
+                if snap is not None and getattr(snap, "price", None) is not None and getattr(snap, "asof_et", None) is not None:
+                    try:
+                        block = delivery.format_last_price_block(snap)
+                    except Exception:
+                        block = None
+                    if block:
+                        await message.reply(block, mention_author=False)
+                    else:
+                        await message.reply(f"SPY — {float(snap.price):.2f}", mention_author=False)
+                else:
+                    await message.reply("SPY — price snapshot unavailable right now. Try `/oi SPY`." , mention_author=False)
+                return
+    except Exception:
+        pass
 
     # Concierge is additive; it must not block normal command handling.
     try:
@@ -12510,8 +14733,17 @@ if __name__ == "__main__":
         try:
             lock_dir = Path("logs")
             lock_dir.mkdir(parents=True, exist_ok=True)
-            lock_path = lock_dir / "tnt_discord_bot.lock"
+            safe_entry = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in _TNT_ENTRYPOINT)
+            lock_path = lock_dir / f"tnt_discord_bot.{safe_entry}.lock"
             fh = open(lock_path, "a+", encoding="utf-8")
+
+            # Ensure the lock handle is not inheritable. If a child process inherits
+            # this handle, it can appear to "also" hold the singleton lock and we end
+            # up with two running bot processes.
+            try:
+                os.set_inheritable(fh.fileno(), False)
+            except Exception:
+                pass
 
             try:
                 # Windows: msvcrt lock (non-blocking)
@@ -12561,6 +14793,13 @@ if __name__ == "__main__":
         print("[FATAL] Another TNT Discord bot process is already running (singleton lock active).")
         print("        Stop the other process or set TNT_ALLOW_MULTIPLE_BOTS=1 to override.")
         raise SystemExit(2)
+
+    # Load repo env files so feature gates work in dev/prod shells.
+    # This is intentionally after singleton lock so duplicate runs don't thrash env parsing.
+    try:
+        _dotenv_load_into_environ()
+    except Exception:
+        pass
 
     _print_start_banner()
     _print_env_snapshot()
