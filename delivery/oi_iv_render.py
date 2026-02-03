@@ -353,23 +353,12 @@ def render_oi_iv_png(
     except Exception:
         pass
 
-    # Title smaller/tighter, with a light subheader.
-    # Place these slightly above the axes so they don't cover the IV overlay.
-    ax.set_title(title, color="#c9d1d9", fontsize=11, pad=0, loc="left", y=1.11)
+    # Title + light subheader.
+    # Use fig-level text so it never overlaps/clips regardless of backend.
     try:
         sub = f"{n} strikes  •  IV overlay {'on' if include_iv_overlay else 'off'}"
-        ax.text(
-            0.0,
-            1.07,
-            sub,
-            transform=ax.transAxes,
-            ha="left",
-            va="bottom",
-            fontsize=8.5,
-            color="#8b949e",
-            alpha=0.85,
-            clip_on=False,
-        )
+        fig.text(0.06, 0.965, str(title or ""), ha="left", va="top", fontsize=11, color="#c9d1d9")
+        fig.text(0.06, 0.935, sub, ha="left", va="top", fontsize=8.5, color="#8b949e", alpha=0.85)
     except Exception:
         pass
     ax.set_xlabel("Strike", color="#c9d1d9")
@@ -509,8 +498,8 @@ def render_oi_iv_png(
         except Exception:
             bottom = 0.18
         bottom = max(0.02, min(0.30, float(bottom)))
-        # Leave extra headroom for title/subheader placed above the axes.
-        fig.tight_layout(rect=(0.06, bottom, 0.985, 0.90))
+        # Leave extra headroom for fig-level title/subheader.
+        fig.tight_layout(rect=(0.06, bottom, 0.985, 0.88))
     except Exception:
         pass
     dpi_used = int(dpi) if int(dpi) > 0 else 150
