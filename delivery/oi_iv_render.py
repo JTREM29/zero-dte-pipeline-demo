@@ -282,6 +282,7 @@ def render_oi_iv_png(
         pass
 
     ax2 = None
+    wall_callout_drawn = False
     if bool(include_iv_overlay):
         ax2 = ax.twinx()
         style_tnt_dark_axes(ax2, grid=False)
@@ -348,6 +349,7 @@ def render_oi_iv_png(
                     bbox={"facecolor": "#0b0f14", "edgecolor": "#2d333b", "alpha": 0.65, "pad": 2.5},
                     zorder=5,
                 )
+                wall_callout_drawn = True
     except Exception:
         pass
 
@@ -372,6 +374,9 @@ def render_oi_iv_png(
 
     # One decisive takeaway (top-right).
     try:
+        # If a wall callout is already present (soft-cap), avoid duplicating the same message.
+        if bool(wall_callout_drawn):
+            raise RuntimeError("skip_takeaway_when_wall_callout")
         put_i = int(max(range(n), key=lambda i: float(oi_puts_pos[i]) if oi_puts_pos else 0.0))
         call_i = int(max(range(n), key=lambda i: float(oi_calls_pos[i]) if oi_calls_pos else 0.0))
         put_max = float(oi_puts_pos[put_i])
