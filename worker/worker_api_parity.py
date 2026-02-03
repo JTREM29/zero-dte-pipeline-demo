@@ -134,6 +134,10 @@ async def healthz(_: Request) -> JSONResponse:
             "build": _build_id(),
             "service": "tnt-worker-parity",
             "oi_iv_render_sha": (_sha256_file(oi_path)[:12] if oi_path else ""),
+            "module_file": __file__,
+            "repo_root": _REPO_ROOT,
+            "python": sys.version.split(" ")[0],
+            "executable": sys.executable,
         }
     )
 
