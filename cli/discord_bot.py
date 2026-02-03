@@ -903,6 +903,31 @@ def _render_oi_iv_png_warm(
     except Exception:
         return None
 
+    # Prefer the shared premium v2 renderer so warm-cache outputs match live/worker output
+    # (and inherit the tick-label anti-clipping guards).
+    try:
+        from delivery.oi_iv_render import render_oi_iv_png as _render_premium_oi_iv_png
+
+        dpi_used = 150
+        try:
+            dpi_used = int(os.getenv("TNT_OI_IV_DPI", "150"))
+        except Exception:
+            dpi_used = 150
+
+        png = _render_premium_oi_iv_png(
+            title=str(title or "").strip() or "OI/IV",
+            x_labels=list(x_labels),
+            iv_pct=list(iv_pct or []),
+            oi_calls=list(oi_calls),
+            oi_puts=list(oi_puts),
+            dpi=int(dpi_used) if int(dpi_used) > 0 else 150,
+            include_iv_overlay=bool(include_iv_overlay),
+        )
+        if isinstance(png, (bytes, bytearray)) and png:
+            return bytes(png)
+    except Exception:
+        pass
+
     if not x_labels:
         return None
 
@@ -1214,7 +1239,7 @@ async def run_cache_warm_cycle() -> None:
                         v_stamp = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
                         stamp_key = "sv1" if (allow_stamp in truthy and v_stamp in truthy) else "sv0"
 
-                        base = f"oi_png:v7:{sym}:strike:{exp}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
+                        base = f"oi_png:v11:{sym}:strike:{exp}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
                         key = _gprr_cache_key(base)
                         existing = await _png_cache_get(key, family="oi")
                         if existing is not None and existing[0]:
@@ -1468,8 +1493,18 @@ def _sanitize_worker_png_bytes(png_bytes: bytes, *, force: bool = False) -> tupl
     except Exception:
         sanitize_always = False
 
-    # When asked to sanitize worker OI charts, treat redaction as non-negotiable.
+    # IMPORTANT: heuristic wiping can false-positive on chart tick labels and
+    # create visible artifacts (small black rectangles) in Discord screenshots.
+    # Only sanitize when the worker explicitly indicates debug stamping,
+    # unless an operator explicitly forces it.
     force = bool(force)
+
+    sanitize_heuristic = False
+    try:
+        truthy = {"1", "true", "yes", "y", "on"}
+        sanitize_heuristic = (os.getenv("TNT_WORKER_SANITIZE_HEURISTIC", "0") or "0").strip().lower() in truthy
+    except Exception:
+        sanitize_heuristic = False
 
     try:
         from PIL import Image
@@ -1493,6 +1528,11 @@ def _sanitize_worker_png_bytes(png_bytes: bytes, *, force: bool = False) -> tupl
         except Exception:
             stamp_debug = False
             stamp_pos = ""
+
+        # Default: no heuristic wiping unless stamping is explicitly indicated.
+        # This prevents wiping/cropping strike tick labels (the "6." fragments).
+        if not (sanitize_always or force or stamp_debug or sanitize_heuristic):
+            return png_bytes, False, "skip_no_stamp_meta"
 
         # If metadata doesn't explicitly indicate debug stamping, still attempt a
         # conservative heuristic in the bottom corners. We only wipe when a
@@ -1688,9 +1728,15 @@ async def _worker_post_oi_iv_png(payload: dict[str, object], *, sanitize: bool) 
             png = bytes(data)
             if not sanitize:
                 return png
-            out_png, did, reason = _sanitize_worker_png_bytes(png, force=True)
+            force_sanitize = False
             try:
-                print(f"[TNT][OI][SANITIZE] SANITIZE={1 if did else 0} reason={reason}")
+                truthy = {"1", "true", "yes", "y", "on"}
+                force_sanitize = (os.getenv("TNT_WORKER_SANITIZE_FORCE", "0") or "0").strip().lower() in truthy
+            except Exception:
+                force_sanitize = False
+            out_png, did, reason = _sanitize_worker_png_bytes(png, force=force_sanitize)
+            try:
+                print(f"[TNT][OI][SANITIZE] SANITIZE={1 if did else 0} force={1 if force_sanitize else 0} reason={reason}")
             except Exception:
                 pass
 
@@ -1698,10 +1744,15 @@ async def _worker_post_oi_iv_png(payload: dict[str, object], *, sanitize: bool) 
             try:
                 meta = _read_png_text_metadata(out_png)
                 layout = str(meta.get("tnt_oi_iv_layout") or "")
+                palette = str(meta.get("tnt_oi_iv_palette") or "")
+                wm = str(meta.get("tnt_oi_iv_watermark") or "")
                 b = str(meta.get("tnt_build") or "")
                 tag = str(meta.get("tnt_render_tag") or "")
-                if layout or b or tag:
-                    print(f"[TNT][OI][WORKER][META] layout={layout or '-'} build={b or '-'} tag={tag or '-'}")
+                if layout or palette or wm or b or tag:
+                    print(
+                        f"[TNT][OI][WORKER][META] layout={layout or '-'} palette={palette or '-'} watermark={wm or '-'} "
+                        f"build={b or '-'} tag={tag or '-'}"
+                    )
             except Exception:
                 pass
             return out_png
@@ -3314,8 +3365,8 @@ async def tnt_health(interaction: discord.Interaction) -> None:
         any_present = 0
         fresh_present = 0
         for s in OI_WARMED:
-            # v6 is current; keep older versions for backward visibility while they drain.
-            prefixes = (f"oi_png:v7:{s}:", f"oi_png:v6:{s}:", f"oi_png:v5:{s}:", f"oi_png:v4:{s}:", f"oi_png:v3:{s}:", f"oi_png:v2:{s}:")
+            # v11 is current; keep older versions for backward visibility while they drain.
+            prefixes = (f"oi_png:v11:{s}:", f"oi_png:v10:{s}:", f"oi_png:v9:{s}:", f"oi_png:v8:{s}:", f"oi_png:v7:{s}:", f"oi_png:v6:{s}:", f"oi_png:v5:{s}:", f"oi_png:v4:{s}:", f"oi_png:v3:{s}:", f"oi_png:v2:{s}:")
             has_any = False
             has_fresh = False
             for k, entry in _oi_items:
@@ -9531,7 +9582,7 @@ async def oi(
     v_stamp = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
     stamp_key = "sv1" if (allow_stamp in truthy and v_stamp in truthy) else "sv0"
 
-    cache_key_png = f"oi_png:v7:{sym}:{by_norm}:{exp_for_key}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
+    cache_key_png = f"oi_png:v11:{sym}:{by_norm}:{exp_for_key}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
     cache_key_png_full = _gprr_cache_key(cache_key_png)
 
     # Always print the cache key used for this request (helps debug stale cache vs fresh render).
@@ -9962,6 +10013,23 @@ async def oi(
         include_iv_overlay: bool = True,
         **_kwargs,
     ) -> bytes | None:
+        # Prefer the shared premium renderer so warm-cache images match live /oi output.
+        try:
+            from delivery.oi_iv_render import render_oi_iv_png as _shared_render
+
+            return _shared_render(
+                title=str(title),
+                x_labels=list(x_labels),
+                iv_pct=list(iv_pct) if iv_pct else [],
+                oi_calls=list(oi_calls),
+                oi_puts=list(oi_puts),
+                dpi=150,
+                include_iv_overlay=bool(include_iv_overlay),
+            )
+        except Exception:
+            # Fall back to a minimal local renderer if shared import fails.
+            pass
+
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -9993,9 +10061,9 @@ async def oi(
 
         _add_tnt_watermark(ax)
 
-        call_color = "#00ff66"
-        put_color = "#ff3344"
-        line_color = "#ffa657"
+        call_color = "#4C78A8"  # TNT muted blue
+        put_color = "#E45756"   # TNT muted red
+        line_color = "#8b949e"  # muted gray
 
         if oi_calls is not None and oi_puts is not None:
             width = 0.38
@@ -10004,6 +10072,10 @@ async def oi(
         else:
             ax.bar(xs, oi_total or [], color=call_color, alpha=0.45, label="OI")
         ax.set_ylabel("Open interest", color="#c9d1d9")
+        try:
+            ax.set_ylim(bottom=0.0)
+        except Exception:
+            pass
         ax.grid(True, alpha=0.12, linestyle="--")
         ax.yaxis.tick_right()
         ax.yaxis.set_label_position("right")
@@ -10192,11 +10264,7 @@ async def oi(
             )
             try:
                 rows = int(len(df)) if df is not None else 0
-                print(f"[TNT][OI][PERF] render_mode=local symbol={sym} fetch_s={time.perf_counter()-tf0:.2f} rows={rows} total_s={time.perf_counter()-t0:.2f}")
-            except Exception:
-                pass
-            try:
-                print(f"[TNT][OI][PROOF] render_mode=local symbol={sym} key={cache_key_png_full}")
+                print(f"[TNT][OI][FETCH] symbol={sym} fetch_s={time.perf_counter()-tf0:.2f} rows={rows} total_s={time.perf_counter()-t0:.2f}")
             except Exception:
                 pass
             if df is None or getattr(df, "empty", True):
@@ -10244,6 +10312,20 @@ async def oi(
                 iv_pct2 = [iv_pct2[i] for i in keep_sorted]
 
             labels = [f"{s:g}" for s in strikes2]
+
+            # Final guardrail: enforce OI bars are finite and >= 0 before any render (worker or local).
+            # This prevents baseline artifacts when negative/NaN values sneak in from upstream joins.
+            def _pos(v: object) -> float:
+                try:
+                    x = float(v)
+                except Exception:
+                    return 0.0
+                if not math.isfinite(x):
+                    return 0.0
+                return x if x > 0.0 else 0.0
+
+            oi_calls2 = [_pos(v) for v in list(oi_calls2)]
+            oi_puts2 = [_pos(v) for v in list(oi_puts2)]
 
             # Spot marker (best-effort) using underlying_price from snapshots.
             spot_idx = None
@@ -10334,6 +10416,29 @@ async def oi(
                     "include_iv_overlay": bool(include_iv),
                     "x_label": "Strike",
                 }
+
+                # Optional: renderer layout tuning for tick label clipping.
+                # These are consumed by the parity worker (worker/worker_api_parity.py) and
+                # are ignored by older workers.
+                try:
+                    raw_bottom = (os.getenv("TNT_OI_IV_LAYOUT_BOTTOM", "") or "").strip()
+                    if raw_bottom:
+                        bottom = float(raw_bottom)
+                        if 0.02 <= bottom <= 0.30:
+                            payload["layout_bottom"] = float(bottom)
+                except Exception:
+                    pass
+                try:
+                    truthy = {"1", "true", "yes", "y", "on"}
+                    # Bulletproof default: in deterministic worker parity mode, always save with tight bbox
+                    # to prevent strike tick label clipping across backends/Discord screenshots.
+                    # In strict parity mode, only enable if explicitly requested (to avoid pixel mismatch).
+                    if _oi_worker_parity_mode() == "deterministic":
+                        payload["save_bbox_tight"] = True
+                    elif (os.getenv("TNT_OI_IV_SAVE_BBOX_TIGHT", "0") or "0").strip().lower() in truthy:
+                        payload["save_bbox_tight"] = True
+                except Exception:
+                    pass
                 png0 = await _worker_render_oi_iv_payload_png(payload)
                 render_mode = "worker"
                 try:
@@ -10409,6 +10514,10 @@ async def oi(
             png = await asyncio.to_thread(_render_local_shared)
             try:
                 print(f"[TNT][OI][PERF] render_mode=local symbol={sym} mpl_s={time.perf_counter()-tr0:.2f}")
+            except Exception:
+                pass
+            try:
+                print(f"[TNT][OI][PROOF] render_mode=local symbol={sym} key={cache_key_png_full}")
             except Exception:
                 pass
             if not png:
