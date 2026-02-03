@@ -7,6 +7,7 @@ import sys
 import struct
 import subprocess
 import time
+import traceback
 from typing import Any
 
 from starlette.applications import Starlette
@@ -160,8 +161,18 @@ async def render_smoke(_: Request) -> Response:
         plt.close(fig)
         data = buf.getvalue()
     except Exception as exc:
+        tb = traceback.format_exc()
+        if len(tb) > 6000:
+            tb = tb[:6000] + "\n... (truncated)"
         return JSONResponse(
-            {"ok": False, "error": f"smoke_render_failed:{type(exc).__name__}:{exc}"},
+            {
+                "ok": False,
+                "error": f"smoke_render_failed:{type(exc).__name__}:{exc}",
+                "traceback": tb,
+                "cwd": os.getcwd(),
+                "executable": sys.executable,
+                "python": sys.version.split(" ")[0],
+            },
             status_code=500,
         )
 
@@ -240,8 +251,18 @@ async def render_oi_iv(request: Request) -> Response:
             },
         )
     except Exception as exc:
+        tb = traceback.format_exc()
+        if len(tb) > 6000:
+            tb = tb[:6000] + "\n... (truncated)"
         return JSONResponse(
-            {"ok": False, "error": f"bad_payload:{type(exc).__name__}:{exc}"},
+            {
+                "ok": False,
+                "error": f"bad_payload:{type(exc).__name__}:{exc}",
+                "traceback": tb,
+                "cwd": os.getcwd(),
+                "executable": sys.executable,
+                "python": sys.version.split(" ")[0],
+            },
             status_code=400,
         )
 
