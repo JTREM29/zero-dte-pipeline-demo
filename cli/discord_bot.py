@@ -1214,7 +1214,7 @@ async def run_cache_warm_cycle() -> None:
                         v_stamp = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
                         stamp_key = "sv1" if (allow_stamp in truthy and v_stamp in truthy) else "sv0"
 
-                        base = f"oi_png:v5:{sym}:strike:{exp}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
+                        base = f"oi_png:v7:{sym}:strike:{exp}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
                         key = _gprr_cache_key(base)
                         existing = await _png_cache_get(key, family="oi")
                         if existing is not None and existing[0]:
@@ -1613,6 +1613,26 @@ def _sanitize_worker_png_bytes(png_bytes: bytes, *, force: bool = False) -> tupl
         return png_bytes, False, "sanitize_exception"
 
 
+def _read_png_text_metadata(png_bytes: bytes) -> dict[str, str]:
+    """Best-effort read of PNG tEXt metadata (invisible attribution/version tags)."""
+
+    try:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(png_bytes))
+        im.load()
+        info = getattr(im, "text", None)
+        if isinstance(info, dict):
+            out: dict[str, str] = {}
+            for k, v in info.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    out[k] = v
+            return out
+    except Exception:
+        pass
+    return {}
+
+
 async def _worker_render_oi_iv_payload_png(payload: dict[str, object]) -> bytes:
     """Ask TNT worker to render OI/IV from a deterministic payload."""
 
@@ -1623,6 +1643,25 @@ async def _worker_post_oi_iv_png(payload: dict[str, object], *, sanitize: bool) 
     base = _normalize_worker_base(os.getenv("TNT_WORKER_URL", "") or "")
     if not base:
         raise RuntimeError("TNT_WORKER_URL not set")
+
+    # When /oi is worker-required, ensure we're talking to the parity worker API.
+    # Otherwise we can silently hit a legacy worker that renders the old stacked layout.
+    try:
+        if _oi_worker_mode() == "required":
+            import aiohttp
+
+            timeout_h = aiohttp.ClientTimeout(total=2.0)
+            async with aiohttp.ClientSession(timeout=timeout_h) as s:
+                async with s.get(f"{base}/healthz") as r:
+                    hz = await r.json(content_type=None)
+            svc = str(hz.get("service") or "") if isinstance(hz, dict) else ""
+            if svc and svc != "tnt-worker-parity":
+                raise RuntimeError(f"worker_wrong_service:{svc}")
+            if not svc:
+                raise RuntimeError("worker_missing_service")
+    except Exception:
+        # Bubble up: caller decides whether to fall back or error (required mode errors).
+        raise
 
     import aiohttp
 
@@ -1652,6 +1691,17 @@ async def _worker_post_oi_iv_png(payload: dict[str, object], *, sanitize: bool) 
             out_png, did, reason = _sanitize_worker_png_bytes(png, force=True)
             try:
                 print(f"[TNT][OI][SANITIZE] SANITIZE={1 if did else 0} reason={reason}")
+            except Exception:
+                pass
+
+            # Proof (in logs only): confirm which OI/IV layout the worker actually rendered.
+            try:
+                meta = _read_png_text_metadata(out_png)
+                layout = str(meta.get("tnt_oi_iv_layout") or "")
+                b = str(meta.get("tnt_build") or "")
+                tag = str(meta.get("tnt_render_tag") or "")
+                if layout or b or tag:
+                    print(f"[TNT][OI][WORKER][META] layout={layout or '-'} build={b or '-'} tag={tag or '-'}")
             except Exception:
                 pass
             return out_png
@@ -1772,7 +1822,12 @@ async def _oi_worker_payload_renderer_ok() -> bool:
                 state["reason"] = "worker_empty"
                 return False
         except Exception as exc:
-            state["reason"] = f"worker_fail:{type(exc).__name__}"
+            msg = str(exc) if exc is not None else ""
+            if msg.startswith("worker_"):
+                # Preserve actionable worker identity/contract failures.
+                state["reason"] = msg
+            else:
+                state["reason"] = f"worker_fail:{type(exc).__name__}"
             return False
 
         w1h = _sha256_pixels_png(bytes(w1))
@@ -3259,8 +3314,8 @@ async def tnt_health(interaction: discord.Interaction) -> None:
         any_present = 0
         fresh_present = 0
         for s in OI_WARMED:
-            # v3 is current; keep v2 for backward visibility while it drains.
-            prefixes = (f"oi_png:v5:{s}:", f"oi_png:v4:{s}:", f"oi_png:v3:{s}:", f"oi_png:v2:{s}:")
+            # v6 is current; keep older versions for backward visibility while they drain.
+            prefixes = (f"oi_png:v7:{s}:", f"oi_png:v6:{s}:", f"oi_png:v5:{s}:", f"oi_png:v4:{s}:", f"oi_png:v3:{s}:", f"oi_png:v2:{s}:")
             has_any = False
             has_fresh = False
             for k, entry in _oi_items:
@@ -9476,7 +9531,7 @@ async def oi(
     v_stamp = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
     stamp_key = "sv1" if (allow_stamp in truthy and v_stamp in truthy) else "sv0"
 
-    cache_key_png = f"oi_png:v5:{sym}:{by_norm}:{exp_for_key}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
+    cache_key_png = f"oi_png:v7:{sym}:{by_norm}:{exp_for_key}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
     cache_key_png_full = _gprr_cache_key(cache_key_png)
 
     # Always print the cache key used for this request (helps debug stale cache vs fresh render).
@@ -10261,7 +10316,12 @@ async def oi(
             # Preferred: worker renders from our deterministic payload (parity, no symbol ambiguity).
             try:
                 if not (await _oi_worker_payload_renderer_ok()):
-                    raise RuntimeError("worker_parity_disabled")
+                    try:
+                        reason = str(_OI_WORKER_OI_IV_PARITY.get("reason") or "")
+                    except Exception:
+                        reason = ""
+                    reason = reason or "unknown"
+                    raise RuntimeError(f"worker_parity_disabled:{reason}")
                 tw0 = time.perf_counter()
                 payload: dict[str, object] = {
                     "symbol": sym,
@@ -11611,7 +11671,7 @@ async def htf(
         pass
 
     ttl_sec = max(int(os.getenv("TNT_TTL_HTF_PNG_SEC", "60")), 10)
-    cache_key_base = f"chart_htf_png:v2:{sym_fetch}:1d"
+    cache_key_base = f"chart_htf_png:v3:{sym_fetch}:1d"
     cache_key = _gprr_cache_key(cache_key_base)
 
     async def _cache_get(_key: str):
@@ -12022,7 +12082,49 @@ async def htf(
             # HTF watermark should whisper, not compete with price action.
             _add_tnt_watermark(ax, alpha=0.025, fontsize=52)
 
-            xnums = mdates.date2num(xs_p)
+            # Plot arrays (may be filtered for egregious outliers that can blow out y-limits).
+            xs_plot = list(xs_p)
+            opens_plot = list(opens_p)
+            closes_plot = list(closes_p)
+            highs_plot = list(highs_p)
+            lows_plot = list(lows_p)
+
+            # Drop extreme outliers (e.g., a single bad bar) so y-limits don't get dragged
+            # to absurd ranges like ~100 when price is ~700.
+            try:
+                closes_clean = [float(c) for c in closes_plot if isinstance(c, (int, float)) and float(c) > 0 and (not math.isnan(float(c)))]
+                if closes_clean and len(closes_clean) >= 30:
+                    c_sorted = sorted(closes_clean)
+                    med = float(c_sorted[len(c_sorted) // 2])
+                    if med > 0:
+                        lo_bound = med / 4.0
+                        hi_bound = med * 4.0
+                        keep = []
+                        for i in range(len(closes_plot)):
+                            try:
+                                c = float(closes_plot[i])
+                                h = float(highs_plot[i])
+                                l = float(lows_plot[i])
+                                o = float(opens_plot[i])
+                            except Exception:
+                                continue
+                            if any(math.isnan(v) for v in (c, h, l, o)):
+                                continue
+                            if c <= 0 or h <= 0 or l <= 0:
+                                continue
+                            if (c < lo_bound) or (c > hi_bound) or (h < lo_bound) or (h > hi_bound) or (l < lo_bound) or (l > hi_bound):
+                                continue
+                            keep.append(i)
+                        if len(keep) >= 30 and len(keep) < len(closes_plot):
+                            xs_plot = [xs_plot[i] for i in keep]
+                            opens_plot = [opens_plot[i] for i in keep]
+                            closes_plot = [closes_plot[i] for i in keep]
+                            highs_plot = [highs_plot[i] for i in keep]
+                            lows_plot = [lows_plot[i] for i in keep]
+            except Exception:
+                pass
+
+            xnums = mdates.date2num(xs_plot)
             dx = (xnums[1] - xnums[0]) if len(xnums) > 1 else 1.0
             w = max(dx * 0.75, 1e-6)
             up = "#00ff66"
@@ -12030,16 +12132,16 @@ async def htf(
             wick = "#c9d1d9"
 
             for i in range(len(xnums)):
-                o = float(opens_p[i])
-                c = float(closes_p[i])
-                h = float(highs_p[i])
-                l = float(lows_p[i])
+                o = float(opens_plot[i])
+                c = float(closes_plot[i])
+                h = float(highs_plot[i])
+                l = float(lows_plot[i])
                 col = up if c >= o else down
                 ax.vlines(xnums[i], l, h, color=wick, linewidth=0.6, alpha=0.9)
                 body_low = min(o, c)
                 body_h = abs(c - o)
                 if body_h <= 0:
-                    body_h = max((max(closes_p) - min(closes_p)) * 0.0002, 1e-6)
+                    body_h = max((max(closes_plot) - min(closes_plot)) * 0.0002, 1e-6)
                 ax.add_patch(
                     Rectangle(
                         (xnums[i] - w / 2.0, body_low),
@@ -12054,18 +12156,69 @@ async def htf(
                 )
 
             try:
-                if sma20 is not None:
-                    s20 = _sma(closes_p, 20)
+                if len(closes_plot) >= 25:
+                    s20 = _sma(closes_plot, 20)
                     ax.plot(xnums, s20, linewidth=1.05, color="#ffa657", alpha=0.95, label="SMA20")
-                if sma50 is not None:
-                    s50 = _sma(closes_p, 50)
+                if len(closes_plot) >= 55:
+                    s50 = _sma(closes_plot, 50)
                     ax.plot(xnums, s50, linewidth=1.05, color="#a371f7", alpha=0.95, label="SMA50")
             except Exception:
                 pass
 
+            # Compute y-bounds from the visible plotted candles.
+            y_bounds = None
+            y_pad = None
+            try:
+                lows_clean = [float(v) for v in lows_plot if isinstance(v, (int, float)) and float(v) > 0 and (not math.isnan(float(v)))]
+                highs_clean = [float(v) for v in highs_plot if isinstance(v, (int, float)) and float(v) > 0 and (not math.isnan(float(v)))]
+                if lows_clean and highs_clean:
+                    lo = min(lows_clean)
+                    hi = max(highs_clean)
+                    pad = (hi - lo) * 0.05 if hi > lo else (hi * 0.01)
+                    ymin = (lo - pad) if pad > 0 else (lo * 0.995)
+                    ymax = (hi + pad) if pad > 0 else (hi * 1.005)
+                    if ymax > ymin:
+                        y_bounds = (float(ymin), float(ymax))
+                        y_pad = float(pad)
+            except Exception:
+                y_bounds = None
+                y_pad = None
+
+            # Compute guide levels from the plotted window (not the full history).
+            lvl_hi20_plot = None
+            lvl_lo20_plot = None
+            sma50_plot = None
+            try:
+                if len(highs_plot) >= 21:
+                    lvl_hi20_plot = max(float(v) for v in highs_plot[-20:])
+                if len(lows_plot) >= 21:
+                    lvl_lo20_plot = min(float(v) for v in lows_plot[-20:])
+                if len(closes_plot) >= 55:
+                    sma50_plot = float(_sma(closes_plot, 50)[-1])
+            except Exception:
+                lvl_hi20_plot = None
+                lvl_lo20_plot = None
+                sma50_plot = None
+
+            def _level_in_view(lvl: float | None) -> bool:
+                if lvl is None:
+                    return False
+                try:
+                    lv = float(lvl)
+                except Exception:
+                    return False
+                if y_bounds is None:
+                    return True
+                ymin, ymax = float(y_bounds[0]), float(y_bounds[1])
+                pad = float(y_pad) if (y_pad is not None and y_pad > 0) else (ymax - ymin) * 0.05
+                # Only draw if within the visible band (+ generous margin).
+                return (lv >= (ymin - 3.0 * pad)) and (lv <= (ymax + 3.0 * pad))
+
             if state in {"WATCH", "ON"}:
-                for lvl, name in ((lvl_hi20, "HI20"), (lvl_lo20, "LO20"), (sma50, "SMA50")):
+                for lvl, name in ((lvl_hi20_plot, "HI20"), (lvl_lo20_plot, "LO20"), (sma50_plot, "SMA50")):
                     if lvl is None:
+                        continue
+                    if not _level_in_view(lvl):
                         continue
                     ax.axhline(float(lvl), linewidth=0.9, alpha=0.22, color="#c9d1d9")
                     try:
@@ -12085,7 +12238,7 @@ async def htf(
             if state == "ON":
                 try:
                     x_last = xnums[-1]
-                    y_last = float(closes_p[-1])
+                    y_last = float(closes_plot[-1])
                     if direction == "BULL":
                         ax.scatter([x_last], [y_last], s=46, color=up, zorder=6)
                         ax.text(x_last, y_last, "  ▲", color=up, fontsize=12, va="center")
@@ -12095,18 +12248,10 @@ async def htf(
                 except Exception:
                     pass
 
-            # Tight y-axis bounds based on visible data (after overlays).
+            # Apply tight y-axis bounds now (and again later after legends/layout).
             try:
-                lows_clean = [float(v) for v in lows_p if isinstance(v, (int, float)) and float(v) > 0 and (not math.isnan(float(v)))]
-                highs_clean = [float(v) for v in highs_p if isinstance(v, (int, float)) and float(v) > 0 and (not math.isnan(float(v)))]
-                if lows_clean and highs_clean:
-                    lo = min(lows_clean)
-                    hi = max(highs_clean)
-                    pad = (hi - lo) * 0.05 if hi > lo else (hi * 0.01)
-                    ymin = (lo - pad) if pad > 0 else (lo * 0.995)
-                    ymax = (hi + pad) if pad > 0 else (hi * 1.005)
-                    if ymax > ymin:
-                        ax.set_ylim(float(ymin), float(ymax))
+                if y_bounds is not None:
+                    ax.set_ylim(float(y_bounds[0]), float(y_bounds[1]))
             except Exception:
                 pass
 
@@ -12195,6 +12340,16 @@ async def htf(
             handles, labels = ax.get_legend_handles_labels()
             if labels:
                 ax.legend(loc="upper left", fontsize=8, framealpha=0.15, ncol=2)
+
+            # Lock y-axis *after* all artists/legend to prevent any late autoscale from
+            # off-window level lines causing massive dead space.
+            try:
+                if y_bounds is not None:
+                    ax.set_autoscale_on(False)
+                    ax.autoscale(enable=False, axis="y")
+                    ax.set_ylim(float(y_bounds[0]), float(y_bounds[1]))
+            except Exception:
+                pass
 
             fig.tight_layout()
             buf = io.BytesIO()
@@ -13797,7 +13952,7 @@ async def trade(interaction: discord.Interaction, symbol: str = "SPY", tier: str
 
     async def _htf_summary_line_from_cache(sym_key: str) -> str | None:
         try:
-            cache_key_base = f"chart_htf_png:v2:{sym_key}:1d"
+            cache_key_base = f"chart_htf_png:v3:{sym_key}:1d"
             cache_key = _gprr_cache_key(cache_key_base)
             cached = await _png_cache_get(cache_key, family="htf")
         except Exception:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import subprocess
 import time
 from typing import Any
@@ -16,6 +17,15 @@ from starlette.routing import Route
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 
 _START = time.time()
+
+# Ensure imports resolve from the repo checkout (delivery.*, etc.), even if the
+# process is started without PYTHONPATH set or has an older installed package.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+try:
+    if _REPO_ROOT and _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+except Exception:
+    pass
 
 
 def _build_id() -> str:
@@ -109,6 +119,38 @@ async def render_oi_iv(request: Request) -> Response:
 
         from delivery.oi_iv_render import render_oi_iv_png
 
+        def _ensure_text_meta(png_bytes: bytes, updates: dict[str, str]) -> bytes:
+            try:
+                from PIL import Image
+                from PIL.PngImagePlugin import PngInfo
+
+                im = Image.open(io.BytesIO(png_bytes))
+                im.load()
+                info = getattr(im, "text", None)
+                meta = dict(info) if isinstance(info, dict) else {}
+                changed = False
+                for k, v in (updates or {}).items():
+                    if not k:
+                        continue
+                    if str(meta.get(k) or ""):
+                        continue
+                    meta[str(k)] = str(v)
+                    changed = True
+                if not changed:
+                    return png_bytes
+                pnginfo = PngInfo()
+                for k, v in meta.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        try:
+                            pnginfo.add_text(k, v)
+                        except Exception:
+                            pass
+                out = io.BytesIO()
+                im.convert("RGBA").save(out, format="PNG", pnginfo=pnginfo)
+                return out.getvalue() or png_bytes
+            except Exception:
+                return png_bytes
+
         png = render_oi_iv_png(
             title=title,
             x_labels=labels,
@@ -121,6 +163,15 @@ async def render_oi_iv(request: Request) -> Response:
         if not isinstance(png, (bytes, bytearray)) or not png:
             raise RuntimeError("render_empty")
         data = bytes(png)
+        # Add missing (invisible) metadata for CLX-side verification.
+        data = _ensure_text_meta(
+            data,
+            {
+                "tnt_oi_iv_layout": "v2",
+                "tnt_build": _build_id(),
+                "tnt_render_tag": (os.getenv("TNT_RENDER_TAG") or os.getenv("COMPUTERNAME") or "").strip(),
+            },
+        )
     except Exception as exc:
         return JSONResponse(
             {"ok": False, "error": f"bad_payload:{type(exc).__name__}:{exc}"},

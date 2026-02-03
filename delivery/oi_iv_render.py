@@ -149,34 +149,52 @@ def render_oi_iv_png(
     fig, ax = plt.subplots(figsize=figsize)
     style_tnt_dark_figure(fig)
     style_tnt_dark_axes(ax)
-    add_tnt_watermark_ax(ax)
 
-    call_color = "#00ff66"
-    put_color = "#ff3344"
-    line_color = "#ffa657"
+    # OI/IV should read "premium" and data-first: watermark off by default.
+    try:
+        truthy = {"1", "true", "yes", "y", "on"}
+        if (os.getenv("TNT_OI_IV_WATERMARK", "0") or "0").strip().lower() in truthy:
+            add_tnt_watermark_ax(ax, alpha=0.03)
+    except Exception:
+        pass
 
-    width = 0.38
-    ax.bar([x - width / 2.0 for x in xs], oi_calls, width=width, color=call_color, alpha=0.55, label="Calls OI")
-    ax.bar([x + width / 2.0 for x in xs], oi_puts, width=width, color=put_color, alpha=0.48, label="Puts OI")
+    call_color = "#58a6ff"  # blue
+    put_color = "#ff7b72"   # salmon
+    line_color = "#8b949e"  # muted gray
+
+    # Side-by-side with a real gap so it can't be mistaken as stacked/overlapped.
+    width = 0.34
+    gap = 0.10
+    delta = (width + gap) / 2.0
+    ax.bar([x - delta for x in xs], oi_calls, width=width, color=call_color, alpha=0.55, label="Calls OI", zorder=2)
+    ax.bar([x + delta for x in xs], oi_puts, width=width, color=put_color, alpha=0.50, label="Puts OI", zorder=2)
     ax.set_ylabel("Open interest", color="#c9d1d9")
     ax.grid(True, alpha=0.12, linestyle="--")
-    ax.yaxis.tick_right()
-    ax.yaxis.set_label_position("right")
+    # Keep OI axis conventional (left); IV axis will be right.
+    try:
+        ax.yaxis.tick_left()
+        ax.yaxis.set_label_position("left")
+    except Exception:
+        pass
 
     ax2 = None
     if bool(include_iv_overlay):
         ax2 = ax.twinx()
-        style_tnt_dark_axes(ax2)
+        style_tnt_dark_axes(ax2, grid=False)
+        try:
+            ax2.tick_params(colors="#8b949e")
+        except Exception:
+            pass
         ax2.plot(
             xs,
             list(iv_pct) if iv_pct else [math.nan] * n,
             color=line_color,
-            linewidth=1.25,
-            alpha=0.60,
-            linestyle="--",
+            linewidth=1.05,
+            alpha=0.42,
+            linestyle=":",
             label="IV",
         )
-        ax2.set_ylabel("IV (%)", color="#c9d1d9")
+        ax2.set_ylabel("IV (%)", color="#8b949e")
 
     ax.set_title(title, color="#c9d1d9")
     ax.set_xlabel("Strike", color="#c9d1d9")
@@ -245,6 +263,8 @@ def render_oi_iv_png(
     fig.tight_layout()
     dpi_used = int(dpi) if int(dpi) > 0 else 150
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi_used, facecolor=fig.get_facecolor(), metadata=tnt_png_metadata())
+    meta = dict(tnt_png_metadata())
+    meta["tnt_oi_iv_layout"] = "v2"
+    fig.savefig(buf, format="png", dpi=dpi_used, facecolor=fig.get_facecolor(), metadata=meta)
     plt.close(fig)
     return buf.getvalue()
