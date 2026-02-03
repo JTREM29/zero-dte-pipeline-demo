@@ -4,6 +4,7 @@ import io
 import json
 import os
 import sys
+import struct
 import subprocess
 import time
 from typing import Any
@@ -43,13 +44,96 @@ def _build_id() -> str:
         return ""
 
 
+def _sha256_file(path: str) -> str:
+    try:
+        import hashlib
+
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 16), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def _png_with_text_meta(png_bytes: bytes, updates: dict[str, str]) -> bytes:
+    """Inject/override PNG tEXt chunks (keyword\0text) without extra deps."""
+
+    try:
+        import zlib
+
+        if not isinstance(png_bytes, (bytes, bytearray)):
+            return bytes(png_bytes)
+        data = bytes(png_bytes)
+        if not data.startswith(PNG_SIG):
+            return data
+
+        # Parse chunks; keep everything but remove existing tEXt for the keys we override.
+        i = len(PNG_SIG)
+        out = bytearray(PNG_SIG)
+        keys = {str(k) for k in (updates or {}).keys() if str(k)}
+
+        def _read_u32(b: bytes, off: int) -> int:
+            return int.from_bytes(b[off : off + 4], "big", signed=False)
+
+        while i + 8 <= len(data):
+            ln = _read_u32(data, i)
+            typ = data[i + 4 : i + 8]
+            j = i + 8
+            k = j + ln
+            crc_end = k + 4
+            if crc_end > len(data):
+                break
+            chunk_data = data[j:k]
+
+            if typ == b"tEXt" and keys:
+                try:
+                    nul = chunk_data.find(b"\x00")
+                    if nul > 0:
+                        keyword = chunk_data[:nul].decode("latin-1", errors="ignore")
+                        if keyword in keys:
+                            i = crc_end
+                            continue
+                except Exception:
+                    pass
+
+            # If this is IEND, inject our tEXt chunks right before it.
+            if typ == b"IEND":
+                for kk, vv in (updates or {}).items():
+                    if not kk:
+                        continue
+                    key_b = str(kk).encode("latin-1", errors="ignore")
+                    val_b = str(vv).encode("latin-1", errors="ignore")
+                    text_data = key_b + b"\x00" + val_b
+                    out += struct.pack(">I", len(text_data))
+                    out += b"tEXt"
+                    out += text_data
+                    crc = zlib.crc32(b"tEXt" + text_data) & 0xFFFFFFFF
+                    out += struct.pack(">I", crc)
+
+            out += data[i:crc_end]
+            i = crc_end
+
+        if out.startswith(PNG_SIG) and len(out) > len(PNG_SIG):
+            return bytes(out)
+        return data
+    except Exception:
+        try:
+            return bytes(png_bytes)
+        except Exception:
+            return png_bytes
+
+
 async def healthz(_: Request) -> JSONResponse:
+    oi_path = os.path.join(_REPO_ROOT, "delivery", "oi_iv_render.py")
     return JSONResponse(
         {
             "ok": True,
             "uptime_s": int(time.time() - _START),
             "build": _build_id(),
             "service": "tnt-worker-parity",
+            "oi_iv_render_sha": (_sha256_file(oi_path)[:12] if oi_path else ""),
         }
     )
 
@@ -117,39 +201,18 @@ async def render_oi_iv(request: Request) -> Response:
         oi_puts = [float(x) for x in put_oi]
         iv = [float(x) for x in (call_iv or [])]
 
-        from delivery.oi_iv_render import render_oi_iv_png
+        # Import the renderer explicitly from this checkout to avoid sys.path ambiguity.
+        import importlib.util
 
-        def _ensure_text_meta(png_bytes: bytes, updates: dict[str, str]) -> bytes:
-            try:
-                from PIL import Image
-                from PIL.PngImagePlugin import PngInfo
-
-                im = Image.open(io.BytesIO(png_bytes))
-                im.load()
-                info = getattr(im, "text", None)
-                meta = dict(info) if isinstance(info, dict) else {}
-                changed = False
-                for k, v in (updates or {}).items():
-                    if not k:
-                        continue
-                    if str(meta.get(k) or ""):
-                        continue
-                    meta[str(k)] = str(v)
-                    changed = True
-                if not changed:
-                    return png_bytes
-                pnginfo = PngInfo()
-                for k, v in meta.items():
-                    if isinstance(k, str) and isinstance(v, str):
-                        try:
-                            pnginfo.add_text(k, v)
-                        except Exception:
-                            pass
-                out = io.BytesIO()
-                im.convert("RGBA").save(out, format="PNG", pnginfo=pnginfo)
-                return out.getvalue() or png_bytes
-            except Exception:
-                return png_bytes
+        oi_path = os.path.join(_REPO_ROOT, "delivery", "oi_iv_render.py")
+        spec = importlib.util.spec_from_file_location("tnt_delivery_oi_iv_render", oi_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("renderer_spec_failed")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        render_oi_iv_png = getattr(mod, "render_oi_iv_png", None)
+        if not callable(render_oi_iv_png):
+            raise RuntimeError("renderer_missing")
 
         png = render_oi_iv_png(
             title=title,
@@ -163,8 +226,8 @@ async def render_oi_iv(request: Request) -> Response:
         if not isinstance(png, (bytes, bytearray)) or not png:
             raise RuntimeError("render_empty")
         data = bytes(png)
-        # Add missing (invisible) metadata for CLX-side verification.
-        data = _ensure_text_meta(
+        # Inject/override invisible metadata for CLX-side verification (no Pillow required).
+        data = _png_with_text_meta(
             data,
             {
                 "tnt_oi_iv_layout": "v2",
@@ -182,7 +245,15 @@ async def render_oi_iv(request: Request) -> Response:
         return JSONResponse({"ok": False, "error": "not_png"}, status_code=500)
 
     # No visible stamps here; attribution stays in PNG metadata via delivery.tnt_chart_style.tnt_png_metadata.
-    return Response(content=data, media_type="image/png")
+    return Response(
+        content=data,
+        media_type="image/png",
+        headers={
+            "X-TNT-Service": "tnt-worker-parity",
+            "X-TNT-Build": _build_id(),
+            "X-TNT-OI-IV-Layout": "v2",
+        },
+    )
 
 
 routes = [
