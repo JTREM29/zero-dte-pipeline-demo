@@ -355,12 +355,12 @@ def render_oi_iv_png(
 
     # Title smaller/tighter, with a light subheader.
     # Place these slightly above the axes so they don't cover the IV overlay.
-    ax.set_title(title, color="#c9d1d9", fontsize=11, pad=0, loc="left", y=1.08)
+    ax.set_title(title, color="#c9d1d9", fontsize=11, pad=0, loc="left", y=1.11)
     try:
         sub = f"{n} strikes  •  IV overlay {'on' if include_iv_overlay else 'off'}"
         ax.text(
             0.0,
-            1.04,
+            1.07,
             sub,
             transform=ax.transAxes,
             ha="left",
@@ -510,7 +510,7 @@ def render_oi_iv_png(
             bottom = 0.18
         bottom = max(0.02, min(0.30, float(bottom)))
         # Leave extra headroom for title/subheader placed above the axes.
-        fig.tight_layout(rect=(0.06, bottom, 0.985, 0.92))
+        fig.tight_layout(rect=(0.06, bottom, 0.985, 0.90))
     except Exception:
         pass
     dpi_used = int(dpi) if int(dpi) > 0 else 150

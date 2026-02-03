@@ -1239,7 +1239,7 @@ async def run_cache_warm_cycle() -> None:
                         v_stamp = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
                         stamp_key = "sv1" if (allow_stamp in truthy and v_stamp in truthy) else "sv0"
 
-                        base = f"oi_png:v11:{sym}:strike:{exp}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
+                        base = f"oi_png:v12:{sym}:strike:{exp}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
                         key = _gprr_cache_key(base)
                         existing = await _png_cache_get(key, family="oi")
                         if existing is not None and existing[0]:
@@ -2017,6 +2017,7 @@ async def run_heavy_chart(
     render_fn,
     cache_get,
     cache_set,
+    profile_snapshot: RenderProfile | None = None,
     post_to_channel: bool = False,
     redis_sf_namespace: str | None = None,
     redis_sf_work_key: str | None = None,
@@ -2039,8 +2040,13 @@ async def run_heavy_chart(
             m = meta if isinstance(meta, dict) else {}
             render_mode = str(m.get("render_mode") or m.get("mode") or "unknown")
             sym = str(m.get("symbol") or m.get("sym") or "")
+            iv_bit = m.get("include_iv_overlay")
+            iv_key = m.get("iv_key")
             worker = (os.getenv("TNT_WORKER_URL", "") or "").strip()
-            print(f"[TNT][OI][PROOF] render_mode={render_mode} symbol={sym} worker={worker}")
+            print(
+                f"[TNT][OI][PROOF] render_mode={render_mode} symbol={sym} worker={worker} "
+                + f"include_iv={1 if bool(iv_bit) else 0} iv_key={str(iv_key or '')}"
+            )
         except Exception:
             pass
 
@@ -2093,7 +2099,7 @@ async def run_heavy_chart(
 
     # 3️⃣ GPRR gate (cache-miss renders)
     try:
-        prof = _gprr_profile()
+        prof = profile_snapshot if profile_snapshot is not None else _gprr_profile()
         lvl = ProfileLevel(int(getattr(prof, "level", 0)))
         if lvl == ProfileLevel.SURVIVAL:
             await ack.edit(content=_gprr_busy_banner(prof))
@@ -2124,7 +2130,7 @@ async def run_heavy_chart(
     async def _work():
         await _acquire_render_slot_global(family=str(cmd), interaction=interaction)
         try:
-            prof = _gprr_profile()
+            prof = profile_snapshot if profile_snapshot is not None else _gprr_profile()
             out = _call_render_fn(render_fn, profile=prof)
             if asyncio.iscoroutine(out):
                 out = await out
@@ -9567,11 +9573,27 @@ async def oi(
     # Cache-first / busy-mode (avoid option-chain stampedes under load).
     # IMPORTANT: key uses resolved YYYY-MM-DD (not a selector token like "0dte").
     exp_for_key = exp_for_fetch or exp_clean or "auto"
+
+    # IV overlay policy for /oi:
+    # - Default: keep IV overlay ON (users expect /oi to be OI/IV).
+    # - Optional: respect GPRR profile (DEGRADED/SURVIVAL may hide overlays) only if opted-in.
+    try:
+        respect_profile_iv = bool(_truthy_env("TNT_OI_RESPECT_PROFILE_IV_OVERLAY", default="0"))
+    except Exception:
+        respect_profile_iv = False
+    if respect_profile_iv:
+        try:
+            include_iv_request = bool(getattr(prof, "include_iv_overlay", True)) if prof is not None else True
+        except Exception:
+            include_iv_request = True
+    else:
+        include_iv_request = True
+
     # IMPORTANT: include IV-overlay bit so degraded modes (IV hidden) never
     # serve a cached PNG rendered with IV overlay (and vice versa).
     try:
-        prof_for_key = _gprr_profile() if _gprr_enabled() else None
-        include_iv_key = bool(getattr(prof_for_key, "include_iv_overlay", True)) if prof_for_key is not None else True
+        prof_for_key = prof
+        include_iv_key = bool(include_iv_request)
     except Exception:
         include_iv_key = True
     iv_key = "iv1" if include_iv_key else "iv0"
@@ -9582,7 +9604,7 @@ async def oi(
     v_stamp = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
     stamp_key = "sv1" if (allow_stamp in truthy and v_stamp in truthy) else "sv0"
 
-    cache_key_png = f"oi_png:v11:{sym}:{by_norm}:{exp_for_key}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
+    cache_key_png = f"oi_png:v12:{sym}:{by_norm}:{exp_for_key}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
     cache_key_png_full = _gprr_cache_key(cache_key_png)
 
     # Always print the cache key used for this request (helps debug stale cache vs fresh render).
@@ -9719,7 +9741,7 @@ async def oi(
     try:
         is_warmed = sym in OI_WARMED_SET
         if not is_warmed and _gprr_enabled():
-            prof_gate = _gprr_profile()
+            prof_gate = prof if prof is not None else _gprr_profile()
             lvl = ProfileLevel(int(getattr(prof_gate, "level", 0)))
             if lvl in {ProfileLevel.DEGRADED, ProfileLevel.SURVIVAL}:
                 ack = await _instant_ack_editor(interaction)
@@ -10386,7 +10408,7 @@ async def oi(
 
             exp_label0 = exp_label_resolved or exp_for_fetch or exp_for_key
             top_tag = f" | Top {top_n}" if top_n > 0 else ""
-            include_iv = bool(getattr(profile, "include_iv_overlay", True)) if profile is not None else True
+            include_iv = bool(include_iv_request)
             title = f"OI/IV — {sym} — exp {exp_label0} — {window_label}{top_tag}"
             if spot_label:
                 title = f"{title} — {spot_label}"
@@ -10471,7 +10493,14 @@ async def oi(
                 return {
                     "png_bytes": bytes(png0),
                     "png_err": None,
-                    "meta": {"mode": "strike", "exp": str(exp_for_fetch or exp_label0), "symbol": sym, "render_mode": render_mode},
+                    "meta": {
+                        "mode": "strike",
+                        "exp": str(exp_for_fetch or exp_label0),
+                        "symbol": sym,
+                        "render_mode": render_mode,
+                        "include_iv_overlay": bool(include_iv),
+                        "iv_key": str(iv_key),
+                    },
                     "caption": text,
                     "filename": f"{sym.lower()}_oi_strike.png",
                     "ttl_sec": max(int(os.getenv("TNT_TTL_OI_PNG_SEC", "45")), 5),
@@ -10543,7 +10572,14 @@ async def oi(
             return {
                 "png_bytes": png,
                 "png_err": None,
-                "meta": {"mode": "strike", "exp": str(exp_label0), "symbol": sym, "render_mode": render_mode},
+                "meta": {
+                    "mode": "strike",
+                    "exp": str(exp_label0),
+                    "symbol": sym,
+                    "render_mode": render_mode,
+                    "include_iv_overlay": bool(include_iv),
+                    "iv_key": str(iv_key),
+                },
                 "caption": text,
                 "filename": f"{sym.lower()}_oi_strike.png",
                 "ttl_sec": max(int(os.getenv("TNT_TTL_OI_PNG_SEC", "45")), 5),
@@ -10556,6 +10592,7 @@ async def oi(
             render_fn=_render_fn,
             cache_get=_cache_get,
             cache_set=_cache_set,
+            profile_snapshot=prof,
             redis_sf_namespace="oi",
             redis_sf_work_key=cache_key_png_full,
             redis_sf_lock_ttl_s=60,
@@ -10607,7 +10644,7 @@ async def oi(
 
         exp_labels, oi_sums, iv_pct = _bucket_oi_iv_by_expiration(summaries)
         window_pct = int(strike_window_pct * 100)
-        include_iv = bool(getattr(profile, "include_iv_overlay", True)) if profile is not None else True
+        include_iv = bool(include_iv_request)
         title = f"{sym} Options — OI by Expiration + IV Overlay | Next {len(exp_labels)} Exps | {window_label}"
         if not include_iv:
             title = title.replace(" + IV Overlay", "") + " | IV hidden"
@@ -10655,6 +10692,7 @@ async def oi(
         render_fn=_render_fn_exp,
         cache_get=_cache_get,
         cache_set=_cache_set,
+        profile_snapshot=prof,
     )
 
 
