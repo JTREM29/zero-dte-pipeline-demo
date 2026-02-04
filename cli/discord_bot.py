@@ -977,7 +977,13 @@ def _render_oi_iv_png_warm(
         )
         ax2.set_ylabel("IV (%)", color="#c9d1d9")
 
-    ax.set_title(title, color="#c9d1d9")
+    # Figure-level title/subheader to avoid any overlap/clipping.
+    try:
+        sub = f"{n} strikes  •  IV overlay {'on' if include_iv_overlay else 'off'}"
+        fig.text(0.06, 0.965, str(title or ""), ha="left", va="top", fontsize=11, color="#c9d1d9")
+        fig.text(0.06, 0.935, sub, ha="left", va="top", fontsize=8.5, color="#8b949e", alpha=0.85)
+    except Exception:
+        pass
     ax.set_xlabel("Strike", color="#c9d1d9")
 
     # One-line takeaway (top-right). Keep it decisive.
@@ -1027,7 +1033,7 @@ def _render_oi_iv_png_warm(
     except Exception:
         pass
 
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.02, 0.04, 0.98, 0.88))
     dpi_used = 150
     try:
         if profile is not None:
@@ -10133,7 +10139,13 @@ async def oi(
                 except Exception:
                     pass
 
-        ax.set_title(title, color="#c9d1d9")
+        # Figure-level title/subheader to avoid any overlap/clipping.
+        try:
+            sub = f"{n} buckets  •  IV overlay {'on' if include_iv_overlay else 'off'}"
+            fig.text(0.06, 0.965, str(title or ""), ha="left", va="top", fontsize=11, color="#c9d1d9")
+            fig.text(0.06, 0.935, sub, ha="left", va="top", fontsize=8.5, color="#8b949e", alpha=0.85)
+        except Exception:
+            pass
         ax.set_xlabel(x_label, color="#c9d1d9")
 
         # One decisive takeaway (top-right).
@@ -10200,7 +10212,7 @@ async def oi(
         except Exception:
             pass
 
-        fig.tight_layout()
+        fig.tight_layout(rect=(0.02, 0.04, 0.98, 0.88))
         dpi_used = None
         try:
             if dpi is not None:
