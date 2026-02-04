@@ -28,6 +28,14 @@ Populate these in `.env` (or the deployment secret store) before launching:
   - `DISCORD_CANARY_CHANNEL_ID` – staging/canary channel id.
 - Safety toggles: `DRY_RUN`, `STRICT_CONTRACTS`.
 
+Optional (recommended):
+
+- `AUTOPOST_CANDIDATES_MESSAGING=1` – appends a short **AI Trade Candidates** block to autopost renders.
+   - Source of truth is only canonical snapshots (`ctx:sym:{SYM}.candidates`).
+   - Uses locked, verbatim messaging for:
+      - Candidate boundary: "This is a candidate, not a command."
+      - No-candidate: "There is no AI trade candidate right now because conditions do not offer a statistical edge."
+
 ## 3. Launch Command
 
 From the repo root, run:
@@ -44,6 +52,7 @@ Choose the correct mode first (edit `.env` or export directly in the shell). The
 2. **Channels:** Double-check channel ids in `.env` match Discord (right-click → “Copy ID”).
 3. **Mode flags:** Confirm `DRY_RUN`/`STRICT_CONTRACTS` match the desired mode (see table above).
 4. **IQFeed/market data:** Ensure collectors are running so futures context is fresh.
+   - Futures ingest proof (one-shot): run `python -u scripts/futures_ops_proof_one_shot.py` and require `CLASSIFY=OK`.
 5. **OpenAI (optional):** If insights mode is enabled, make sure `OPENAI_API_KEY` is present.
 6. **TNT prompt (required):** Confirm `tnt_system_prompt.txt` is present and updated.
 7. **TNT prompt runtime (2-minute verification):** On startup, confirm console logs a line like:
@@ -88,8 +97,118 @@ With `STRICT_CONTRACTS=1` (dev/CI): the same violation should raise `ContractVio
 
 ## 8. Post-Run Tasks
 
-- For canary validation, capture a screenshot/log snippet confirming successful posts.
-- Rotate `DRY_RUN` back to `1` when returning to local development.
-- Periodically prune old audit folders (automatic pruning keeps the last 60 days by default).
 
 Keep this document updated when guardrails, message formats, or operational procedures change.
+See also: [TNT_CHART_STRUCTURE_COMMANDS.md](TNT_CHART_STRUCTURE_COMMANDS.md) for internal-only chart commands and the agent routing/consistency matrix.
+
+## 9. “Make it post” (streams + proof greps)
+
+If `/force_*` works but a channel looks empty, the renderer is almost never the issue.
+It’s usually one of:
+- Scheduler not running (wrong bot process, or `TNT_AUTOMATION_ENABLED=0`)
+- Deduped (it already posted earlier)
+- Wrong channel id / routing fallback (autopost/canary instead of production)
+- Schedule not yet due
+
+### 9.1 Trading alerts → `#alerts`
+
+Paste into `.env.local`:
+
+```ini
+# ============ Alerts (Discord delivery) ============
+TNT_ALERTS_DISCORD_DELIVERY_ENABLED=1
+TNT_ALERTS_CHANNEL_ID=1458633494107525173
+
+# optional override (default is fine)
+# TNT_ALERTS_DISCORD_QUEUE=tnt:alerts:discord_queue
+
+# optional: bundling
+TNT_ALERTS_BUNDLE_WINDOW_SEC=15
+```
+
+Proof grep (delivery worker / slash bot log):
+
+```powershell
+Get-Content -Tail 400 .\logs\slash_live.log |
+   Select-String "\[TNT\]\[ALERTS\]\[DELIVERY\]\[(POP|BUNDLE|POSTED|WARN)\]" |
+   Select-Object -Last 80 | % { $_.Line }
+```
+
+### 9.2 Earnings calendar + results → `#calendar-earnings`
+
+Paste into `.env.local`:
+
+```ini
+# ============ Earnings + Macro (Calendar) ============
+TNT_AUTOMATION_ENABLED=1
+
+EARNINGS_PROVIDER=massive_benzinga
+EARNINGS_AUTOPOST_ENABLED=1
+EARNINGS_RESULTS_AUTOPOST_ENABLED=1
+
+CALENDAR_EARNINGS_CHANNEL_ID=1462948320229200065
+EARNINGS_POST_CHANNEL_ID=1462948320229200065
+
+# schedule
+TNT_EARNINGS_DAILY_TIME_ET=18:00
+TNT_EARNINGS_RESULTS_TIMES_ET=11:00
+
+# dedupe TTLs (3 days)
+TNT_EARNINGS_DAILY_DEDUPE_TTL_SEC=259200
+TNT_EARNINGS_RESULTS_DEDUPE_TTL_SEC=259200
+
+# macro file
+TNT_MACRO_EVENTS_FILE=data/macro_events.csv
+```
+
+Proof grep (delivery bot log):
+
+```powershell
+Get-Content -Tail 600 .\logs\bot_live.log |
+   Select-String "\[AUTOPOST\]\[(EARNINGS|EARNINGS_RESULTS)\]( posting| deduped)|\[AUTOPOST\]\[(EARNINGS|EARNINGS_RESULTS)\]\[PROOF\]" |
+   Select-Object -Last 120 | % { $_.Line }
+```
+
+### 9.3 Daily + weekly outlook → `#weekly-daily-outlook`
+
+Paste into `.env.local`:
+
+```ini
+# ============ Crown Jewel Outlook ============
+TNT_AUTOMATION_ENABLED=1
+
+DAILY_OUTLOOK_ENABLED=1
+DAILY_OUTLOOK_TIME_ET=08:45
+DAILY_OUTLOOK_CHANNEL_ID=1465748835203547220
+TNT_OUTLOOK_KIND=status
+
+# headlines / wow knobs (optional)
+TNT_OUTLOOK_HEADLINES_LIMIT=4
+TNT_OUTLOOK_WOW_NEWS_WINDOW_MIN=90
+TNT_HEADLINES_MATERIAL_ONLY=1
+
+# weekly (normal schedule)
+WEEKLY_OUTLOOK_ENABLED=1
+WEEKLY_OUTLOOK_DAY_ET=SUN
+WEEKLY_OUTLOOK_TIME_ET=18:00
+WEEKLY_OUTLOOK_DEDUPE_SCOPE=week
+WEEKLY_OUTLOOK_DEDUPE_TTL_SEC=691200
+```
+
+Proof grep (delivery bot log):
+
+```powershell
+Get-Content -Tail 600 .\logs\bot_live.log |
+   Select-String "\[AUTOPOST\]\[(OUTLOOK|WEEKLY_OUTLOOK)\]( posting| deduped)|\[AUTOPOST\]\[(OUTLOOK|WEEKLY_OUTLOOK)\]\[PROOF\]" |
+   Select-Object -Last 120 | % { $_.Line }
+```
+
+### 9.4 One extra “no doubt” proof (startup routing banner)
+
+After a restart, confirm the delivery bot prints the resolved channels + key flags:
+
+```powershell
+Get-Content -Tail 200 .\logs\bot_live.log |
+   Select-String "\[TNT\]\[CONFIG\] channels=|\[TNT\]\[CONFIG\] outlook_kind=|\[TNT\]\[CONFIG\] earnings_provider=" |
+   Select-Object -Last 60 | % { $_.Line }
+```
