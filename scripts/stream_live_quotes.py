@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Stream real-time quotes with Polygon primary and IQFeed fallback."""
+"""Stream real-time quotes with a primary feed and IQFeed fallback."""
 from __future__ import annotations
 
 import argparse
@@ -26,19 +26,19 @@ async def _fetch_polygon_quote(symbol: str) -> Optional[Tuple[str, float]]:
     try:
         connected = await connector.connect()
         if not connected:
-            LOG.warning("Polygon connection failed: %s", connector.last_error)
+            LOG.warning("Primary provider connection failed: %s", connector.last_error)
             return None
         quote = await connector.get_quote(symbol)
         if not quote:
-            LOG.warning("Polygon returned no quote for %s", symbol)
+            LOG.warning("Primary provider returned no quote for %s", symbol)
             return None
         price = quote.get("last")
         if price is None:
-            LOG.warning("Polygon quote missing price field for %s", symbol)
+            LOG.warning("Primary quote missing price field for %s", symbol)
             return None
-        return "polygon", float(price)
+        return "primary", float(price)
     except Exception as exc:  # pragma: no cover - defensive
-        LOG.warning("Polygon quote error (%s): %s", symbol, exc)
+        LOG.warning("Primary quote error (%s): %s", symbol, exc)
         return None
     finally:
         await connector.disconnect()
@@ -77,7 +77,7 @@ async def _fetch_iqfeed_quote(symbol: str) -> Optional[Tuple[str, float]]:
 
 async def _fetch_with_fallback(symbol: str, providers: Iterable[str]) -> Tuple[Optional[str], Optional[float]]:
     for provider in providers:
-        if provider == "polygon":
+        if provider == "primary":
             result = await _fetch_polygon_quote(symbol)
         elif provider == "iqfeed":
             result = await _fetch_iqfeed_quote(symbol)
@@ -90,10 +90,10 @@ async def _fetch_with_fallback(symbol: str, providers: Iterable[str]) -> Tuple[O
 
 def _provider_order(use_iqfeed_first: bool) -> Tuple[str, ...]:
     if use_iqfeed_first and iqfeed_client.IQFEED_ENABLED:
-        return ("iqfeed", "polygon")
+        return ("iqfeed", "primary")
     if iqfeed_client.IQFEED_ENABLED:
-        return ("polygon", "iqfeed")
-    return ("polygon",)
+        return ("primary", "iqfeed")
+    return ("primary",)
 
 
 async def _stream_quotes(symbol: str, duration: float, use_iqfeed_first: bool) -> None:
@@ -118,10 +118,10 @@ async def _stream_quotes(symbol: str, duration: float, use_iqfeed_first: bool) -
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fetch live quotes with Polygon/IQFeed fallback")
+    parser = argparse.ArgumentParser(description="Fetch live quotes with primary/IQFeed fallback")
     parser.add_argument("--symbol", default="SPX", help="Ticker symbol to stream")
     parser.add_argument("--duration", type=float, default=30.0, help="Duration to stream in seconds")
-    parser.add_argument("--use-iqfeed-first", action="store_true", help="Try IQFeed before Polygon")
+    parser.add_argument("--use-iqfeed-first", action="store_true", help="Try IQFeed before the primary feed")
     return parser.parse_args()
 
 

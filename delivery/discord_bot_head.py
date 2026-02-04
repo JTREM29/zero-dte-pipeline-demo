@@ -27,12 +27,19 @@ from delivery.tnt_llm import call_tnt_agent_async
 # NOTE: Keep tests deterministic. Golden/smoke tests should not change based on a
 # developer's local .env/.env.local.
 if "pytest" not in sys.modules:
-    for _env_path in (Path.cwd() / ".env.local", Path.cwd() / ".env"):
-        try:
-            if _env_path.exists():
-                load_dotenv(_env_path, override=False)
-        except Exception:  # noqa: BLE001
-            pass
+    try:
+        env_path = Path.cwd() / ".env"
+        if env_path.exists():
+            load_dotenv(env_path, override=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        env_local_path = Path.cwd() / ".env.local"
+        if env_local_path.exists():
+            load_dotenv(env_local_path, override=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 ET = ZoneInfo("America/New_York")
 
@@ -79,7 +86,8 @@ AI_ENABLED = os.getenv("DISCORD_AI_ENABLED", "0") == "1"
 AI_MODE = os.getenv("DISCORD_AI_MODE", "mention")
 AI_ROLE_ID = int(os.getenv("DISCORD_AI_ROLE_ID", "0") or "0")
 AI_CHANNEL_ID = int(os.getenv("DISCORD_AI_CHANNEL_ID", "0") or "0")
-AI_MODEL = os.getenv("DISCORD_AI_MODEL", "gpt-5-mini")
+# TNT agent calls are model-locked in delivery.tnt_llm; keep a stable, non-drifting default here.
+AI_MODEL = "gpt-5.2"
 AI_MAX_CHARS = int(os.getenv("DISCORD_AI_MAX_CHARS", "1200"))
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
@@ -443,8 +451,34 @@ def get_close_at_or_before(symbol: str, tf: str, ts_iso: str) -> Optional[Dict[s
     return {"ts": ts, "close": float(close)}
 
 
-def get_last_n_bars(symbol: str, tf: str = "1m", n: int = 2000) -> list[tuple]:
+def get_last_n_bars(symbol: str, tf: str = "1m", n: int = 2000, *, with_volume: bool = False) -> list[tuple]:
+    """Fetch the last N bars from SQLite.
+
+    Backwards compatible:
+    - with_volume=False returns 5-tuples: (ts, open, high, low, close)
+    - with_volume=True returns 6-tuples when `prices.volume` exists.
+    """
+
+    sym = symbol.upper()
     with sqlite3.connect(DB_PATH) as conn:
+        if with_volume:
+            try:
+                rows = _rows(
+                    conn,
+                    """
+                    SELECT ts, open, high, low, close, volume
+                    FROM prices
+                    WHERE symbol=? AND tf=?
+                    ORDER BY ts DESC
+                    LIMIT ?
+                    """,
+                    (sym, tf, n),
+                )
+                return list(reversed(rows))
+            except sqlite3.OperationalError:
+                # Older schema: no volume column.
+                pass
+
         rows = _rows(
             conn,
             """
@@ -454,7 +488,7 @@ def get_last_n_bars(symbol: str, tf: str = "1m", n: int = 2000) -> list[tuple]:
             ORDER BY ts DESC
             LIMIT ?
             """,
-            (symbol.upper(), tf, n),
+            (sym, tf, n),
         )
     return list(reversed(rows))
 
@@ -1385,6 +1419,8 @@ async def _autopost_loop(channel: discord.abc.Messageable) -> None:
 
 async def _ensure_autopost_task() -> None:
     global _autopost_task
+    if (os.getenv("TNT_AUTOMATION_ENABLED", "0") or "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
     if not AUTOPOST_ENABLED:
         return
     if CHANNEL_ID == 0:
@@ -1425,6 +1461,9 @@ def _extract_ai_text(resp: object) -> str:
 @bot.event
 async def on_ready() -> None:
     print(f"[OK] Logged in as {bot.user} (guilds={len(bot.guilds)})")
+    if (os.getenv("TNT_AUTOMATION_ENABLED", "0") or "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        print("[OK] automation: disabled (TNT_AUTOMATION_ENABLED=0)")
+        return
     if DAILY_SUMMARY_ENABLED and DAILY_SUMMARY_CHANNEL_ID:
         bot.loop.create_task(daily_summary_loop())
         print(f"[OK] Daily summary enabled: {DAILY_SUMMARY_TIME_ET} ET -> channel_id={DAILY_SUMMARY_CHANNEL_ID}")

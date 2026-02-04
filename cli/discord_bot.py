@@ -23,6 +23,9 @@ from discord import app_commands
 from discord.app_commands import Choice
 from discord.ext import commands
 
+# Centralize attachment construction (guardrail: no direct attachment construction in entrypoints).
+from services.discord_files import file_from_png_bytes, files_from_name_bytes
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -43,6 +46,72 @@ def _print_start_banner() -> None:
     try:
         node_role = (os.getenv("TNT_NODE_ROLE") or "").strip() or "(unset)"
         print(f"[TNT][START] mode={_tnt_mode()} entrypoint={_TNT_ENTRYPOINT} pid={os.getpid()} node_role={node_role}")
+    except Exception:
+        pass
+
+
+def _print_control_plane_proof() -> None:
+    """Emit deterministic startup proof for control-plane debugging.
+
+    Goal: when things look "randomly broken", this shows exactly which repo,
+    commit, interpreter, and channel wiring the running bot is using.
+    """
+
+    try:
+        cwd = str(Path.cwd())
+    except Exception:
+        cwd = "(unknown)"
+
+    # Commit/build marker (best-effort).
+    sha = ""
+    try:
+        import subprocess
+
+        sha = (
+            subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=str(PROJECT_ROOT))
+            .decode("utf-8", errors="ignore")
+            .strip()
+        )
+    except Exception:
+        sha = ""
+
+    build = (os.getenv("TNT_BUILD") or "").strip()
+
+    # Channel wiring (IDs only; no secrets).
+    ask_id = (os.getenv("TNT_ASK_CHANNEL_ID") or os.getenv("ASK_TNT_CHANNEL_ID") or "").strip() or "(unset)"
+    ask_only = (os.getenv("TNT_ASK_CHANNEL_ONLY_ENABLED") or "").strip() or "(unset)"
+    cal_id = (os.getenv("TNT_CALENDAR_EARNINGS_CHANNEL_ID") or "").strip() or "(unset)"
+
+    # Token fingerprint (never log token).
+    token_fp = "(missing)"
+    try:
+        import hashlib
+
+        tok = (_resolve_discord_token() or "").strip()
+        if tok:
+            token_fp = f"sha1:{hashlib.sha1(tok.encode('utf-8')).hexdigest()[:10]} len={len(tok)}"
+    except Exception:
+        pass
+
+    py = str(getattr(sys, "executable", "") or "(unknown)")
+    ver = str(getattr(sys, "version", "") or "").splitlines()[0].strip()
+
+    try:
+        print(
+            "[TNT][PROOF] repo={repo} cwd={cwd} git={git} build={build} py={py} ver={ver} "
+            "ask_id={ask_id} ask_only={ask_only} cal_earnings_id={cal_id} token={token}".format(
+                repo=str(PROJECT_ROOT),
+                cwd=cwd,
+                git=(sha or "(unknown)"),
+                build=(build or "(unset)"),
+                py=py,
+                ver=(ver or "(unknown)"),
+                ask_id=ask_id,
+                ask_only=ask_only,
+                cal_id=cal_id,
+                token=token_fp,
+            )
+        )
     except Exception:
         pass
 
@@ -82,6 +151,38 @@ def _print_env_snapshot() -> None:
         except Exception:
             parity_mode = "(unknown)"
         print(f"[TNT][WORKER] url={worker_url} parity_mode={parity_mode}")
+    except Exception:
+        pass
+
+
+def _ask_debug_enabled() -> bool:
+    try:
+        return (str(os.getenv("TNT_ASK_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"})
+    except Exception:
+        return False
+
+
+def _print_ask_router_snapshot() -> None:
+    if not _ask_debug_enabled():
+        return
+
+    try:
+        enabled = (os.getenv("TNT_ASK_CHANNEL_ONLY_ENABLED", "0") or "0").strip()
+        channel_id = (os.getenv("TNT_ASK_CHANNEL_ID") or "").strip()
+        legacy_id = (os.getenv("ASK_TNT_CHANNEL_ID") or "").strip()
+        cooldown = (os.getenv("TNT_ASK_CHANNEL_COOLDOWN_SEC") or "").strip()
+        if not channel_id and legacy_id:
+            channel_id = legacy_id
+        if not cooldown:
+            cooldown = "(default)"
+        print(
+            "[TNT][ASK][CFG] channel_only={en} channel_id={cid} cooldown_sec={cd} legacy_ask_id={legacy}".format(
+                en=("on" if enabled == "1" else "off"),
+                cid=(channel_id or "(unset)"),
+                cd=cooldown,
+                legacy=(legacy_id or "(unset)"),
+            )
+        )
     except Exception:
         pass
 
@@ -301,6 +402,16 @@ def _macro_calendar_render_reply(*, query: str, now_utc: datetime | None = None)
     end = now + timedelta(days=7)
     items = _macro_calendar_load_upcoming(start_utc=now, end_utc=end, limit=20)
 
+    # NOTE: tests monkeypatch this module's `datetime` symbol to freeze time.
+    # That monkeypatch can replace the type with a non-type object, so never
+    # use `isinstance(x, datetime)` here.
+    try:
+        import datetime as _dtmod
+
+        _real_dt = _dtmod.datetime
+    except Exception:  # pragma: no cover
+        _real_dt = None
+
     req_type = _macro_calendar_requested_type(query)
     if req_type:
         items_t = [x for x in items if str(x.get("type") or "").upper() == req_type]
@@ -309,7 +420,7 @@ def _macro_calendar_render_reply(*, query: str, now_utc: datetime | None = None)
 
         ev = items_t[0]
         ts = ev.get("ts_utc")
-        if isinstance(ts, datetime):
+        if (_real_dt is not None) and isinstance(ts, _real_dt):
             ts_et = ts.astimezone(getattr(delivery, "ET", timezone.utc))
             minutes = int(round((ts - now).total_seconds() / 60.0))
             title = str(ev.get("title") or req_type).strip() or req_type
@@ -325,7 +436,7 @@ def _macro_calendar_render_reply(*, query: str, now_utc: datetime | None = None)
     lines.append("📅 Macro calendar (next 7d, ET)")
     for ev in items[:8]:
         ts = ev.get("ts_utc")
-        if not isinstance(ts, datetime):
+        if (_real_dt is None) or (not isinstance(ts, _real_dt)):
             continue
         ts_et = ts.astimezone(getattr(delivery, "ET", timezone.utc))
         typ = str(ev.get("type") or "").strip().upper() or "(event)"
@@ -346,6 +457,9 @@ CANARY_ID = int(os.getenv("DISCORD_CANARY_CHANNEL_ID", "0"))
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Guardrail: macro background loop task (prevents duplicate starts on reconnect).
+_macro_task: asyncio.Task | None = None
 
 # Optional: macro econ + calendar commands (Massive cache + autopost).
 try:
@@ -1429,7 +1543,7 @@ def _append_gprr_banner_cached(text: str, *, cached_asof_ts: float | None) -> st
 
 
 def _file_from_png_bytes(png_bytes: bytes, *, filename: str) -> discord.File:
-    return discord.File(fp=io.BytesIO(png_bytes), filename=str(filename or "chart.png"))
+    return file_from_png_bytes(png_bytes, filename=str(filename or "chart.png"))
 
 
 def _tnt_png_metadata() -> dict[str, str]:
@@ -2061,8 +2175,12 @@ async def run_heavy_chart(
             iv_bit = m.get("include_iv_overlay")
             iv_key = m.get("iv_key")
             worker = (os.getenv("TNT_WORKER_URL", "") or "").strip()
+            try:
+                channel_id = int(getattr(interaction, "channel_id", 0) or 0)
+            except Exception:
+                channel_id = 0
             print(
-                f"[TNT][OI][PROOF] render_mode={render_mode} symbol={sym} worker={worker} "
+                f"[TNT][OI][PROOF] render_mode={render_mode} symbol={sym} channel_id={channel_id} worker={worker} "
                 + f"include_iv={1 if bool(iv_bit) else 0} iv_key={str(iv_key or '')}"
             )
         except Exception:
@@ -4494,15 +4612,111 @@ def _build_status_report() -> str:
     now_str = now_et.strftime("%Y-%m-%d %H:%M:%S")
     session = delivery.market_session_et(now_et.astimezone(timezone.utc))
 
-    futures_payload, futures_status, futures_reason = delivery._futures_context_status(now_et.isoformat())
-    futures_age = futures_payload.get("age_minutes")
-    futures_age_text = f"{futures_age:.1f} min" if isinstance(futures_age, (int, float)) else "unknown"
-    futures_ts = futures_payload.get("computed_dt") or futures_payload.get("computed_ts")
-    futures_ts_text = delivery._format_ts_et(futures_ts) if futures_ts else "unknown"
-    futures_bits = [futures_status.upper(), f"age {futures_age_text}", f"updated {futures_ts_text}"]
-    if futures_reason and futures_status != "fresh":
-        futures_bits.append(futures_reason)
-    futures_line = " | ".join(bit for bit in futures_bits if bit)
+    def _legacy_futures_ingest_line() -> str | None:
+        try:
+            from services.futures.futures_store import FuturesStore
+            from services.observability.futures_ingest_health import classify_futures_ingest
+
+            store = FuturesStore()
+            hb_ts, hb_msg = store.get_heartbeat()
+            if hb_ts is None:
+                return None
+
+            now_s = float(time.time())
+            hb_age = max(0, int(round(now_s - float(hb_ts))))
+            hb_max = int(os.getenv("TNT_FUTURES_INGEST_HB_MAX_AGE_SEC", "90") or "90")
+            scores_max = int(os.getenv("TNT_FUTURES_INGEST_SCORES_MAX_AGE_SEC", "120") or "120")
+
+            scores = None
+            try:
+                scores = store.get_scores()
+            except Exception:
+                scores = None
+
+            status = None
+            try:
+                status = store.get_status()
+            except Exception:
+                status = None
+            note = str((status or {}).get("note") or "").strip()
+
+            scores_present = scores is not None
+            scores_age: int | None = None
+            if scores is not None:
+                updated_utc = None
+                try:
+                    updated_utc = getattr(scores, "updated_utc", None)
+                except Exception:
+                    updated_utc = None
+                if updated_utc is None and isinstance(scores, dict):
+                    updated_utc = scores.get("updated_utc")
+                try:
+                    scores_age = max(0, int(round(now_s - float(updated_utc)))) if updated_utc is not None else None
+                except Exception:
+                    scores_age = None
+
+            state, reason = classify_futures_ingest(
+                hb_age_s=hb_age,
+                scores_age_s=scores_age,
+                scores_present=bool(scores_present),
+                note=note,
+                hb_msg=hb_msg,
+                hb_max_age=int(hb_max),
+                scores_max_age=int(scores_max),
+            )
+
+            # Deterministic, operator-facing status line.
+            if state == "DOWN":
+                # Keep the established format.
+                if hb_age > hb_max:
+                    return f"DOWN (hb {hb_age}s stale)"
+                return f"DOWN (hb {hb_age}s)"
+
+            if state == "OK":
+                if isinstance(scores_age, int):
+                    return f"OK (hb {hb_age}s, scores {scores_age}s)"
+                return f"OK (hb {hb_age}s, scores unknown)"
+
+            # DEGRADED
+            if not scores_present or scores_age is None:
+                core = f"DEGRADED (hb {hb_age}s, scores missing"
+            elif scores_age > scores_max:
+                core = f"DEGRADED (hb {hb_age}s, scores {scores_age}s stale"
+            else:
+                core = f"DEGRADED (hb {hb_age}s, scores {scores_age}s"
+
+            extras: list[str] = []
+            if note and note.lower() not in {"ok"}:
+                extras.append(f"note={note}")
+            if hb_msg and str(hb_msg).strip() and str(hb_msg).strip().lower() not in {"ok"}:
+                extras.append(f"hb_msg={str(hb_msg).strip()}")
+            if reason and reason not in {"scores missing", "scores stale"} and not reason.startswith("hb "):
+                # Avoid duplicating the basic indicators.
+                if reason not in extras and not any(reason == x for x in extras):
+                    extras.append(reason)
+
+            if extras:
+                return core + "; " + "; ".join(extras) + ")"
+            return core + ")"
+        except Exception:
+            return None
+
+    futures_line = None
+    try:
+        futures_payload, futures_status, futures_reason = delivery._futures_context_status(now_et.isoformat())
+        futures_age = futures_payload.get("age_minutes")
+        futures_age_text = f"{futures_age:.1f} min" if isinstance(futures_age, (int, float)) else "unknown"
+        futures_ts = futures_payload.get("computed_dt") or futures_payload.get("computed_ts")
+        futures_ts_text = delivery._format_ts_et(futures_ts) if futures_ts else "unknown"
+        futures_bits = [str(futures_status or "").upper(), f"age {futures_age_text}", f"updated {futures_ts_text}"]
+        if futures_reason and futures_status != "fresh":
+            futures_bits.append(str(futures_reason))
+        futures_line = " | ".join(bit for bit in futures_bits if bit)
+    except Exception:
+        futures_line = None
+
+    # Prefer ingest-aligned heartbeat/scores status when available.
+    futures_line = _legacy_futures_ingest_line() or futures_line or "MISSING | age unknown | updated unknown"
 
     data_stale, data_age, data_ts = delivery._calc_data_stale()
     data_age_text = f"{data_age:.1f} min" if isinstance(data_age, (int, float)) else "unknown"
@@ -6573,7 +6787,7 @@ async def chart(
             except Exception:
                 pass
             filename = f"{(sym or '').lower().replace(':', '').replace('/', '_')}_chart.png"
-            file = discord.File(fp=io.BytesIO(png_bytes), filename=filename)
+            file = file_from_png_bytes(png_bytes, filename=filename)
 
             # Replace attachment in-place.
             try:
@@ -6643,7 +6857,7 @@ async def chart(
     try:
         await channel.send(
             content=text,
-            files=[discord.File(fp=io.BytesIO(png_bytes), filename=filename)],
+            files=[file_from_png_bytes(png_bytes, filename=filename)],
             view=view,
         )
     except Exception as exc:  # noqa: BLE001
@@ -6962,7 +7176,7 @@ async def vwap_range(
         return
 
     filename = f"{sym.lower()}_vwap_range.png"
-    file = discord.File(fp=io.BytesIO(png_bytes), filename=filename)
+    file = file_from_png_bytes(png_bytes, filename=filename)
 
     # Safe framing.
     content = (
@@ -7202,7 +7416,7 @@ async def rs(
         return
 
     filename = f"{sym.lower()}_vs_{bench.lower()}_rs.png"
-    file = discord.File(fp=io.BytesIO(png_bytes), filename=filename)
+    file = file_from_png_bytes(png_bytes, filename=filename)
 
     content = (
         f"📈 **Relative Strength** — **{sym} vs {bench}** | "
@@ -7590,7 +7804,7 @@ async def crypto_rs(interaction: discord.Interaction) -> None:
             await _reply(f"Crypto RS unavailable: {png_err}.")
         return
 
-    file = discord.File(fp=io.BytesIO(png_bytes), filename="crypto_rs.png")
+    file = file_from_png_bytes(png_bytes, filename="crypto_rs.png")
     asof_ts = 0.0
     age_d: int | None = None
     b20: float | None = None
@@ -7998,7 +8212,7 @@ async def crypto_vol(interaction: discord.Interaction) -> None:
             await _reply(f"Crypto vol unavailable: {png_err}.")
         return
 
-    file = discord.File(fp=io.BytesIO(png_bytes), filename="crypto_vol.png")
+    file = file_from_png_bytes(png_bytes, filename="crypto_vol.png")
     asof_ts = 0.0
     age_d: int | None = None
     brv_last: float | None = None
@@ -8834,7 +9048,7 @@ async def risk_on_off(
 
     filename = "risk_on_off.png"
     try:
-        await channel.send(content=headline, files=[discord.File(fp=io.BytesIO(png_bytes), filename=filename)])
+        await channel.send(content=headline, files=[file_from_png_bytes(png_bytes, filename=filename)])
     except Exception as exc:  # noqa: BLE001
         try:
             print(f"[TNT][RISK_ON_OFF][SEND][ERROR] {exc}")
@@ -8935,7 +9149,7 @@ async def pcr(
                 try:
                     await channel.send(
                         content=_append_gprr_banner(f"📊 **Put/Call Ratio (rolling)** — **{sym}** | _cached under load_"),
-                        files=[discord.File(fp=io.BytesIO(c_png), filename=f"{sym.lower()}_pcr.png")],
+                        files=[file_from_png_bytes(c_png, filename=f"{sym.lower()}_pcr.png")],
                     )
                     await _reply("✅ Posted cached PCR chart.")
                     return
@@ -8963,7 +9177,7 @@ async def pcr(
                         try:
                             await channel.send(
                                 content=_append_gprr_banner(f"📊 **Put/Call Ratio (rolling)** — **{sym}** | _stale cache under load_"),
-                                files=[discord.File(fp=io.BytesIO(s_png), filename=f"{sym.lower()}_pcr.png")],
+                                files=[file_from_png_bytes(s_png, filename=f"{sym.lower()}_pcr.png")],
                             )
                             await _reply("✅ Posted cached PCR chart (stale under load).")
                             return
@@ -9296,7 +9510,7 @@ async def pcr(
         return
 
     try:
-        await channel.send(content=headline, files=[discord.File(fp=io.BytesIO(png_bytes), filename=filename)])
+        await channel.send(content=headline, files=[file_from_png_bytes(png_bytes, filename=filename)])
     except Exception as exc:  # noqa: BLE001
         try:
             print(f"[TNT][PCR][SEND][ERROR] {exc}")
@@ -10493,7 +10707,10 @@ async def oi(
                     pass
                 try:
                     worker = (os.getenv("TNT_WORKER_URL", "") or "").strip()
-                    print(f"[TNT][OI][PROOF] render_mode=worker symbol={sym} worker={worker} key={cache_key_png_full}")
+                    cid = int(getattr(interaction, "channel_id", 0) or 0)
+                    print(
+                        f"[TNT][OI][PROOF] render_mode=worker symbol={sym} channel_id={cid} worker={worker} key={cache_key_png_full}"
+                    )
                 except Exception:
                     pass
 
@@ -10570,7 +10787,8 @@ async def oi(
             except Exception:
                 pass
             try:
-                print(f"[TNT][OI][PROOF] render_mode=local symbol={sym} key={cache_key_png_full}")
+                cid = int(getattr(interaction, "channel_id", 0) or 0)
+                print(f"[TNT][OI][PROOF] render_mode=local symbol={sym} channel_id={cid} key={cache_key_png_full}")
             except Exception:
                 pass
             if not png:
@@ -14467,6 +14685,81 @@ async def on_ready() -> None:
     if bot.user is not None:
         print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
+    # Control-plane probe: channel permissions for key ops channels.
+    # This avoids "random" failures that are actually Discord perms/category overrides.
+    try:
+        def _parse_channel_id(raw: str) -> int | None:
+            t = (raw or "").strip()
+            if not t or not t.isdigit():
+                return None
+            try:
+                v = int(t)
+                return v if v > 0 else None
+            except Exception:
+                return None
+
+        def _perm_report(perms: discord.Permissions) -> list[str]:
+            missing: list[str] = []
+            # Required for posting rich macro cards.
+            if not perms.view_channel:
+                missing.append("View Channel")
+            if not perms.send_messages:
+                missing.append("Send Messages")
+            if not perms.embed_links:
+                missing.append("Embed Links")
+            if not perms.attach_files:
+                missing.append("Attach Files")
+            # Useful for Ask-TNT read/route.
+            if not perms.read_message_history:
+                missing.append("Read Message History")
+            return missing
+
+        async def _probe_channel(channel_id: int, *, label: str) -> None:
+            try:
+                ch = bot.get_channel(channel_id)
+                if ch is None:
+                    try:
+                        ch = await bot.fetch_channel(channel_id)
+                    except Exception:
+                        ch = None
+                if ch is None:
+                    print(f"[TNT][PERMS][WARN] {label}: channel not found id={channel_id}")
+                    return
+
+                guild = getattr(ch, "guild", None)
+                if guild is None or bot.user is None:
+                    return
+
+                member = getattr(guild, "me", None)
+                if member is None:
+                    try:
+                        member = guild.get_member(bot.user.id)
+                    except Exception:
+                        member = None
+
+                if member is None:
+                    # As a fallback, we can still print a useful hint.
+                    print(f"[TNT][PERMS][WARN] {label}: unable to resolve bot member for guild={getattr(guild, 'id', '?')}")
+                    return
+
+                perms = ch.permissions_for(member)
+                missing = _perm_report(perms)
+                if missing:
+                    print(f"[TNT][PERMS][FAIL] {label}: missing={missing} channel_id={channel_id}")
+                else:
+                    print(f"[TNT][PERMS][OK] {label}: ok channel_id={channel_id}")
+            except Exception as exc:
+                print(f"[TNT][PERMS][WARN] {label}: probe failed id={channel_id} err={type(exc).__name__}:{exc}")
+
+        ask_id = _parse_channel_id(_config_value("TNT_ASK_CHANNEL_ID") or _config_value("ASK_TNT_CHANNEL_ID"))
+        cal_id = _parse_channel_id(_config_value("TNT_CALENDAR_EARNINGS_CHANNEL_ID") or _config_value("CALENDAR_EARNINGS_CHANNEL_ID"))
+        if ask_id:
+            asyncio.create_task(_probe_channel(ask_id, label="ask-tnt"))
+        if cal_id:
+            asyncio.create_task(_probe_channel(cal_id, label="calendar-earnings"))
+    except Exception:
+        pass
+
     # Worker health probe (ops visibility): if OI is worker-required and the worker is on an
     # older build, layout fixes will not appear even after restarting this bot.
     try:
@@ -14524,14 +14817,22 @@ async def on_ready() -> None:
 
     # Macro econ loops: refresh Massive econ cache + autopost macro cards.
     try:
-        if not hasattr(bot, "_tnt_macro_task") or getattr(bot, "_tnt_macro_task") is None or getattr(bot, "_tnt_macro_task").done():
-            from jobs.macro_econ_jobs import run_macro_loops
-            from services.redis_env import redis_client
+        global _macro_task
+        if _macro_task is not None and not _macro_task.done():
+            return
 
-            r = redis_client(timeout_s=2.0, decode_responses=True)
-            setattr(bot, "_tnt_macro_task", asyncio.create_task(run_macro_loops(bot, r)))
-            print("[TNT][MACRO] Macro econ loops started")
+        from jobs.macro_econ_jobs import run_macro_loops
+        from services.redis_env import redis_client
+
+        r = redis_client(timeout_s=2.0, decode_responses=True)
+        _macro_task = asyncio.create_task(run_macro_loops(bot, r))
+        setattr(bot, "_tnt_macro_task", _macro_task)
+        print("[TNT][MACRO] Macro econ loops started")
     except Exception as exc:
+        try:
+            _macro_task = None
+        except Exception:
+            pass
         try:
             print(f"[TNT][MACRO][WARN] Failed to start macro loops: {type(exc).__name__}: {exc}")
         except Exception:
@@ -14602,10 +14903,41 @@ async def on_message(message: discord.Message) -> None:
     except Exception:
         pass
 
+    # Ask-TNT channel (no mention needed): macro posture/regime, next events, blackout.
+    try:
+        from services.ask_tnt_router import handle_ask_channel_message
+        from services.redis_env import redis_client
+
+        r = None
+        try:
+            r = redis_client(timeout_s=1.5, decode_responses=True)
+        except Exception:
+            r = None
+
+        if await handle_ask_channel_message(message, bot, r):
+            return
+    except Exception:
+        pass
+
+    # Everywhere else: Ask-TNT replies only on mention / reply-to-bot.
+    try:
+        from ask.mention_router import maybe_handle_ask_mentions
+
+        decision = await maybe_handle_ask_mentions(bot, message)
+        if decision.handled:
+            if decision.reply:
+                await message.reply(decision.reply, mention_author=False)
+            return
+    except Exception:
+        pass
+
     # Deterministic macro/econ calendar (CPI/FOMC/NFP/etc). Prefer CSV (rich) with Redis fallback (gating).
     try:
+        from services.ask_tnt_router import is_ask_channel, load_ask_config
+
+        cfg = load_ask_config()
         content = (message.content or "").strip()
-        if content and len(content) <= 220:
+        if is_ask_channel(message.channel, cfg=cfg, strict=False) and content and len(content) <= 220:
             reply = _macro_calendar_render_reply(query=content)
             if reply:
                 await message.reply(reply, mention_author=False)
@@ -15028,7 +15360,12 @@ async def on_message(message: discord.Message) -> None:
     except Exception:
         pass
 
-    await bot.process_commands(message)
+    # Unit tests use light fake message objects; skip discord.py command processing in that case.
+    try:
+        if hasattr(message, "_state"):
+            await bot.process_commands(message)
+    except Exception:
+        pass
 
     # GPRR (GPU Pressure Relief & Render Autopilot) V1a heuristic baseline.
     try:
@@ -15074,8 +15411,28 @@ if __name__ == "__main__":
         try:
             lock_dir = Path("logs")
             lock_dir.mkdir(parents=True, exist_ok=True)
-            safe_entry = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in _TNT_ENTRYPOINT)
-            lock_path = lock_dir / f"tnt_discord_bot.{safe_entry}.lock"
+
+            # Token-aware lock even when the token is only in dotenv files.
+            # We *read* dotenv values without mutating env because this runs before
+            # `_dotenv_load_into_environ()` by design.
+            token = (os.getenv("DISCORD_BOT_TOKEN") or "").strip()
+            if not token:
+                try:
+                    for env_path in (PROJECT_ROOT / ".env.local", PROJECT_ROOT / ".env"):
+                        val = _dotenv_get_value(env_path, "DISCORD_BOT_TOKEN")
+                        if val:
+                            token = val
+                            break
+                except Exception:
+                    pass
+
+            lock_id = "default"
+            if token:
+                import hashlib
+
+                lock_id = hashlib.sha1(token.encode("utf-8")).hexdigest()[:12]
+
+            lock_path = lock_dir / f"tnt_discord_bot.{lock_id}.lock"
             fh = open(lock_path, "a+", encoding="utf-8")
 
             # Ensure the lock handle is not inheritable. If a child process inherits
@@ -15142,8 +15499,11 @@ if __name__ == "__main__":
     except Exception:
         pass
 
+    _print_control_plane_proof()
+
     _print_start_banner()
     _print_env_snapshot()
+    _print_ask_router_snapshot()
     try:
         _preflight_filesystem()
     except Exception as exc:

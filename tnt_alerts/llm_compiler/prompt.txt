@@ -5,6 +5,7 @@ HARD RULES:
 - You MUST use ONLY the allowed enums and shapes listed below.
 - If the user asks for unsupported features (options/OI/news/custom indicators), set ok=false and propose the closest supported alternative in clarify.
 - If the direction/timeframe/session is missing, you may fill defaults and add a warning.
+- Include intent.direction as one of: AUTO/BULLISH/BEARISH/NEUTRAL. If the user doesn't specify, use AUTO.
 - Symbols must be uppercase. If more than 20 symbols are requested, set ok=false and clarify how to split or use a watchlist.
 
 ALLOWED TIMEFRAMES: 1m,2m,3m,5m,10m,15m,30m,60m,1D
@@ -44,3 +45,60 @@ DEFAULTS (if missing):
 
 Return envelope:
 { "ok": boolean, "intent": AlertIntent|null, "warnings": [], "clarify": object|null }
+
+AlertIntent v1 REQUIRED SHAPE (when ok=true):
+{
+	"version": "1.0",
+	"source": {
+		"user_id": "<string>",
+		"channel_id": "<string>",
+		"request_text": "<original user request>",
+		"created_at_utc": "<ISO-8601 datetime>"
+	},
+	"targets": {
+		"type": "symbols"|"watchlist",
+		"symbols": ["SPY"],
+		"watchlist": null|"<name>",
+		"max_symbols": 20
+	},
+	"direction": "AUTO"|"BULLISH"|"BEARISH"|"NEUTRAL",
+	"condition": { ... },
+	"gates": {
+		"market_hours": {"session": "RTH"|"ETH"|"CUSTOM", "time_window_et": null|["HH:MM","HH:MM"]},
+		"cooldown": {"seconds": 300},
+		"max_triggers": {"count": 20},
+		"data_freshness": {"price_age_seconds": 30},
+		"regime": {"allowed": ["BULLISH"], "min_confidence": 0.5}
+	},
+	"lifecycle": {"start": "now", "expires": null|{"type":"relative","hours":8}|{"type":"date","date":"YYYY-MM-DD"}},
+	"actions": [{"type": "discord_notify", "style": "compact"}],
+	"tags": {}
+}
+
+IMPORTANT:
+- "condition" is a SINGLE object (NOT an array of conditions).
+- "gates" is an object keyed by gate name (NOT a list).
+
+Example (SPY crosses ABOVE VWAP on 5m):
+{
+	"ok": true,
+	"intent": {
+		"version": "1.0",
+		"source": {"user_id":"<string>","channel_id":"<string>","request_text":"...","created_at_utc":"2026-01-16T00:00:00Z"},
+		"targets": {"type":"symbols","symbols":["SPY"],"watchlist":null,"max_symbols":20},
+		"condition": {
+			"type":"cross",
+			"op":"crosses_above",
+			"left":{"type":"price","field":"last"},
+			"right":{"type":"indicator","name":"vwap","params":{}},
+			"timeframe":"5m",
+			"confirm":"close"
+		},
+		"gates": {"market_hours":{"session":"RTH","time_window_et":null}},
+		"lifecycle": {"start":"now","expires":{"type":"relative","hours":8}},
+		"actions": [{"type":"discord_notify","style":"compact"}],
+		"tags": {}
+	},
+	"warnings": [],
+	"clarify": null
+}

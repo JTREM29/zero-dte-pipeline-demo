@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -168,6 +169,12 @@ def save_state(alert_id: str, symbol: str, state: dict) -> None:
 def enqueue_actions(*, alert_id: str, symbol: str, intent: AlertIntentV1, event: dict, actions: list[dict]) -> None:
     r = _redis_client()
 
+    host = (os.getenv("TNT_REDIS_HOST", "127.0.0.1") or "127.0.0.1").strip()
+    port = _env_int("TNT_REDIS_PORT", 6379)
+    db = _env_int("TNT_REDIS_DB", 0)
+
+    queue_key = (os.getenv("TNT_REDIS_QUEUE", "tnt:jobs") or "tnt:jobs").strip()
+
     job = {
         "type": "alert_trigger",
         "job_id": f"alert_trigger:{alert_id}:{symbol}:{event.get('ts_utc')}",
@@ -183,7 +190,16 @@ def enqueue_actions(*, alert_id: str, symbol: str, intent: AlertIntentV1, event:
         "actions": actions,
     }
 
-    r.rpush(os.getenv("TNT_REDIS_QUEUE", "tnt:jobs"), json.dumps(job, separators=(",", ":")))
+    r.rpush(queue_key, json.dumps(job, separators=(",", ":")))
+
+    # Proof-grade enqueue marker (connects TRIGGER -> POP -> POSTED).
+    try:
+        print(
+            "[TNT][ALERTS][SCHED][ENQUEUE] "
+            + f"redis={host}:{port}/{db} queue={queue_key} alert_id={alert_id} job_id={job.get('job_id')} symbol={symbol}"
+        )
+    except Exception:
+        pass
 
 
 # ---- Scheduler loop skeleton -------------------------------------------------
@@ -212,6 +228,15 @@ def scheduler_tick(
     """
 
     r = _redis_client()
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+    # Ops heartbeat (best-effort).
+    try:
+        r.set("tnt:alerts:scheduler:last_tick_utc", now_utc)
+        r.set("tnt:alerts:scheduler:last_tf", str(tf))
+    except Exception:
+        pass
+
     alert_ids = list(r.smembers(tf_key(tf)))
     intents = load_alert_intents(alert_ids)
 
@@ -222,6 +247,8 @@ def scheduler_tick(
             symbol_to_alerts.setdefault(sym, []).append((alert_id, intent))
 
     snaps = fetch_snaps(list(symbol_to_alerts.keys()), tf)
+
+    enqueued = 0
 
     for sym, alert_list in symbol_to_alerts.items():
         snap = snaps.get(sym)
@@ -236,7 +263,51 @@ def scheduler_tick(
             event = evaluate_alert(intent, snap, ctx, gctx, state)
             save_state(alert_id, sym, state)
 
-            if event.get("decision") == "TRIGGERED":
+            decision = str((event or {}).get("decision") or "")
+            if decision and decision != "TRIGGERED":
+                # Best-effort: capture the most recent non-trigger decision and why.
+                try:
+                    r.set("tnt:alerts:last_skip_utc", str(event.get("ts_utc") or now_utc))
+                    r.set("tnt:alerts:last_skip_alert_id", str(alert_id))
+                    r.set("tnt:alerts:last_skip_symbol", str(sym))
+                    r.set("tnt:alerts:last_skip_tf", str(tf))
+                    r.set("tnt:alerts:last_skip_decision", str(decision))
+                    reasons = event.get("reason_codes")
+                    if isinstance(reasons, list):
+                        r.set("tnt:alerts:last_skip_reason_codes", json.dumps(reasons, separators=(",", ":"), ensure_ascii=False))
+                    elif reasons:
+                        r.set("tnt:alerts:last_skip_reason_codes", str(reasons))
+
+                    # Optional: store a richer reason detail (first gate reason) for ops UX.
+                    try:
+                        gates = ((event or {}).get("eval") or {}).get("gates")
+                        r0 = gates[0] if isinstance(gates, list) and gates else None
+                        if isinstance(r0, dict):
+                            headline = str(r0.get("headline") or "").strip()
+                            detail = str(r0.get("detail") or "").strip()
+                            note = str(r0.get("note") or "").strip()
+                            msg = ""
+                            if headline:
+                                msg = f"Suppressed: {headline}"
+                                if detail:
+                                    msg += f" ({detail})"
+                            elif note:
+                                msg = note
+                            if msg:
+                                r.set("tnt:alerts:last_skip_reason_detail", msg[:240])
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            if decision == "TRIGGERED":
+                try:
+                    r.set("tnt:alerts:last_trigger_utc", str(event.get("ts_utc") or now_utc))
+                    r.set("tnt:alerts:last_trigger_alert_id", str(alert_id))
+                    r.set("tnt:alerts:last_trigger_symbol", str(sym))
+                    r.set("tnt:alerts:last_trigger_tf", str(tf))
+                except Exception:
+                    pass
                 enqueue_actions(
                     alert_id=alert_id,
                     symbol=sym,
@@ -244,6 +315,12 @@ def scheduler_tick(
                     event=event,
                     actions=[a.model_dump(mode="json") for a in intent.actions],
                 )
+                enqueued += 1
+
+    try:
+        r.set("tnt:alerts:scheduler:last_enqueued", str(enqueued))
+    except Exception:
+        pass
 
 
 def sleep_until_boundary(tf: str) -> None:

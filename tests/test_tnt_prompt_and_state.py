@@ -58,7 +58,7 @@ def test_tnt_state_from_analysis_payload_validates() -> None:
             "display_symbol": "SPY",
             "price_context": {
                 "mode": "LIVE",
-                "source": "Massive",
+                "source": "EXTERNAL",
                 "last_price_ts": "2025-12-24T14:41:12+00:00",
                 "last_price": 508.25,
             },

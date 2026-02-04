@@ -68,7 +68,7 @@ def validate_intent(intent: AlertIntentV1) -> tuple[AlertIntentV1, list[str]]:
     if intent.gates.cooldown and int(intent.gates.cooldown.seconds) < 0:
         raise AlertValidationError(ERR_INVALID_NUMBER, "cooldown.seconds must be >= 0")
 
-    if int(intent.gates.max_triggers or 0) <= 0:
+    if intent.gates.max_triggers is not None and int(intent.gates.max_triggers) <= 0:
         raise AlertValidationError(ERR_INVALID_NUMBER, "max_triggers must be >= 1")
 
     # Expiry cap (v1): 30d

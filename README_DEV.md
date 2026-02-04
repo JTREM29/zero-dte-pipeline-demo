@@ -15,7 +15,7 @@ This guide captures the day-to-day workflow for running the Zero DTE pipeline lo
    ```powershell
    Copy-Item .env.example .env
    ```
-   Fill in IQFeed login, Polygon API key, Discord tokens/webhooks, and any optional providers you plan to exercise.
+   Fill in IQFeed login, market data API keys, Discord tokens/webhooks, and any optional integrations you plan to exercise.
 
 ## 2. IQFeed Data Collectors
 
@@ -56,6 +56,178 @@ Optional env vars (feature flags / tuning):
 
 - `TNT_CRYPTO_WATCHLIST` — comma-separated symbols for `/crypto_watchlist` (default: `BTC,ETH,XRP,DOGE,LTC`).
 - `TNT_TTL_CRYPTO_WATCHLIST_SEC` — TTL seconds for the text watchlist cache (default: `300`, clamped 30–3600).
+
+### Alert trigger context line (“Edge Clarity”)
+
+When an alert actually triggers, the bot can optionally append one extra line of context, for example:
+
+`🧠 Context: ES: bearish • earnings AMC tomorrow (confirmed) • expected move ±4.2% • News: quiet`
+
+Design constraints:
+
+- Off by default (env-gated)
+- Trigger-only (does not run on every evaluation)
+- Cache-only (Redis reads only; no new external calls)
+- Rate-limited per `alert_id` via Redis TTL to prevent noisy repeats
+
+Enable in `.env.local` (recommended production defaults):
+
+```ini
+# Edge Clarity line (trigger messages)
+ALERT_CONTEXT_LINE_ENABLED=1
+ALERT_CONTEXT_LINE_MAX_TOKENS=100
+ALERT_CONTEXT_LINE_COOLDOWN_SEC=300
+ALERT_CONTEXT_LINE_INCLUDE_FUTURES=1
+ALERT_CONTEXT_LINE_INCLUDE_EARNINGS=1
+ALERT_CONTEXT_LINE_INCLUDE_NEWS=1
+```
+
+If news ingest isn’t stable yet, set:
+
+```ini
+ALERT_CONTEXT_LINE_INCLUDE_NEWS=0
+```
+
+Cache sources used:
+
+- Preferred: canonical ctx snapshots (when enabled)
+   - Market: `ctx:market`
+   - Per-symbol: `ctx:sym:{SYM}`
+
+- Futures: `fut:scores` (derives ES bias from the cached regime; does not include raw prices)
+- Earnings: `cal:earnings:{SYM}` (requires `refreshed_utc` and honors `EARNINGS_PREVIEW_STALE_HOURS`; today/tomorrow only)
+- News: `news:symbol:{SYM}:last_ts` and `news:market:last_ts` (stamp-only: “just hit / recent / quiet”)
+
+Legacy keys above remain as fallback sources while `CTX_SNAPSHOT_STRICT=off|shadow`. In strict mode, UI context is omitted rather than falling back.
+
+### Context Snapshots (`ctx:*`) rollout (recommended)
+
+TNT can optionally build context snapshots in Redis (`ctx:market`, `ctx:sym:{SYM}`) so alerts, previews, gates, status, and trigger messaging all use the same canonical context (futures bias, earnings risk, news state).
+
+Messaging contract (immutable): see `docs/AI_TRADE_CANDIDATES_CONTRACT.md`.
+
+**Enable snapshots (safe)**
+
+```ini
+CTX_SNAPSHOT_ENABLED=1
+
+# optional
+CTX_SNAPSHOT_SYMBOLS=SPY,QQQ,IWM,AAPL,MSFT,NVDA,TSLA,AMZN,META,GOOGL
+CTX_SNAPSHOT_INTERVAL_SEC=30
+CTX_SNAPSHOT_TTL_SEC=120
+CTX_SNAPSHOT_EARNINGS_STALE_HOURS=48
+CTX_CANDIDATES_APPROVED_CAP=5
+```
+
+**Strict modes (cutover is reversible)**
+
+```ini
+# off (default): consumers prefer ctx but may fallback
+CTX_SNAPSHOT_STRICT=0
+
+# shadow: allow fallback, but record ctx misses (recommended first)
+CTX_SNAPSHOT_STRICT=shadow
+
+# on: strict (no fallback); risk gates fail-closed if ctx missing/stale
+CTX_SNAPSHOT_STRICT=1
+```
+
+**Recommended rollout**
+
+Start in shadow mode during market hours:
+
+```ini
+CTX_SNAPSHOT_ENABLED=1
+CTX_SNAPSHOT_STRICT=shadow
+```
+
+Monitor health with:
+
+- `/context_status` (ephemeral): hb age, last errors, miss counters (`ctx:miss:*`, `ctx:miss_last:*`)
+- `/alerts_status`: includes “Context (ctx:*)” and strict mode
+
+If ctx misses stop increasing under normal load, flip to strict:
+
+```ini
+CTX_SNAPSHOT_STRICT=1
+```
+
+Emergency revert (instant):
+
+```ini
+CTX_SNAPSHOT_STRICT=shadow
+```
+
+**Miss telemetry (debug)**
+
+When ctx is enabled, consumers record misses to Redis:
+
+- `ctx:miss:{consumer}`
+- `ctx:miss_last:{consumer}`
+
+Global last miss (also written):
+
+- `ctx:miss_last`
+
+Common consumer tags:
+
+`edge_clarity`, `preview_footer`, `earnings_blackout_gate`, `news_blackout_gate`,
+`futures_conflict_gate`, `alerts_status`
+
+### Go-live: enable ctx + news + futures + ops recaps (checklist)
+
+Create your channels:
+
+- `#calendar-earnings`
+- (Optional) `#tnt-ops` (you can start with one channel; split later if volume warrants)
+
+When you have your channel ID, set these in `.env.local`:
+
+```ini
+# Context snapshots
+CTX_SNAPSHOT_ENABLED=1
+CTX_SNAPSHOT_STRICT=shadow
+CTX_SNAPSHOT_INTERVAL_SEC=30
+CTX_SNAPSHOT_TTL_SEC=120
+
+# Earnings autoposts
+EARNINGS_AUTOPOST_ENABLED=1
+EARNINGS_POST_CHANNEL_ID=YOUR_CHANNEL_ID
+EARNINGS_PRECLOSE_ENABLED=1
+
+# News broadcast (no spam)
+NEWS_BROADCAST_ENABLED=1
+NEWS_BROADCAST_CHANNEL_ID=YOUR_CHANNEL_ID
+NEWS_BROADCAST_COOLDOWN_SEC=600
+
+# Futures broadcast (bias flip only)
+FUTURES_BROADCAST_ENABLED=1
+FUTURES_BROADCAST_CHANNEL_ID=YOUR_CHANNEL_ID
+FUTURES_BROADCAST_COOLDOWN_SEC=900
+
+# Ops recaps
+OPS_DAILY_RECAP_ENABLED=1
+OPS_WEEKLY_RECAP_ENABLED=1
+OPS_RECAP_CHANNEL_ID=YOUR_CHANNEL_ID
+```
+
+Recommended: keep all three posting into the same channel initially. Once you see volume, split ops to a separate channel.
+
+Runbook for go-live:
+
+- Restart bot
+- Run `/context_status` → confirm hb age is healthy, `strict=shadow`, misses low
+- Trigger a test event:
+   - `/news_ping_market` (seeds market news state)
+   - `/news_ping SPY` (seeds symbol news state)
+ - Confirm broadcast happens once per transition (cooldown/locks prevent repeats)
+ - After one clean session with low/no misses: `CTX_SNAPSHOT_STRICT=1`
+
+Emergency revert (instant):
+
+```ini
+CTX_SNAPSHOT_STRICT=shadow
+```
 
 Note: [run_discord_v1_beta.ps1](run_discord_v1_beta.ps1) will also load `DISCORD_BOT_TOKEN` and `DISCORD_CANARY_CHANNEL_ID` from `.env.local` or `.env` if they are not already set in your session. Avoid pasting bot tokens into chat logs.
 

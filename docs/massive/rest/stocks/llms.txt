@@ -1,0 +1,76 @@
+# REST API
+
+## Aggregates
+
+- [Custom Bars (OHLC)](https://massive.com/docs/rest/stocks/aggregates/custom-bars.md): Retrieve aggregated historical OHLC (Open, High, Low, Close) and volume data for a specified stock ticker over a custom date range and time interval in Eastern Time (ET)
+- [Daily Market Summary (OHLC)](https://massive.com/docs/rest/stocks/aggregates/daily-market-summary.md): Retrieve daily OHLC (open, high, low, close), volume, and volume-weighted average price (VWAP) data for all U.S
+- [Daily Ticker Summary (OHLC)](https://massive.com/docs/rest/stocks/aggregates/daily-ticker-summary.md): Retrieve the opening and closing prices for a specific stock ticker on a given date, along with any pre-market and after-hours trade prices
+- [Previous Day Bar (OHLC)](https://massive.com/docs/rest/stocks/aggregates/previous-day-bar.md): Retrieve the previous trading day's open, high, low, and close (OHLC) data for a specified stock ticker
+
+## Corporate Actions
+
+- [Dividends](https://massive.com/docs/rest/stocks/corporate-actions/dividends.md): Retrieve a historical record of cash dividend distributions for a given ticker, including declaration, ex-dividend, record, and pay dates, as well as payout amounts and adjustment factors for normalizing historical data to offset the effects of dividends
+- [Initial Public Offerings (IPOs)](https://massive.com/docs/rest/stocks/corporate-actions/ipos.md): Retrieve comprehensive information on Initial Public Offerings (IPOs), including upcoming and historical events, starting from the year 2008
+- [Dividends (Deprecated)](https://massive.com/docs/rest/stocks/corporate-actions/reference-dividends.md): Retrieve a historical record of cash dividend distributions for a given ticker, including declaration, ex-dividend, record, and pay dates, as well as payout amounts and frequency
+- [Splits (Deprecated)](https://massive.com/docs/rest/stocks/corporate-actions/reference-splits.md): Retrieve historical stock split events, including execution dates and ratio factors, to understand changes in a company’s share structure over time
+- [Splits](https://massive.com/docs/rest/stocks/corporate-actions/splits.md): Retrieve historical stock split events, including execution dates and ratio factors, to understand changes in a company’s share structure over time
+- [Ticker Events](https://massive.com/docs/rest/stocks/corporate-actions/ticker-events.md): Retrieve a timeline of key events associated with a given ticker, CUSIP, or Composite FIGI
+
+## Filings
+
+- [10-K Sections](https://massive.com/docs/rest/stocks/filings/10-k-sections.md): Plain-text content of specific sections from SEC filings
+- [Risk Categories](https://massive.com/docs/rest/stocks/filings/risk-categories.md): The full taxonomy used to classify risk factors in the Risk Factors API
+- [Risk Factors](https://massive.com/docs/rest/stocks/filings/risk-factors.md): Standardized, machine-readable risk factor disclosures from SEC filings
+
+## Fundamentals
+
+- [Balance Sheets](https://massive.com/docs/rest/stocks/fundamentals/balance-sheets.md): Retrieve comprehensive balance sheet data for public companies, containing quarterly and annual financial positions
+- [Cash Flow Statements](https://massive.com/docs/rest/stocks/fundamentals/cash-flow-statements.md): Retrieve comprehensive cash flow statement data for public companies, including quarterly, annual, and trailing twelve-month cash flows
+- [Financials (Deprecated)](https://massive.com/docs/rest/stocks/fundamentals/financials.md): Retrieve historical financial data for a specified stock ticker, derived from company SEC filings and extracted via XBRL
+- [Float](https://massive.com/docs/rest/stocks/fundamentals/float.md): Retrieve the latest free float for a specified stock ticker
+- [Income Statements](https://massive.com/docs/rest/stocks/fundamentals/income-statements.md): Retrieve comprehensive income statement data for public companies, including key metrics such as revenue, expenses, and net income for various reporting periods
+- [Ratios](https://massive.com/docs/rest/stocks/fundamentals/ratios.md): Retrieve comprehensive financial ratios data providing key valuation, profitability, liquidity, and leverage metrics for public companies
+- [Short Interest](https://massive.com/docs/rest/stocks/fundamentals/short-interest.md): Retrieve bi-monthly aggregated short interest data reported to FINRA by broker-dealers for a specified stock ticker
+- [Short Volume](https://massive.com/docs/rest/stocks/fundamentals/short-volume.md): Retrieve daily aggregated short sale volume data reported to FINRA from off-exchange trading venues and alternative trading systems (ATS) for a specified stock ticker
+
+## Market Operations
+
+- [Condition Codes](https://massive.com/docs/rest/stocks/market-operations/condition-codes.md): Retrieve a unified and comprehensive list of trade and quote conditions from various upstream market data providers (e.g., CTA, UTP, OPRA, FINRA)
+- [Exchanges](https://massive.com/docs/rest/stocks/market-operations/exchanges.md): Retrieve a list of known exchanges, including their identifiers, names, market types, and other relevant attributes
+- [Market Holidays](https://massive.com/docs/rest/stocks/market-operations/market-holidays.md): Retrieve upcoming market holidays and their corresponding open/close times
+- [Market Status](https://massive.com/docs/rest/stocks/market-operations/market-status.md): Retrieve the current trading status for various exchanges and overall financial markets
+
+## News
+
+- [News](https://massive.com/docs/rest/stocks/news.md): Retrieve the most recent news articles related to a specified ticker, along with summaries, source details, and sentiment analysis
+
+## Snapshots
+
+- [Full Market Snapshot](https://massive.com/docs/rest/stocks/snapshots/full-market-snapshot.md): Retrieve a comprehensive snapshot of the entire U.S
+- [Single Ticker Snapshot](https://massive.com/docs/rest/stocks/snapshots/single-ticker-snapshot.md): Retrieve the most recent market data snapshot for a single ticker
+- [Top Market Movers](https://massive.com/docs/rest/stocks/snapshots/top-market-movers.md): Retrieve snapshot data highlighting the top 20 gainers or losers in the U.S
+- [Unified Snapshot](https://massive.com/docs/rest/stocks/snapshots/unified-snapshot.md): Retrieve unified snapshots of market data for multiple asset classes including stocks, options, forex, and cryptocurrencies in a single request
+
+## Technical Indicators
+
+- [Exponential Moving Average (EMA)](https://massive.com/docs/rest/stocks/technical-indicators/exponential-moving-average.md): Retrieve the Exponential Moving Average (EMA) for a specified ticker over a defined time range
+- [Moving Average Convergence/Divergence (MACD)](https://massive.com/docs/rest/stocks/technical-indicators/moving-average-convergence-divergence.md): Retrieve the Moving Average Convergence/Divergence (MACD) for a specified ticker over a defined time range
+- [Relative Strength Index (RSI)](https://massive.com/docs/rest/stocks/technical-indicators/relative-strength-index.md): Retrieve the Relative Strength Index (RSI) for a specified ticker over a defined time range
+- [Simple Moving Average (SMA)](https://massive.com/docs/rest/stocks/technical-indicators/simple-moving-average.md): Retrieve the Simple Moving Average (SMA) for a specified ticker over a defined time range
+
+## Tickers
+
+- [All Listings](https://massive.com/docs/rest/stocks/tickers/all-listings.md)
+- [All Tickers](https://massive.com/docs/rest/stocks/tickers/all-tickers.md): Retrieve a comprehensive list of ticker symbols supported by Massive across various asset classes (e.g., stocks, indices, forex, crypto)
+- [Listing Overview](https://massive.com/docs/rest/stocks/tickers/listing-overview.md)
+- [Listing Updates](https://massive.com/docs/rest/stocks/tickers/listing-updates.md)
+- [Related Tickers](https://massive.com/docs/rest/stocks/tickers/related-tickers.md): Retrieve a list of tickers related to a specified ticker, identified through an analysis of news coverage and returns data
+- [Ticker Overview](https://massive.com/docs/rest/stocks/tickers/ticker-overview.md): Retrieve comprehensive details for a single ticker supported by Massive
+- [Ticker Types](https://massive.com/docs/rest/stocks/tickers/ticker-types.md): Retrieve a list of all ticker types supported by Massive
+
+## Trades Quotes
+
+- [Last Quote](https://massive.com/docs/rest/stocks/trades-quotes/last-quote.md): Retrieve the most recent National Best Bid and Offer (NBBO) quote for a specified stock ticker, including the latest bid/ask prices, sizes, exchange details, and timestamp
+- [Last Trade](https://massive.com/docs/rest/stocks/trades-quotes/last-trade.md): Retrieve the latest available trade for a specified stock ticker, including details such as price, size, exchange, and timestamp
+- [Quotes](https://massive.com/docs/rest/stocks/trades-quotes/quotes.md): Retrieve National Best Bid and Offer (NBBO) quotes for a specified stock ticker over a defined time range
+- [Trades](https://massive.com/docs/rest/stocks/trades-quotes/trades.md): Retrieve comprehensive, tick-level trade data for a specified stock ticker within a defined time range

@@ -63,6 +63,7 @@ HARD RULES:
 - You MUST use ONLY the allowed enums and shapes listed below.
 - If the user asks for unsupported features (options/OI/news/custom indicators), set ok=false and propose the closest supported alternative in clarify.
 - If the direction/timeframe/session is missing, you may fill defaults and add a warning.
+- Include intent.direction as one of: AUTO/BULLISH/BEARISH/NEUTRAL. If the user doesn't specify, use AUTO.
 - Symbols must be uppercase. If more than 20 symbols are requested, set ok=false and clarify how to split or use a watchlist.
 
 ALLOWED TIMEFRAMES: 1m,2m,3m,5m,10m,15m,30m,60m,1D
@@ -85,6 +86,9 @@ ALLOWED LEVELS:
 ALLOWED GATES:
 - regime: allowed list, min_confidence optional
 - market_hours: session {RTH,ETH,CUSTOM} and time_window_et if CUSTOM
+- macro_blackout: event_types optional, pre_minutes, post_minutes
+- earnings_blackout: pre_minutes, post_minutes, confirmed_only
+- news_blackout: minutes, market_minutes
 - cooldown: seconds int
 - max_triggers: count int
 - data_freshness: price_age_seconds int
@@ -102,21 +106,13 @@ DEFAULTS (if missing):
 
 Return envelope:
 { \"ok\": boolean, \"intent\": AlertIntent|null, \"warnings\": [], \"clarify\": object|null }
+
+AlertIntent v1 REQUIRED SHAPE (when ok=true):
+{\n  \"version\": \"1.0\",\n  \"source\": {\"user_id\": \"<string>\", \"channel_id\": \"<string>\", \"request_text\": \"<original user request>\", \"created_at_utc\": \"<ISO-8601 datetime>\"},\n  \"targets\": {\"type\": \"symbols\"|\"watchlist\", \"symbols\": [\"SPY\"], \"watchlist\": null|\"<name>\", \"max_symbols\": 20},\n  \"condition\": { ... },\n  \"gates\": { ... },\n  \"lifecycle\": {\"start\": \"now\", \"expires\": null|{\"type\":\"relative\",\"hours\":8}|{\"type\":\"date\",\"date\":\"YYYY-MM-DD\"}},\n  \"actions\": [{\"type\": \"discord_notify\", \"style\": \"compact\"}],\n  \"tags\": {}\n}
+
+IMPORTANT:
+- \"condition\" is a SINGLE object (NOT an array of conditions).
+- \"gates\" is an object keyed by gate name (NOT a list).
+\nExample ok=false (clarify):
+{\n  "ok": false,\n  "intent": null,\n  "warnings": [{"code": "PARSE_AMBIGUOUS", "note": "Direction not specified"}],\n  "clarify": {\n    "question": "Do you mean crosses ABOVE VWAP, BELOW VWAP, or BOTH?",\n    "choices": ["ABOVE", "BELOW", "BOTH"],\n    "default": "BOTH"\n  }\n}
 """
-
-
-def example_default_timeframe_warning() -> CompilerWarning:
-    return CompilerWarning(code=WARN_DEFAULT_TIMEFRAME_USED, note="Timeframe not specified; using 5m")
-
-
-def example_ambiguous_clarify() -> dict[str, Any]:
-    return {
-        "ok": False,
-        "intent": None,
-        "warnings": [{"code": PARSE_AMBIGUOUS, "note": "Direction not specified"}],
-        "clarify": {
-            "question": "Do you mean crosses ABOVE VWAP, BELOW VWAP, or BOTH?",
-            "choices": ["ABOVE", "BELOW", "BOTH"],
-            "default": "BOTH",
-        },
-    }

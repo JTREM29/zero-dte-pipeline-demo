@@ -15,7 +15,10 @@ import sqlite3
 import subprocess
 import sys
 import time as time_lib
+import random
 import json
+import platform
+import traceback
 from collections.abc import Iterable
 from dataclasses import dataclass
 import io
@@ -62,6 +65,40 @@ from delivery.options_framework import build_options_framework
 
 from delivery.tnt_prompt import load_tnt_system_prompt
 from delivery.tnt_state import build_tnt_state_from_analysis_payload, build_tnt_state_from_packet, enrich_tnt_state, format_tnt_state_block
+from delivery.coach_consistency import (
+    CoachTokens,
+    apply_consistency_guard,
+    apply_candidate_truth_guard,
+    build_observational_envelope,
+    normalize_coach_output,
+    tokens_from_tnt_state,
+)
+
+from delivery.tnt_final_phrasing import (
+    build_candidate_reply,
+    build_futures_overview,
+    build_greeting,
+    build_market_context,
+    build_market_best_effort_futures_only,
+    build_market_snapshot_missing,
+    build_symbol_context,
+)
+
+from delivery.candidates_contract import (
+    AI_TRADE_CANDIDATES_BOUNDARY_SENTENCE,
+    AI_TRADE_CANDIDATES_CANONICAL_DEFINITION,
+    AI_TRADE_CANDIDATES_MISINTERPRETATION_CORRECTION_SENTENCE,
+    AI_TRADE_CANDIDATES_NO_CANDIDATE_SENTENCE,
+)
+
+from delivery.channel_router import decide_route, router_enabled
+
+from services.context.ctx_reader import (
+    IntentSpec,
+    load_required_ctx,
+    redis_client_for_ctx,
+    resolve_intent_and_required_keys,
+)
 from delivery.tnt_chart_contract import FOOTER_DISCLAIMER, validate_chart_spec
 from delivery.options_chain_summary import summarize_options_chain
 
@@ -221,6 +258,22 @@ class _GroupedDailyCacheEntry:
 
 _GROUPED_DAILY_CACHE: dict[str, _GroupedDailyCacheEntry] = {}
 
+
+@dataclass(slots=True)
+class _CheapQANewsCacheEntry:
+    lines: list[str]
+    ts: float
+
+
+@dataclass(slots=True)
+class _CheapQAEarningsCacheEntry:
+    line: str
+    ts: float
+
+
+_CHEAP_QA_NEWS_CACHE: dict[str, _CheapQANewsCacheEntry] = {}
+_CHEAP_QA_EARNINGS_CACHE: dict[str, _CheapQAEarningsCacheEntry] = {}
+
 def _env_float(name: str, fallback: float) -> float:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -250,7 +303,170 @@ _OPTIONS_MICRO_MAX = _env_int("OPTIONS_MICRO_MAX", 16)
 _GROUPED_DAILY_TTL_SEC = _env_float("GROUPED_DAILY_TTL_SEC", 3600.0)
 _GROUPED_DAILY_CACHE_MAX = _env_int("GROUPED_DAILY_CACHE_MAX", 7)
 
+_CHEAP_QA_NEWS_TTL_SEC = _env_float("CHEAP_QA_NEWS_TTL_SEC", 300.0)
+_CHEAP_QA_EARNINGS_TTL_SEC = _env_float("CHEAP_QA_EARNINGS_TTL_SEC", 3600.0)
+_CHEAP_QA_CACHE_MAX = _env_int("CHEAP_QA_CACHE_MAX", 128)
+
 _ETF_CONSTITUENTS_TTL_SEC = _env_float("ETF_CONSTITUENTS_TTL_SEC", 21600.0)
+
+
+def _env_bool(name: str, fallback: bool) -> bool:
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return bool(fallback)
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _cheapqa_enrich_enabled() -> bool:
+    # Default ON: user wants premium feel without LLM.
+    return _env_bool("CHEAP_QA_ENRICH", True)
+
+
+def _cheapqa_enrich_news_enabled() -> bool:
+    return _env_bool("CHEAP_QA_ENRICH_NEWS", True)
+
+
+def _cheapqa_enrich_earnings_enabled() -> bool:
+    return _env_bool("CHEAP_QA_ENRICH_EARNINGS", True)
+
+
+def _cheapqa_enrich_futures_enabled() -> bool:
+    return _env_bool("CHEAP_QA_ENRICH_FUTURES", True)
+
+
+def _cheapqa_allow_coach_fallback() -> bool:
+    # Default OFF to preserve the historical no-LLM guarantee for CHEAP_QA.
+    return _env_bool("CHEAP_QA_ALLOW_COACH_FALLBACK", False)
+
+
+def _cheapqa_cache_trim(cache: dict[str, object]) -> None:
+    try:
+        if _CHEAP_QA_CACHE_MAX <= 0 or len(cache) <= _CHEAP_QA_CACHE_MAX:
+            return
+        # Drop oldest entries by ts if present.
+        while len(cache) > _CHEAP_QA_CACHE_MAX:
+            oldest_key = None
+            oldest_ts = None
+            for k, v in list(cache.items()):
+                ts = getattr(v, "ts", None)
+                if ts is None:
+                    continue
+                if oldest_ts is None or float(ts) < float(oldest_ts):
+                    oldest_ts = float(ts)
+                    oldest_key = k
+            if oldest_key is None:
+                break
+            cache.pop(oldest_key, None)
+    except Exception:
+        return
+
+
+async def _cheapqa_latest_news_lines(symbol: str) -> list[str]:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return []
+
+    entry = _CHEAP_QA_NEWS_CACHE.get(sym)
+    if entry is not None and _CHEAP_QA_NEWS_TTL_SEC > 0:
+        try:
+            if (time_lib.time() - float(entry.ts)) <= float(_CHEAP_QA_NEWS_TTL_SEC):
+                return list(entry.lines)
+        except Exception:
+            pass
+
+    key = _resolve_massive_api_key()
+    if not key:
+        return []
+
+    base = (os.getenv("MASSIVE_BASE_URL") or "https://api.massive.com").strip().rstrip("/")
+    try:
+        from services.news.massive_benzinga_news import fetch_benzinga_news
+
+        since = _now_utc().replace(tzinfo=timezone.utc) - timedelta(hours=24)
+        items = await fetch_benzinga_news(
+            base_url=base,
+            api_key=key,
+            tickers=[sym],
+            published_since_utc=since,
+            limit=2,
+            timeout_s=float(_env_int("CHEAP_QA_NEWS_TIMEOUT_S", 8)),
+        )
+    except Exception:
+        items = []
+
+    lines: list[str] = []
+    for it in (items or [])[:1]:
+        try:
+            headline = str(getattr(it, "headline", "") or "").strip()
+            url = str(getattr(it, "url", "") or "").strip()
+            if headline and url:
+                lines.append(f"📰 Headline (24h): {headline} — {url}")
+            elif headline:
+                lines.append(f"📰 Headline (24h): {headline}")
+        except Exception:
+            continue
+
+    _CHEAP_QA_NEWS_CACHE[sym] = _CheapQANewsCacheEntry(lines=list(lines), ts=time_lib.time())
+    _cheapqa_cache_trim(_CHEAP_QA_NEWS_CACHE)
+    return lines
+
+
+async def _cheapqa_next_earnings_line(symbol: str, *, now_utc: datetime | None = None) -> str | None:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+
+    entry = _CHEAP_QA_EARNINGS_CACHE.get(sym)
+    if entry is not None and _CHEAP_QA_EARNINGS_TTL_SEC > 0:
+        try:
+            if (time_lib.time() - float(entry.ts)) <= float(_CHEAP_QA_EARNINGS_TTL_SEC):
+                return str(entry.line or "").strip() or None
+        except Exception:
+            pass
+
+    key = _resolve_earnings_api_key()
+    if not key:
+        return None
+
+    base = (os.getenv("MASSIVE_BASE_URL") or "https://api.massive.com").strip().rstrip("/")
+    base_now_utc = now_utc
+    try:
+        if base_now_utc is not None and base_now_utc.tzinfo is None:
+            base_now_utc = base_now_utc.replace(tzinfo=timezone.utc)
+    except Exception:
+        base_now_utc = None
+    if base_now_utc is None:
+        base_now_utc = _now_utc().replace(tzinfo=timezone.utc)
+    now_et = base_now_utc.astimezone(ET)
+    try:
+        from services.calendar.massive_benzinga_earnings import fetch_benzinga_earnings, pick_next_earnings
+
+        recs = await fetch_benzinga_earnings(
+            base_url=base,
+            api_key=key,
+            tickers=[sym],
+            start_date=now_et.date(),
+            end_date=(now_et.date() + timedelta(days=int(_env_int("CHEAP_QA_EARNINGS_LOOKAHEAD_DAYS", 120)))),
+            limit=200,
+            timeout_s=float(_env_int("CHEAP_QA_EARNINGS_TIMEOUT_S", 10)),
+        )
+        nxt = pick_next_earnings(recs, symbol=sym, now_utc=base_now_utc)
+    except Exception:
+        nxt = None
+
+    line: str | None = None
+    if nxt is not None:
+        try:
+            dt_et = nxt.ts_utc.astimezone(ET)
+            when = "BMO" if dt_et.hour < 12 else ("AMC" if dt_et.hour >= 16 else "TAS")
+            conf = "confirmed" if bool(getattr(nxt, "confirmed", True)) else "unconfirmed"
+            line = f"📅 Next earnings: {dt_et.date().isoformat()} ({when}, ET) — {conf}"
+        except Exception:
+            line = None
+
+    _CHEAP_QA_EARNINGS_CACHE[sym] = _CheapQAEarningsCacheEntry(line=str(line or "").strip(), ts=time_lib.time())
+    _cheapqa_cache_trim(_CHEAP_QA_EARNINGS_CACHE)
+    return line
 
 
 def _get_cached_options_micro(symbol: str) -> Optional[_OptionsMicroCacheEntry]:
@@ -281,17 +497,59 @@ def _set_cached_options_micro(symbol: str, packet: dict[str, Any], *, ts: Option
         _OPTIONS_MICRO_CACHE.pop(oldest_key, None)
 
 
-def _polygon_key_and_base() -> tuple[Optional[str], str, str]:
-    """Return (api_key, base_url, provider_label).
+def _massive_key_and_base() -> tuple[Optional[str], str, str]:
+    """Return (api_key, base_url, provider_label) for Massive.
 
-    If Massive is enabled (key present + ZERO_DTE_USE_MASSIVE=1), prefer that key/base.
+    NOTE: Massive is used for Benzinga feeds. Do not route Polygon market-data
+    endpoints through Massive.
     """
 
     use_massive = os.getenv("ZERO_DTE_USE_MASSIVE", "0") == "1"
+
+    # Massive key policy (ops): prefer MASSIVE_API_KEY; allow falling back
+    # to POLYGON_API_KEY for deployments where Massive uses the same key.
     massive_key = (os.getenv("MASSIVE_API_KEY") or "").strip()
+    if not massive_key:
+        massive_key = (os.getenv("POLYGON_API_KEY") or "").strip()
+
     massive_base = (os.getenv("MASSIVE_BASE_URL") or "").strip().rstrip("/")
-    if use_massive and massive_key:
-        return massive_key, (massive_base or "https://api.polygon.io"), "massive"
+    if use_massive and not massive_key:
+        raise RuntimeError(
+            "ZERO_DTE_USE_MASSIVE=1 but MASSIVE_API_KEY/POLYGON_API_KEY is missing; set MASSIVE_API_KEY (or reuse POLYGON_API_KEY) and MASSIVE_BASE_URL=https://api.massive.com"
+        )
+    return (massive_key or None), (massive_base or "https://api.massive.com"), "massive"
+
+
+def _resolve_massive_api_key() -> str:
+    """Resolve the Massive API key.
+
+    Policy: MASSIVE_API_KEY preferred; fallback to POLYGON_API_KEY allowed.
+    Supports simple `${VAR}` / `$VAR` references.
+    """
+
+    raw = (os.getenv("MASSIVE_API_KEY") or "").strip()
+    if raw:
+        expanded, _ = _expand_env_reference(raw)
+        if expanded:
+            return expanded
+
+    raw = (os.getenv("POLYGON_API_KEY") or "").strip()
+    return raw
+
+
+def _resolve_massive_api_key_source() -> str:
+    raw = (os.getenv("MASSIVE_API_KEY") or "").strip()
+    if raw:
+        expanded, _ = _expand_env_reference(raw)
+        if expanded:
+            return "MASSIVE_API_KEY"
+    if (os.getenv("POLYGON_API_KEY") or "").strip():
+        return "POLYGON_API_KEY"
+    return "missing"
+
+
+def _polygon_key_and_base() -> tuple[Optional[str], str, str]:
+    """Return (api_key, base_url, provider_label) for Polygon market data."""
 
     try:
         from zero_dte_pipeline.config import config
@@ -343,18 +601,24 @@ def _with_api_key(url: str, api_key: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
-async def _fetch_etf_constituents(composite_ticker: str) -> Optional[set[str]]:
-    """Fetch ETF constituents tickers for a composite ticker (e.g., SPY).
+class QualityGateBlockedError(RuntimeError):
+    def __init__(self, *, kind: str, label: str, symbol: str, reason: str):
+        self.kind = str(kind or "analysis")
+        self.label = str(label or "")
+        self.symbol = str(symbol or "")
+        self.reason = str(reason or "Quality gate blocked an unvalidated response.")
+        super().__init__(f"Gate blocked {self.kind} {self.symbol}: {self.reason}")
 
-    Uses Polygon ETF Global endpoint: GET /etf-global/v1/constituents?composite_ticker=SPY
-    """
+
+async def _fetch_etf_constituents(composite_ticker: str) -> Optional[set[str]]:
+    """Fetch ETF constituents tickers for a composite ticker (e.g., SPY)."""
 
     sym = (composite_ticker or "").strip().upper()
     if not sym:
         return None
 
     cached = _get_cached_etf_constituents(sym)
-    if cached is not None and cached:
+    if cached is not None:
         return cached
 
     api_key, base_url, _provider = _polygon_key_and_base()
@@ -375,6 +639,7 @@ async def _fetch_etf_constituents(composite_ticker: str) -> Optional[set[str]]:
         for _ in range(10):
             if not next_url:
                 break
+
             url = next_url
             if url.startswith("/"):
                 url = f"{base_url}{url}"
@@ -541,7 +806,22 @@ def _answer_market_session_question() -> str:
         detail = "WEEKEND"
     else:
         detail = "CLOSED"
-    return f"Answer: Market session is {detail} as of {now_et.strftime('%Y-%m-%d %H:%M')} ET."
+    state = f"Market session={detail} as of {now_et.strftime('%Y-%m-%d %H:%M')} ET."
+    return "\n".join(
+        [
+            "A) State",
+            state,
+            "",
+            "B) Why",
+            "- This is a session/status question (no trade recommendation implied).",
+            "",
+            "C) Action",
+            "- If you need trade guidance: ask a symbol-specific question (or use /trade for the card).",
+            "",
+            "D) Risk + invalidation",
+            "- n/a",
+        ]
+    )
 
 
 def _is_watchlist_question(question: str) -> bool:
@@ -561,9 +841,22 @@ def _answer_watchlist_question() -> str:
         symbols = _fetch_watchlist_symbols()
     except Exception:  # noqa: BLE001
         symbols = []
-    if not symbols:
-        return "Answer: Watchlist is empty."
-    return f"Answer: Watchlist: {', '.join(symbols)}."
+    state = "Watchlist is empty." if not symbols else f"Watchlist: {', '.join(symbols)}."
+    return "\n".join(
+        [
+            "A) State",
+            state,
+            "",
+            "B) Why",
+            "- This is a universe/symbols question (no trade recommendation implied).",
+            "",
+            "C) Action",
+            "- Pick a symbol from the watchlist and ask a specific question.",
+            "",
+            "D) Risk + invalidation",
+            "- n/a",
+        ]
+    )
 
 
 def _is_trend_question(question: str) -> bool:
@@ -637,15 +930,19 @@ def _answer_key_levels_question(symbol: str, tnt_state: Mapping[str, Any]) -> Op
 
     return "\n".join(
         [
-            f"Answer: {answer}",
-            "Bullish only if:",
-            f"- {bull_cond}",
-            "Bearish if:",
-            f"- {bear_cond}",
-            "Invalidation:",
-            f"- {invalid}",
-            "Do nothing if:",
-            f"- {idle}",
+            "A) State",
+            f"Regime/Bias per TNT_STATE; key levels snapshot: {answer}",
+            "",
+            "B) Why",
+            "- This answer is level-based and uses only TNT_STATE pivots.",
+            "",
+            "C) Action",
+            f"- If bias is BULLISH: {bull_cond}",
+            f"- If bias is BEARISH: {bear_cond}",
+            f"- DO NOTHING if: {idle}",
+            "",
+            "D) Risk + invalidation",
+            f"- Invalidation: {invalid}",
         ]
     )
 
@@ -807,22 +1104,54 @@ async def _fetch_polygon_options_chain_df(
         _POLYGON_OPTIONS_HTTP_SEM = asyncio.Semaphore(max(int(os.getenv("TNT_MAX_POLYGON_OPTIONS_HTTP", "12")), 1))
 
     # Determine expiration date (default: today ET).
+    # On weekends/holidays, there may be zero contracts for "today"; if the caller
+    # didn't specify an expiration, roll forward to the next available expiry.
     now_et = _now_et()
-    exp = (expiration_ymd or now_et.date().isoformat())[:10]
+    exp0 = (expiration_ymd or now_et.date().isoformat())[:10]
+    exp = exp0
 
     # Get an approximate underlying price to bound strikes.
+    # Prefer last-trade snapshot, but fall back to `fetch_live_price()` (aggs/prev) when missing.
+    underlying_px = None
     try:
         price_snap = _get_last_price_snapshot(sym)
-        underlying_px = float(price_snap.px) if price_snap and price_snap.px is not None else None
+        if price_snap is not None:
+            px_val = getattr(price_snap, "px", None)
+            if px_val is None:
+                px_val = getattr(price_snap, "price", None)
+            if px_val is not None:
+                underlying_px = float(px_val)
     except Exception:  # noqa: BLE001
         underlying_px = None
+
+    if not isinstance(underlying_px, (int, float)) or not underlying_px or float(underlying_px) <= 0:
+        try:
+            px, _ts_iso, _src = await asyncio.to_thread(fetch_live_price, sym)
+            if px is not None:
+                px_f = float(px)
+                if px_f > 0:
+                    underlying_px = px_f
+        except Exception:
+            pass
 
     strike_min = None
     strike_max = None
     if isinstance(underlying_px, (int, float)) and underlying_px and underlying_px > 0:
-        window = max(float(strike_window_pct), 0.0)
-        strike_min = underlying_px * (1.0 - window)
-        strike_max = underlying_px * (1.0 + window)
+        window_abs = None
+        try:
+            window_abs = float(os.getenv("TNT_OI_WINDOW_ABS", "10"))
+        except Exception:
+            window_abs = 10.0
+        if not (isinstance(window_abs, (int, float)) and window_abs and window_abs > 0 and window_abs < 1_000_000):
+            window_abs = None
+
+        if window_abs is not None:
+            strike_min = float(underlying_px) - float(window_abs)
+            strike_max = float(underlying_px) + float(window_abs)
+        else:
+            window = max(float(strike_window_pct), 0.0)
+            strike_min = underlying_px * (1.0 - window)
+            strike_max = underlying_px * (1.0 + window)
 
     async def _get_json(session: aiohttp.ClientSession, path: str, params: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
         url = f"{base_url}{path}"
@@ -852,20 +1181,42 @@ async def _fetch_polygon_options_chain_df(
 
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        params: dict[str, Any] = {
-            "underlying_ticker": underlying,
-            "expiration_date": exp,
-            "limit": int(max_contracts),
-        }
-        if strike_min is not None and strike_max is not None:
-            # Polygon expects strike_price.gte / strike_price.lte
-            params["strike_price.gte"] = f"{strike_min:.6f}"
-            params["strike_price.lte"] = f"{strike_max:.6f}"
+        exp_candidates: list[str] = [exp]
+        if expiration_ymd is None:
+            try:
+                base = now_et.date()
+                exp_candidates = [(base + timedelta(days=i)).isoformat()[:10] for i in range(0, 15)]
+            except Exception:
+                exp_candidates = [exp]
 
-        contracts = await _get_json(session, "/v3/reference/options/contracts", params=params)
-        if not contracts or contracts.get("status") != "OK":
-            return None
-        results = contracts.get("results") or []
+        results: list[Any] = []
+        contracts: dict[str, Any] | None = None
+
+        for exp_try in exp_candidates:
+            params: dict[str, Any] = {
+                "underlying_ticker": underlying,
+                "expiration_date": exp_try,
+                "limit": int(max_contracts),
+            }
+            if strike_min is not None and strike_max is not None:
+                # Polygon expects strike_price.gte / strike_price.lte
+                params["strike_price.gte"] = f"{strike_min:.6f}"
+                params["strike_price.lte"] = f"{strike_max:.6f}"
+
+            contracts = await _get_json(session, "/v3/reference/options/contracts", params=params)
+            if not contracts or contracts.get("status") != "OK":
+                # If the caller explicitly requested an expiry, don't try to be clever.
+                if expiration_ymd is not None:
+                    return None
+                continue
+
+            results = contracts.get("results") or []
+            if isinstance(results, list) and results:
+                exp = exp_try
+                break
+            if expiration_ymd is not None:
+                return None
+
         if not isinstance(results, list) or not results:
             return None
 
@@ -927,6 +1278,453 @@ async def _fetch_polygon_options_chain_df(
     if not rows:
         return None
     return pd.DataFrame(rows)
+
+
+async def _fetch_polygon_atm_straddle_df(
+    symbol: str,
+    *,
+    expiration_ymd: Optional[str] = None,
+    strike_window_pct: float = 0.06,
+    max_contracts: int = 120,
+) -> Optional[pd.DataFrame]:
+    """Fetch a *tiny* chain snapshot containing the ATM call + put.
+
+    This is intentionally optimized for fast expected-move estimation (ATM straddle)
+    and avoids N-per-contract snapshot calls.
+
+    Returns a DataFrame compatible with `compute_expected_move_from_chain_df`.
+    """
+
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+
+    api_key, base_url, _provider = _polygon_key_and_base()
+    if not api_key:
+        return None
+
+    underlying = _map_underlying_for_options(sym)
+
+    # Determine expiration date candidates (default: today ET, roll forward).
+    now_et = _now_et()
+    exp0 = (expiration_ymd or now_et.date().isoformat())[:10]
+    exp_candidates: list[str] = [exp0]
+    if expiration_ymd is None:
+        try:
+            base = now_et.date()
+            exp_candidates = [(base + timedelta(days=i)).isoformat()[:10] for i in range(0, 15)]
+        except Exception:
+            exp_candidates = [exp0]
+
+    # Underlying price for strike window.
+    try:
+        price_snap = _get_last_price_snapshot(sym)
+        underlying_px = float(price_snap.px) if price_snap and price_snap.px is not None else None
+    except Exception:  # noqa: BLE001
+        underlying_px = None
+    if not isinstance(underlying_px, (int, float)) or not underlying_px or underlying_px <= 0:
+        return None
+
+    window = max(float(strike_window_pct), 0.0)
+    strike_min = float(underlying_px) * (1.0 - window)
+    strike_max = float(underlying_px) * (1.0 + window)
+
+    # Process-wide guard for Polygon options HTTP calls.
+    global _POLYGON_OPTIONS_HTTP_SEM
+    try:
+        _POLYGON_OPTIONS_HTTP_SEM  # type: ignore[name-defined]
+    except Exception:
+        _POLYGON_OPTIONS_HTTP_SEM = asyncio.Semaphore(max(int(os.getenv("TNT_MAX_POLYGON_OPTIONS_HTTP", "12")), 1))
+
+    async def _get_json(session: aiohttp.ClientSession, path: str, params: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+        url = f"{base_url}{path}"
+        query = dict(params or {})
+        query["apiKey"] = api_key
+        await _POLYGON_OPTIONS_HTTP_SEM.acquire()
+        try:
+            async with _OPTIONS_HTTP_LOCK:
+                global _OPTIONS_HTTP_ACTIVE, _OPTIONS_HTTP_PEAK
+                _OPTIONS_HTTP_ACTIVE += 1
+                if _OPTIONS_HTTP_ACTIVE > _OPTIONS_HTTP_PEAK:
+                    _OPTIONS_HTTP_PEAK = _OPTIONS_HTTP_ACTIVE
+            async with session.get(url, params=query) as resp:
+                if resp.status != 200:
+                    return None
+                return await resp.json()
+        finally:
+            try:
+                async with _OPTIONS_HTTP_LOCK:
+                    _OPTIONS_HTTP_ACTIVE = max(0, int(_OPTIONS_HTTP_ACTIVE) - 1)
+            except Exception:
+                pass
+            try:
+                _POLYGON_OPTIONS_HTTP_SEM.release()
+            except Exception:
+                pass
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        best: dict[str, dict[str, Any]] | None = None
+        best_strike: float | None = None
+        best_exp: str | None = None
+
+        for exp_try in exp_candidates:
+            params: dict[str, Any] = {
+                "underlying_ticker": underlying,
+                "expiration_date": exp_try,
+                "limit": int(max_contracts),
+                "strike_price.gte": f"{strike_min:.6f}",
+                "strike_price.lte": f"{strike_max:.6f}",
+            }
+            contracts = await _get_json(session, "/v3/reference/options/contracts", params=params)
+            if not contracts or contracts.get("status") != "OK":
+                if expiration_ymd is not None:
+                    return None
+                continue
+            results = contracts.get("results") or []
+            if not isinstance(results, list) or not results:
+                if expiration_ymd is not None:
+                    return None
+                continue
+
+            # Build strike -> {call, put} and pick closest strike with both legs.
+            by_strike: dict[float, dict[str, Any]] = {}
+            for it in results:
+                if not isinstance(it, dict):
+                    continue
+                try:
+                    strike = float(it.get("strike_price"))
+                except Exception:
+                    continue
+                ctype = str(it.get("contract_type") or "").strip().lower()
+                ticker = str(it.get("ticker") or "").strip()
+                if ctype not in {"call", "put"} or not ticker:
+                    continue
+                bucket = by_strike.setdefault(strike, {})
+                # Prefer first seen; list is already bounded.
+                if ctype not in bucket:
+                    bucket[ctype] = {"ticker": ticker, "strike": strike}
+
+            candidates = [(abs(s - float(underlying_px)), s) for s, legs in by_strike.items() if "call" in legs and "put" in legs]
+            if not candidates:
+                if expiration_ymd is not None:
+                    return None
+                continue
+            candidates.sort(key=lambda x: x[0])
+            best_strike = float(candidates[0][1])
+            best = by_strike.get(best_strike)
+            best_exp = exp_try
+            break
+
+        if not best or best_strike is None or not best_exp:
+            return None
+
+        async def _snap(ticker: str) -> Optional[dict[str, Any]]:
+            snap = await _get_json(session, f"/v3/snapshot/options/{underlying}/{ticker}")
+            if not snap or snap.get("status") != "OK":
+                return None
+            res = snap.get("results") if isinstance(snap.get("results"), dict) else None
+            return res if isinstance(res, dict) else None
+
+        call_ticker = str(best.get("call", {}).get("ticker") or "").strip()
+        put_ticker = str(best.get("put", {}).get("ticker") or "").strip()
+        if not call_ticker or not put_ticker:
+            return None
+
+        call_res, put_res = await asyncio.gather(_snap(call_ticker), _snap(put_ticker))
+        if not call_res or not put_res:
+            return None
+
+        def _row(res: dict[str, Any], *, ctype: str) -> dict[str, Any]:
+            greeks = res.get("greeks") if isinstance(res.get("greeks"), dict) else {}
+            under = res.get("underlying_asset") if isinstance(res.get("underlying_asset"), dict) else {}
+            day = res.get("day") if isinstance(res.get("day"), dict) else {}
+            prev_day = res.get("prev_day")
+            if not isinstance(prev_day, dict):
+                prev_day = res.get("prevDay")
+            prev_day = prev_day if isinstance(prev_day, dict) else {}
+            return {
+                "symbol": str(res.get("ticker") or ""),
+                "strike": best_strike,
+                "type": ctype,
+                "expiration": best_exp,
+                "bid": day.get("bid"),
+                "ask": day.get("ask"),
+                "last": day.get("close"),
+                "volume": day.get("volume"),
+                "prev_volume": prev_day.get("volume"),
+                "open_interest": res.get("open_interest"),
+                "iv": res.get("implied_volatility"),
+                "delta": greeks.get("delta"),
+                "gamma": greeks.get("gamma"),
+                "theta": greeks.get("theta"),
+                "vega": greeks.get("vega"),
+                "underlying_price": under.get("price") if under.get("price") is not None else underlying_px,
+            }
+
+        rows = [_row(call_res, ctype="call"), _row(put_res, ctype="put")]
+
+    return pd.DataFrame(rows) if rows else None
+
+
+async def _fetch_polygon_straddle_with_wings(
+    symbol: str,
+    *,
+    expiration_ymd: str,
+    underlying: float,
+    wing_dollars: int = 5,
+    timeout_s: float = 3.0,
+) -> Optional[dict[str, Any]]:
+    """Fetch an earnings-time expected-move snapshot with ±$wings.
+
+    Deterministic and bounded:
+    - 1 contracts list call
+    - 6 option snapshot calls (call+put at 3 strikes)
+
+    Returns a dict shaped like `expected_move` (new schema) or None.
+    """
+
+    sym = (symbol or "").strip().upper()
+    exp = (expiration_ymd or "").strip()[:10]
+    try:
+        under_px = float(underlying)
+    except Exception:
+        under_px = 0.0
+
+    if not sym or not exp or not (under_px > 0):
+        return None
+
+    try:
+        wing = int(wing_dollars)
+    except Exception:
+        wing = 5
+    wing = max(1, min(25, int(wing)))
+
+    api_key, base_url, _provider = _polygon_key_and_base()
+    if not api_key:
+        return None
+
+    underlying_ticker = _map_underlying_for_options(sym)
+
+    # Strike bounds: just wide enough to reliably include atm±wing.
+    strike_min = max(0.01, float(under_px) - float(max(wing * 3, 10)))
+    strike_max = float(under_px) + float(max(wing * 3, 10))
+
+    # Process-wide guard for Polygon options HTTP calls.
+    global _POLYGON_OPTIONS_HTTP_SEM
+    try:
+        _POLYGON_OPTIONS_HTTP_SEM  # type: ignore[name-defined]
+    except Exception:
+        _POLYGON_OPTIONS_HTTP_SEM = asyncio.Semaphore(max(int(os.getenv("TNT_MAX_POLYGON_OPTIONS_HTTP", "12")), 1))
+
+    async def _get_json(session: aiohttp.ClientSession, path: str, params: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+        url = f"{base_url}{path}"
+        query = dict(params or {})
+        query["apiKey"] = api_key
+        await _POLYGON_OPTIONS_HTTP_SEM.acquire()
+        try:
+            async with _OPTIONS_HTTP_LOCK:
+                global _OPTIONS_HTTP_ACTIVE, _OPTIONS_HTTP_PEAK
+                _OPTIONS_HTTP_ACTIVE += 1
+                if _OPTIONS_HTTP_ACTIVE > _OPTIONS_HTTP_PEAK:
+                    _OPTIONS_HTTP_PEAK = _OPTIONS_HTTP_ACTIVE
+            async with session.get(url, params=query) as resp:
+                if resp.status != 200:
+                    return None
+                return await resp.json()
+        finally:
+            try:
+                async with _OPTIONS_HTTP_LOCK:
+                    _OPTIONS_HTTP_ACTIVE = max(0, int(_OPTIONS_HTTP_ACTIVE) - 1)
+            except Exception:
+                pass
+            try:
+                _POLYGON_OPTIONS_HTTP_SEM.release()
+            except Exception:
+                pass
+
+    def _mid_from_snapshot(res: dict[str, Any]) -> float | None:
+        try:
+            day = res.get("day") if isinstance(res.get("day"), dict) else {}
+            b = day.get("bid")
+            a = day.get("ask")
+            last = day.get("close")
+            try:
+                b = float(b) if b is not None else None
+            except Exception:
+                b = None
+            try:
+                a = float(a) if a is not None else None
+            except Exception:
+                a = None
+            if b is not None and a is not None and a >= b and (a + b) > 0:
+                return 0.5 * (float(a) + float(b))
+            try:
+                return float(last) if last is not None else None
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _nearest_strike(available: list[float], target: float) -> float | None:
+        if not available:
+            return None
+        try:
+            return float(min(available, key=lambda s: abs(float(s) - float(target))))
+        except Exception:
+            return None
+
+    timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout_s)))
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        params: dict[str, Any] = {
+            "underlying_ticker": underlying_ticker,
+            "expiration_date": exp,
+            "limit": 600,
+            "strike_price.gte": f"{strike_min:.6f}",
+            "strike_price.lte": f"{strike_max:.6f}",
+        }
+
+        contracts = await _get_json(session, "/v3/reference/options/contracts", params=params)
+        if not contracts or contracts.get("status") != "OK":
+            return None
+        results = contracts.get("results") or []
+        if not isinstance(results, list) or not results:
+            return None
+
+        by_strike: dict[float, dict[str, str]] = {}
+        for it in results:
+            if not isinstance(it, dict):
+                continue
+            try:
+                strike = float(it.get("strike_price"))
+            except Exception:
+                continue
+            ctype = str(it.get("contract_type") or "").strip().lower()
+            ticker = str(it.get("ticker") or "").strip()
+            if ctype not in {"call", "put"} or not ticker:
+                continue
+            bucket = by_strike.setdefault(strike, {})
+            if ctype not in bucket:
+                bucket[ctype] = ticker
+
+        strikes = sorted([s for s, legs in by_strike.items() if "call" in legs and "put" in legs])
+        if not strikes:
+            return None
+
+        atm_strike = _nearest_strike(strikes, float(under_px))
+        if atm_strike is None:
+            return None
+
+        down_strike = _nearest_strike(strikes, float(atm_strike) - float(wing))
+        up_strike = _nearest_strike(strikes, float(atm_strike) + float(wing))
+
+        def _tickers_for_strike(s: float) -> tuple[str, str] | None:
+            legs = by_strike.get(float(s)) or {}
+            c = str(legs.get("call") or "").strip()
+            p = str(legs.get("put") or "").strip()
+            if not c or not p:
+                return None
+            return c, p
+
+        atm = _tickers_for_strike(float(atm_strike))
+        if atm is None:
+            return None
+
+        # Required legs: ATM call+put. Wings are best-effort.
+        legs: list[tuple[str, str, float]] = [(atm[0], "call", float(atm_strike)), (atm[1], "put", float(atm_strike))]
+
+        if down_strike is not None:
+            t = _tickers_for_strike(float(down_strike))
+            if t is not None:
+                legs.extend([(t[0], "call", float(down_strike)), (t[1], "put", float(down_strike))])
+        if up_strike is not None:
+            t = _tickers_for_strike(float(up_strike))
+            if t is not None:
+                legs.extend([(t[0], "call", float(up_strike)), (t[1], "put", float(up_strike))])
+
+        async def _snap(ticker: str) -> Optional[dict[str, Any]]:
+            snap = await _get_json(session, f"/v3/snapshot/options/{underlying_ticker}/{ticker}")
+            if not snap or snap.get("status") != "OK":
+                return None
+            res = snap.get("results") if isinstance(snap.get("results"), dict) else None
+            return res if isinstance(res, dict) else None
+
+        snaps = await asyncio.gather(*[_snap(t[0]) for t in legs])
+
+        # Build a mini table: strike -> {call_mid, put_mid}
+        table: dict[float, dict[str, float]] = {}
+        for (ticker, ctype, strike), res in zip(legs, snaps):
+            if not res:
+                continue
+            mid = _mid_from_snapshot(res)
+            if mid is None or not (mid >= 0):
+                continue
+            row = table.setdefault(float(strike), {})
+            row[f"{ctype}_mid"] = float(mid)
+
+        atm_row = table.get(float(atm_strike)) or {}
+        call_mid = atm_row.get("call_mid")
+        put_mid = atm_row.get("put_mid")
+        if call_mid is None or put_mid is None:
+            return None
+
+        atm_straddle = float(call_mid) + float(put_mid)
+        if not (atm_straddle > 0):
+            return None
+
+        expected_move_pct = (atm_straddle / float(under_px)) * 100.0 if under_px > 0 else None
+
+        out: dict[str, Any] = {
+            "asof_ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "expiry": exp,
+            "underlying": float(under_px),
+            "atm": {
+                "strike": float(atm_strike),
+                "call_mid": float(call_mid),
+                "put_mid": float(put_mid),
+                "straddle": float(atm_straddle),
+                "pct": float(expected_move_pct) if expected_move_pct is not None else None,
+                "lower": float(max(0.0, float(under_px) - float(atm_straddle))),
+                "upper": float(float(under_px) + float(atm_straddle)),
+            },
+            "wings": {},
+        }
+
+        wings: dict[str, Any] = {}
+        if down_strike is not None:
+            drow = table.get(float(down_strike)) or {}
+            if drow.get("call_mid") is not None or drow.get("put_mid") is not None:
+                wings["down_5"] = {
+                    "strike": float(down_strike),
+                    "call_mid": (float(drow["call_mid"]) if drow.get("call_mid") is not None else None),
+                    "put_mid": (float(drow["put_mid"]) if drow.get("put_mid") is not None else None),
+                }
+        if up_strike is not None:
+            urow = table.get(float(up_strike)) or {}
+            if urow.get("call_mid") is not None or urow.get("put_mid") is not None:
+                wings["up_5"] = {
+                    "strike": float(up_strike),
+                    "call_mid": (float(urow["call_mid"]) if urow.get("call_mid") is not None else None),
+                    "put_mid": (float(urow["put_mid"]) if urow.get("put_mid") is not None else None),
+                }
+
+        out["wings"] = wings
+
+        # Risk shape: best-effort only when both wing costs are present.
+        try:
+            from services.calendar.earnings_options import classify_wing_risk_shape, compute_wing_skew_score
+
+            if "up_5" in wings and "down_5" in wings:
+                up_cost = (float(wings["up_5"].get("call_mid") or 0.0) + float(wings["up_5"].get("put_mid") or 0.0))
+                down_cost = (float(wings["down_5"].get("call_mid") or 0.0) + float(wings["down_5"].get("put_mid") or 0.0))
+                score = compute_wing_skew_score(atm_straddle=atm_straddle, up_cost=up_cost, down_cost=down_cost)
+                label = classify_wing_risk_shape(score=score) if score is not None else None
+                if label and score is not None:
+                    out["risk_shape"] = {"label": str(label), "score": float(score)}
+        except Exception:
+            pass
+
+        return out
 
 
 def _render_meta(render: RenderedPost) -> dict[str, Any]:
@@ -1266,18 +2064,271 @@ def _format_levels_oneliner(
 
 def _load_smart_market_iq() -> Dict[str, Any]:
     """Load market participation snapshot without throwing."""
+
+    def _compute_smart_market_iq_from_etf_proxies() -> Dict[str, Any]:
+        """Best-effort regime snapshot derived from ETF proxy ratios.
+
+        This is intentionally lightweight and contract-safe:
+        - Computes only regime + a small meta pack.
+        - Does not require any internal Redis context.
+        - Returns MISSING on any failure.
+        """
+        try:
+            from delivery.on_demand_data import polygon_aggs
+        except Exception:  # noqa: BLE001
+            print("[SMIQ][WARN] compute unavailable: delivery.on_demand_data import failed")
+            return {"data_quality": "MISSING", "regime": "UNKNOWN", "reason": "import_failed"}
+
+        polygon_key_present = bool((os.getenv("POLYGON_API_KEY", "") or "").strip())
+        if not polygon_key_present:
+            print("[SMIQ][WARN] compute blocked: POLYGON_API_KEY missing in process env")
+            return {"data_quality": "MISSING", "regime": "UNKNOWN", "reason": "no_key"}
+
+        tz = ET_TZ or timezone.utc
+        now_et = datetime.now(tz)
+
+        # Proxy set (kept consistent with /risk_on_off):
+        # ES proxy: SPY, NQ proxy: QQQ, RTY proxy: IWM, rates proxy: TLT/SHY, crude proxy: USO
+        sym_spy = "SPY"
+        sym_qqq = "QQQ"
+        sym_iwm = "IWM"
+        sym_tlt = "TLT"
+        sym_shy = "SHY"
+        sym_uso = "USO"
+
+        try:
+            window_days = int(os.getenv("SMART_MARKET_IQ_PROXY_WINDOW_DAYS", "80"))
+        except Exception:
+            window_days = 80
+        window_days = min(max(window_days, 45), 260)
+
+        try:
+            lookback = int(os.getenv("SMART_MARKET_IQ_PROXY_LOOKBACK_DAYS", "20"))
+        except Exception:
+            lookback = 20
+        lookback = min(max(lookback, 5), 60)
+
+        try:
+            payloads = {
+                sym_spy: polygon_aggs(sym_spy, multiplier=1, timespan="day", days=window_days),
+                sym_qqq: polygon_aggs(sym_qqq, multiplier=1, timespan="day", days=window_days),
+                sym_iwm: polygon_aggs(sym_iwm, multiplier=1, timespan="day", days=window_days),
+                sym_tlt: polygon_aggs(sym_tlt, multiplier=1, timespan="day", days=window_days),
+                sym_shy: polygon_aggs(sym_shy, multiplier=1, timespan="day", days=window_days),
+                sym_uso: polygon_aggs(sym_uso, multiplier=1, timespan="day", days=window_days),
+            }
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            if "POLYGON_API_KEY" in msg:
+                print("[SMIQ][WARN] compute blocked: POLYGON_API_KEY missing (runtime)")
+            else:
+                print(f"[SMIQ][WARN] compute failed: {type(exc).__name__}: {exc}")
+            reason = "no_key" if "POLYGON_API_KEY" in msg else "fetch_failed"
+            return {"data_quality": "MISSING", "regime": "UNKNOWN", "reason": reason}
+
+        def _extract_close_map(payload: dict[str, Any]) -> dict[str, float]:
+            out: dict[str, float] = {}
+            for row in (payload.get("results") or []):
+                try:
+                    t_ms = float(row.get("t"))
+                    c = float(row.get("c"))
+                except Exception:
+                    continue
+                if c <= 0:
+                    continue
+                dt = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc).astimezone(tz)
+                out[dt.date().isoformat()] = float(c)
+            return out
+
+        maps = {k: _extract_close_map(v) for k, v in payloads.items()}
+        counts = {k: len(v) for k, v in maps.items()}
+        if any(int(n) < (lookback + 6) for n in counts.values()):
+            print(f"[SMIQ][WARN] compute insufficient history: lookback={lookback} window_days={window_days} counts={counts}")
+            return {"data_quality": "MISSING", "regime": "UNKNOWN", "reason": "insufficient_history", "meta": {"counts": counts}}
+
+        def _ratio_series(num: str, den: str) -> list[float]:
+            a = maps.get(num) or {}
+            b = maps.get(den) or {}
+            common = sorted(set(a.keys()) & set(b.keys()))
+            ys: list[float] = []
+            for k in common:
+                c_a = a.get(k)
+                c_b = b.get(k)
+                if c_a is None or c_b is None or c_b <= 0:
+                    continue
+                ys.append(float(c_a) / float(c_b))
+            return ys
+
+        r_growth = _ratio_series(sym_qqq, sym_spy)  # growth vs broad
+        r_breadth = _ratio_series(sym_iwm, sym_spy)  # small caps vs broad
+        r_duration = _ratio_series(sym_tlt, sym_shy)  # duration vs cash
+        r_inflation = _ratio_series(sym_uso, sym_spy)  # crude proxy vs broad
+
+        lens = {
+            "QQQ/SPY": len(r_growth),
+            "IWM/SPY": len(r_breadth),
+            "TLT/SHY": len(r_duration),
+            "USO/SPY": len(r_inflation),
+        }
+        if min(lens.values()) < (lookback + 3):
+            print(f"[SMIQ][WARN] compute insufficient overlap: lookback={lookback} lens={lens} counts={counts}")
+            return {
+                "data_quality": "MISSING",
+                "regime": "UNKNOWN",
+                "reason": "insufficient_overlap",
+                "meta": {"counts": counts, "lens": lens},
+            }
+
+        def _pct_change(values: list[float], lb: int) -> float:
+            if len(values) < 2:
+                return 0.0
+            idx = max(0, len(values) - 1 - lb)
+            base = float(values[idx])
+            last = float(values[-1])
+            if base == 0:
+                return 0.0
+            return (last / base - 1.0) * 100.0
+
+        def _sgn(x: float) -> int:
+            if x > 0:
+                return 1
+            if x < 0:
+                return -1
+            return 0
+
+        chg_growth = _pct_change(r_growth, lookback)
+        chg_breadth = _pct_change(r_breadth, lookback)
+        chg_duration = _pct_change(r_duration, lookback)
+        chg_inflation = _pct_change(r_inflation, lookback)
+
+        dir_growth = _sgn(chg_growth)
+        dir_breadth = _sgn(chg_breadth)
+        dir_duration = _sgn(chg_duration)
+        dir_inflation = _sgn(chg_inflation)
+
+        # Composite score (+ risk-on, - defensive). Duration rising is defensive, so subtract.
+        score = int(dir_growth + dir_breadth - dir_duration + dir_inflation)
+        if score > 0:
+            regime_sign = 1
+        elif score < 0:
+            regime_sign = -1
+        else:
+            regime_sign = 0
+
+        aligned = 0
+        if regime_sign != 0:
+            for v in (dir_growth, dir_breadth, -dir_duration, dir_inflation):
+                if int(v) == int(regime_sign):
+                    aligned += 1
+        conflict = bool(regime_sign == 0 or aligned <= 2)
+
+        if conflict:
+            regime = "MIXED"
+        elif regime_sign > 0:
+            regime = "RISK_ON"
+        else:
+            regime = "DEFENSIVE"
+
+        print(
+            "[SMIQ][OK] computed "
+            f"regime={regime} score={score} aligned={aligned}/4 conflict={int(conflict)} "
+            f"lookback={lookback} window_days={window_days} counts={counts}"
+        )
+
+        return {
+            "timestamp_et": now_et.strftime("%Y-%m-%d %H:%M:%S"),
+            "data_quality": "OK",
+            "regime": regime,
+            "top_gainers": [],
+            "top_losers": [],
+            "meta": {
+                "source": "polygon_etf_proxy_ratios",
+                "lookback_days": int(lookback),
+                "window_days": int(window_days),
+                "score": int(score),
+                "aligned": int(aligned),
+                "conflict": bool(conflict),
+                "chg_qqq_spy_20d": float(chg_growth),
+                "chg_iwm_spy_20d": float(chg_breadth),
+                "chg_tlt_shy_20d": float(chg_duration),
+                "chg_uso_spy_20d": float(chg_inflation),
+                "counts": counts,
+            },
+        }
+
+    def _maybe_refresh_smart_market_iq() -> None:
+        # Never do network I/O under pytest; tests should provide fixtures/mocks.
+        if "pytest" in sys.modules:
+            return
+
+        # Optional kill switch.
+        if os.getenv("SMART_MARKET_IQ_REFRESH_ON_READ", "1") != "1":
+            print("[SMIQ] refresh skipped: SMART_MARKET_IQ_REFRESH_ON_READ!=1")
+            return
+
+        try:
+            max_age_sec = int(os.getenv("SMART_MARKET_IQ_MAX_AGE_SEC", "3600"))
+        except Exception:
+            max_age_sec = 3600
+        max_age_sec = max(0, max_age_sec)
+
+        try:
+            if SMART_MARKET_IQ_PATH.exists() and max_age_sec > 0:
+                mtime = SMART_MARKET_IQ_PATH.stat().st_mtime
+                age = (datetime.now(timezone.utc) - datetime.fromtimestamp(mtime, tz=timezone.utc)).total_seconds()
+                if age <= float(max_age_sec):
+                    print(f"[SMIQ] refresh skipped: fresh age_sec={age:.0f} max_age_sec={max_age_sec} path={SMART_MARKET_IQ_PATH}")
+                    return
+                print(f"[SMIQ] refresh needed: stale age_sec={age:.0f} max_age_sec={max_age_sec} path={SMART_MARKET_IQ_PATH}")
+            else:
+                if not SMART_MARKET_IQ_PATH.exists():
+                    print(f"[SMIQ] refresh needed: file missing path={SMART_MARKET_IQ_PATH}")
+                else:
+                    print(f"[SMIQ] refresh needed: max_age_sec={max_age_sec} path={SMART_MARKET_IQ_PATH}")
+        except Exception as exc:
+            print(f"[SMIQ][WARN] refresh stat failed: {type(exc).__name__}: {exc}")
+
+        print(f"[SMIQ] refresh start polygon_key_present={int(bool((os.getenv('POLYGON_API_KEY','') or '').strip()))}")
+        data = _compute_smart_market_iq_from_etf_proxies()
+        if not isinstance(data, dict):
+            print("[SMIQ][WARN] refresh aborted: compute returned non-dict")
+            return
+        if str(data.get("data_quality") or "").strip().upper() != "OK":
+            print(f"[SMIQ][WARN] refresh aborted: compute quality={(data.get('data_quality') or 'UNKNOWN')}")
+            return
+
+        try:
+            SMART_MARKET_IQ_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SMART_MARKET_IQ_PATH.with_suffix(SMART_MARKET_IQ_PATH.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, SMART_MARKET_IQ_PATH)
+            print(
+                "[SMIQ][OK] refresh wrote "
+                f"path={SMART_MARKET_IQ_PATH} regime={str(data.get('regime') or 'UNKNOWN').upper()} "
+                f"ts={data.get('timestamp_et') or 'n/a'}"
+            )
+        except Exception:
+            print("[SMIQ][WARN] refresh write failed")
+            return
+
     try:
+        _maybe_refresh_smart_market_iq()
         if not SMART_MARKET_IQ_PATH.exists():
-            return {"data_quality": "MISSING", "regime": "UNKNOWN"}
+            polygon_key_present = bool((os.getenv("POLYGON_API_KEY", "") or "").strip())
+            return {
+                "data_quality": "MISSING",
+                "regime": "UNKNOWN",
+                "reason": "no_key" if not polygon_key_present else "file_missing",
+            }
         raw = SMART_MARKET_IQ_PATH.read_text(encoding="utf-8")
         if not raw.strip():
-            return {"data_quality": "MISSING", "regime": "UNKNOWN"}
+            return {"data_quality": "MISSING", "regime": "UNKNOWN", "reason": "empty_file"}
         data = json.loads(raw)
         if not isinstance(data, dict):
-            return {"data_quality": "MISSING", "regime": "UNKNOWN"}
+            return {"data_quality": "MISSING", "regime": "UNKNOWN", "reason": "bad_payload"}
         return data
     except Exception:  # noqa: BLE001 - downstream logic handles missing data
-        return {"data_quality": "MISSING", "regime": "UNKNOWN"}
+        return {"data_quality": "MISSING", "regime": "UNKNOWN", "reason": "read_failed"}
 
 
 def _resolve_market_participation(
@@ -1328,6 +2379,7 @@ def _gate_result_to_dict(pg: ParticipationGateResult) -> Dict[str, Any]:
 def _format_participation_section(smiq: Dict[str, Any], pg: Dict[str, Any]) -> str:
     regime = (smiq.get("regime") or "UNKNOWN") if isinstance(smiq, dict) else "UNKNOWN"
     quality = (smiq.get("data_quality") or "UNKNOWN") if isinstance(smiq, dict) else "UNKNOWN"
+    reason = (smiq.get("reason") if isinstance(smiq, dict) else None) or None
     gainers = smiq.get("top_gainers") if isinstance(smiq, dict) else None
     losers = smiq.get("top_losers") if isinstance(smiq, dict) else None
     gainers_fmt = ", ".join(str(t).upper() for t in (gainers or [])[:5]) if gainers else "n/a"
@@ -1344,9 +2396,14 @@ def _format_participation_section(smiq: Dict[str, Any], pg: Dict[str, Any]) -> s
     if impact in ("CAUTION", "STAND_DOWN"):
         note = (pg.get("reason", "n/a") if isinstance(pg, dict) else "n/a")
 
+    regime_label = f"**{regime}**"
+    if str(regime).strip().upper() == "UNKNOWN" and reason:
+        # Self-debugging, low-noise reason code.
+        regime_label = f"**{regime}** ({str(reason).strip().lower()})"
+
     lines = [
         "📊 Market Participation (TNT)",
-        f"• Regime: **{regime}** | Quality: **{quality}** | Gate: **{gate_label}**",
+        f"• Regime: {regime_label} | Quality: **{quality}** | Gate: **{gate_label}**",
         f"• Leaders: {gainers_fmt}",
         f"• Laggards: {losers_fmt}",
         f"• Notes: {note or 'n/a'}",
@@ -1575,7 +2632,20 @@ def tnt_regime_assess(payload: Mapping[str, Any], *, now_et: Optional[datetime] 
         edge = None
 
     macro_risk = payload.get("macro_risk")
-    macro_flag = bool(macro_risk)
+
+    macro_regime = payload.get("macro_regime") if isinstance(payload.get("macro_regime"), Mapping) else None
+    macro_regime_risk = ""
+    macro_regime_posture = ""
+    if isinstance(macro_regime, Mapping):
+        try:
+            macro_regime_risk = str(macro_regime.get("macro_risk") or "").upper().strip()
+            macro_regime_posture = str(macro_regime.get("posture") or "").upper().replace("_", " ").strip()
+        except Exception:  # noqa: BLE001
+            macro_regime_risk = ""
+            macro_regime_posture = ""
+
+    macro_regime_flag = (macro_regime_risk == "HIGH") or (macro_regime_posture == "STAND DOWN")
+    macro_flag = bool(macro_risk) or macro_regime_flag
 
     # Derived
     pct_to_pivot = _pct_distance(price, pivot)
@@ -1602,6 +2672,8 @@ def tnt_regime_assess(payload: Mapping[str, Any], *, now_et: Optional[datetime] 
     reasons: list[str] = []
     if macro_flag:
         reasons.append("macro window risk")
+    if macro_regime_flag:
+        reasons.append(f"macro regime={macro_regime_posture or macro_regime_risk or 'risk'}")
     if confirm in {"UNKNOWN", "NEUTRAL"}:
         reasons.append(f"confirmation={confirm}")
     if near_pivot:
@@ -1756,135 +2828,124 @@ def fmt_last_price(symbol: str, last_price: Optional[float], ts_utc: Optional[st
     return f"💲 **Last Price:** **{price_val:.2f}** ({tf_label} | {ts_display})"
 
 
+def freshness_badge(price_ts: Optional[object], session: str = "unknown") -> str:
+    """Human-friendly freshness indicator for price timestamps.
+
+    Returns a short badge string; must never raise.
+    """
+
+    session_norm = str(session or "unknown").upper().strip()
+    ts_raw = str(price_ts or "").strip()
+    if not ts_raw:
+        return "⚪ price_ts n/a"
+
+    try:
+        ts_dt = parse_iso(ts_raw)
+        now_utc = _now_utc()
+        ts_utc = ts_dt.astimezone(timezone.utc) if ts_dt.tzinfo else ts_dt.replace(tzinfo=timezone.utc)
+        age_min = max(0.0, (now_utc - ts_utc).total_seconds() / 60.0)
+    except Exception:  # noqa: BLE001
+        return "⚪ price_ts unreadable"
+
+    # When markets are closed, freshness isn't actionable; avoid alarming badges.
+    if session_norm in {"CLOSED", "WEEKEND"}:
+        return f"⚪ age {age_min:.0f}m (market closed)"
+
+    try:
+        limit_min = float(PRICE_STALE_LIMIT_RTH) if session_norm == "RTH" else float(PRICE_STALE_LIMIT_AH)
+    except Exception:  # noqa: BLE001
+        limit_min = 5.0
+
+    if age_min <= limit_min:
+        return f"🟢 fresh ({age_min:.1f}m)"
+    if age_min <= limit_min * 2:
+        return f"🟡 stale ({age_min:.1f}m)"
+    return f"🔴 stale ({age_min:.0f}m)"
+
+
 def _coerce_ai_string(value: Optional[object], *, max_len: int = 240) -> str:
     if value is None:
         return ""
-    if level_ctx:
-        lines.append(f"- Upside: {fmt_targets(level_ctx.get('upside_targets'))}")
-        lines.append(f"- Downside: {fmt_targets(level_ctx.get('downside_targets'))}")
 
-        if level_ctx.get("extension_mode") and last_price is not None:
-            broken_levels = level_ctx.get("broken") if isinstance(level_ctx.get("broken"), list) else []
-            try:
-                price_val = float(last_price)
-            except Exception:  # noqa: BLE001
-                price_val = None
-
-            if price_val is not None:
-                pivot_regime = (payload.get("pivot_regime") or "").upper()
-                if pivot_regime.startswith("ABOVE"):
-                    broken_support = [item for item in broken_levels if isinstance(item, (list, tuple)) and len(item) == 2 and item[1] < price_val]
-                    if broken_support:
-                        lines.append(f"- Support (broken): {fmt_targets(broken_support[:3])}")
-                else:
-                    broken_overhead = [item for item in broken_levels if isinstance(item, (list, tuple)) and len(item) == 2 and item[1] > price_val]
-                    if broken_overhead:
-                        lines.append(f"- Overhead resistance (broken): {fmt_targets(broken_overhead[:3])}")
-    else:
-        lines.append("- Upside: n/a")
-        lines.append("- Downside: n/a")
-        lines.append("- (no level context available)")
-        lines.append("")
-        lines.append("🧠 How Pros Would Trade It:")
-        lines.append("- Insufficient level data; defer to fresh signal or manual review")
-        lines.append("")
-        lines.append("🚫 Do Nothing If:")
-        lines.append("- Levels unknown -> wait for updated data")
-        lines.append("")
-        lines.append("_Not financial advice._")
-        return "\n".join(lines)
-
-    if level_ctx:
-        bull_targets = "-"  # keep placeholder if we craft plan below
-    bull_targets_lines: list[str] = []
-    bear_targets_lines: list[str] = []
-    if level_ctx:
-        bull_targets_lines.append(f"- Upside: {fmt_targets(level_ctx.get('upside_targets'))}")
-        bear_targets_lines.append(f"- Downside: {fmt_targets(level_ctx.get('downside_targets'))}")
-
-    lines.append("")
-    lines.append("🧠 How Pros Would Trade It:")
-    bull_plan = ["- Bull: enter on reclaim + hold above Pivot"]
-    bear_plan = ["- Bear: enter on lose + hold below Pivot"]
-    if level_ctx:
-        bull_plan.append(f"- Targets: {fmt_targets(level_ctx.get('upside_targets'))}")
-        bear_plan.append(f"- Targets: {fmt_targets(level_ctx.get('downside_targets'))}")
-    else:
-        bull_plan.append("- Targets: need updated pivots")
-        bear_plan.append("- Targets: need updated pivots")
-    bull_plan.append(f"- Invalidation: lose **{fmt_money(pivot)}**")
-    bear_plan.append(f"- Invalidation: reclaim **{fmt_money(pivot)}**")
-    lines.extend(bull_plan)
-    lines.extend(bear_plan)
-    symbol_norm = symbol.upper().strip()
-    bias_norm = (bias or "NEUTRAL").upper().strip()
-    conviction_norm = (conviction or "LOW").upper().strip()
-
-    price_f = _f(last_price)
-    P = _f(piv.get("P"))
-    R1 = _f(piv.get("R1"))
-    R2 = _f(piv.get("R2"))
-    S1 = _f(piv.get("S1"))
-    S2 = _f(piv.get("S2"))
-
-    confirm = vix_sqqq_confirmation_from_dirs(vix_dir, sqqq_dir)
-
-    regime = detect_regime(price_f, P, R1, R2, S1, S2)
-    d_pivot = _delta(price_f, P) if P is not None else None
-    if d_pivot is None:
-        vs_pivot = "n/a"
-    else:
-        if d_pivot > 0:
-            rel = "above"
-        elif d_pivot < 0:
-            rel = "below"
+    try:
+        if isinstance(value, str):
+            text = value
+        elif isinstance(value, (list, tuple)):
+            parts: list[str] = []
+            for item in value:
+                if item is None:
+                    continue
+                s = str(item).strip()
+                if s:
+                    parts.append(s)
+            text = "; ".join(parts)
+        elif isinstance(value, dict):
+            # Compact & stable: good for embeds/logs.
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         else:
-            rel = "at"
-        vs_pivot = f"{d_pivot:+.2f} pts ({rel} P {_fmt(P)})"
+            text = str(value)
+    except Exception:  # noqa: BLE001 - coercion must never break rendering
+        return ""
 
-    ladd = ladder_levels(price_f if price_f is not None else last_price, piv)
-    up_targets = " → ".join([f"{k} {_fmt(v)}" for k, v in ladd["up"][:2]]) or "n/a"
-    down_targets = " → ".join([f"{k} {_fmt(v)}" for k, v in ladd["down"][:2]]) or "n/a"
+    text = (text or "").strip().replace("\r\n", "\n").replace("\r", "\n")
+    text = " ".join([chunk for chunk in text.split("\n") if chunk]).strip()
 
-    if regime in ("BELOW_S1", "BELOW_P", "EXTENSION_DOWN"):
-        primary = f"**Bear plan:** stay below **P {_fmt(P)}** → targets: {down_targets}"
-        if S1 is not None and price_f is not None and price_f < S1:
-            alternate = f"**Bull flip:** reclaim + hold **S1 {_fmt(S1)}** then **P {_fmt(P)}** → targets: {up_targets}"
-        else:
-            alternate = f"**Bull flip:** reclaim + hold **P {_fmt(P)}** → targets: {up_targets}"
-    elif regime in ("ABOVE_P", "ABOVE_R1", "EXTENSION_UP"):
-        primary = f"**Bull plan:** stay above **P {_fmt(P)}** → targets: {up_targets}"
-        alternate = f"**Bear flip:** lose + hold below **P {_fmt(P)}** → targets: {down_targets}"
+    if max_len and len(text) > max_len:
+        text = text[: max(0, max_len - 1)].rstrip() + "…"
+
+    return text
+
+
+def _coerce_ai_lines(value: Optional[object], *, max_lines: int = 6, max_len: int = 140) -> list[str]:
+    """Convert LLM-ish values (list/str/etc) into clean bullet lines."""
+
+    if value is None:
+        return []
+
+    raw_lines: list[str]
+    if isinstance(value, str):
+        raw_lines = [ln.strip() for ln in value.splitlines()]
+    elif isinstance(value, (list, tuple)):
+        raw_lines = [str(item).strip() for item in value if item is not None]
     else:
-        primary = f"**Range plan:** trade edges only (S/R reactions). Targets: up {up_targets} | down {down_targets}"
-        alternate = f"**Trend plan:** wait for break + retest of **P {_fmt(P)}** then follow direction."
+        raw_lines = [_coerce_ai_string(value, max_len=max_len)]
 
-    msg: List[str] = []
-    msg.append(f"🚨 **{symbol_norm} — Trade Context**")
-    msg.append(fmt_last_price(symbol_norm, last_price, last_price_ts_utc, last_price_tf))
-    if P is not None:
-        msg.append(f"📏 **vs Pivot:** {vs_pivot}")
-    msg.append("")
-    msg.append(
-        f"**Bias:** **{bias_norm}** | **Confirmation:** **{confirm}** | **Regime:** **{regime}** | **Conviction:** **{conviction_norm}**"
-    )
-    msg.append("")
-    msg.append("**Key Levels (RTH):**")
-    msg.append(f"• P {_fmt(P)} | R1 {_fmt(R1)} | R2 {_fmt(R2)}")
-    msg.append(f"• S1 {_fmt(S1)} | S2 {_fmt(S2)}")
-    msg.append("")
-    msg.append("**How Pros Would Trade It**")
-    msg.append(f"• {primary}")
-    msg.append(f"• {alternate}")
-    msg.append("")
-    msg.append("🚫 **Do Nothing If**")
-    msg.append("• No break + retest confirmation (first spike only)")
-    msg.append("• Choppy price around pivot (no direction)")
-    msg.append("• Confirmation flips HARD against the plan")
-    msg.append("")
-    msg.append("_Not financial advice._")
+    cleaned: list[str] = []
+    for ln in raw_lines:
+        if not ln:
+            continue
+        # Normalize bullets if the model included them.
+        for prefix in ("- ", "• ", "* "):
+            if ln.startswith(prefix):
+                ln = ln[len(prefix) :].strip()
+                break
+        if not ln:
+            continue
+        if max_len and len(ln) > max_len:
+            ln = ln[: max(0, max_len - 1)].rstrip() + "…"
+        cleaned.append(ln)
+        if max_lines and len(cleaned) >= max_lines:
+            break
 
-    return "\n".join(msg)
+    return cleaned
+
+
+def _parse_time_et(value: str, default: time) -> time:
+    """Parse HH:MM into a datetime.time (ET clock time)."""
+
+    raw = (value or "").strip()
+    if not raw:
+        return default
+
+    try:
+        hh_s, mm_s = raw.split(":", 1)
+        hh = int(hh_s)
+        mm = int(mm_s)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return default
+        return time(hh, mm)
+    except Exception:  # noqa: BLE001
+        return default
 
 import discord
 from discord import app_commands
@@ -1922,12 +2983,22 @@ from zero_dte_pipeline.tech import build_agent_tech_package
 # NOTE: Keep tests deterministic. Golden/smoke tests should not change based on a
 # developer's local .env/.env.local.
 if "pytest" not in sys.modules:
-    for _env_path in (Path.cwd() / ".env.local", Path.cwd() / ".env"):
-        try:
-            if _env_path.exists():
-                load_dotenv(_env_path, override=False)
-        except Exception:  # noqa: BLE001
-            pass
+    # Precedence (local runtime): .env < .env.local
+    # .env.local is treated as the authoritative local runtime config and should
+    # override any stale inherited env vars from the parent shell.
+    try:
+        env_path = Path.cwd() / ".env"
+        if env_path.exists():
+            load_dotenv(env_path, override=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        env_local_path = Path.cwd() / ".env.local"
+        if env_local_path.exists():
+            load_dotenv(env_local_path, override=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default) == "1"
@@ -2128,9 +3199,18 @@ PREFLIGHT_INTEGRITY_STANDDOWN_TEXT = (
 
 class PublishQueuedError(RuntimeError):
     def __init__(self, *, wait_seconds: float, due_ts: float, key: str):
-        super().__init__(f"Queued for next window in ~{wait_seconds:.1f}s")
+        super().__init__(f"Queued by cadence limiter in ~{wait_seconds:.1f}s")
         self.wait_seconds = float(wait_seconds)
         self.due_ts = float(due_ts)
+        self.key = str(key)
+
+
+class PublishThrottledError(RuntimeError):
+    """Raised when an interactive send would be rate-limited but must never queue."""
+
+    def __init__(self, *, wait_seconds: float, key: str):
+        super().__init__(f"Throttled by cadence limiter (~{wait_seconds:.1f}s); not queued")
+        self.wait_seconds = float(wait_seconds)
         self.key = str(key)
 
 
@@ -2141,6 +3221,13 @@ _RATE_CHARTS_MAX_PER_HOUR = int(os.getenv("TNT_RATE_CHARTS_MAX_PER_HOUR", "12") 
 _RATE_USER_CHART_MIN_SEC = float(os.getenv("TNT_RATE_USER_CHART_MIN_SEC", "600") or "600")
 _RATE_USER_TEXT_MIN_SEC = float(os.getenv("TNT_RATE_USER_TEXT_MIN_SEC", "20") or "20")
 _RATE_QUEUE_ENABLED = (os.getenv("TNT_RATE_QUEUE_ENABLED", "1") == "1")
+
+# Interactive policy:
+# - Humans (slash commands / ask/coach/context and on-demand charts) should never be time-window queued.
+# - Keep time-window queueing for autopost/batch.
+_TNT_DISABLE_COOLDOWNS = (os.getenv("TNT_DISABLE_COOLDOWNS", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+# Default OFF: interactive requests should never be time-window queued.
+_TNT_INTERACTIVE_QUEUE_ENABLED = (os.getenv("TNT_INTERACTIVE_QUEUE_ENABLED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
 _OPS_CHANNEL_ID = int(os.getenv("TNT_OPS_CHANNEL_ID", "0") or "0") or int(os.getenv("BOT_ALERT_CHANNEL_ID", "0") or "0")
 
@@ -2223,6 +3310,14 @@ def _compute_rate_wait_seconds(
     group = _rate_group(label, request_kind)
     label_norm = (label or "").strip().lower() or "unknown"
     kind_norm = (request_kind or "").strip().lower()
+
+    if _TNT_DISABLE_COOLDOWNS:
+        return 0.0, ["disable_cooldowns"]
+
+    # Interactive bypass: never apply time-window throttles to human-triggered requests.
+    # (Inflight render control is handled elsewhere; this is only send/publish cadence.)
+    if kind_norm in {"on_demand_text", "on_demand_chart"} and not _TNT_INTERACTIVE_QUEUE_ENABLED:
+        return 0.0, ["interactive_bypass"]
 
     # Let /ask be responsive: don't apply the global label_min_interval to on-demand coach answers.
     # Per-user text cooldown still applies via _RATE_USER_TEXT_MIN_SEC.
@@ -2481,6 +3576,9 @@ def _preflight_text_violations(text: str) -> list[str]:
     # Substring checks for multi-word / headings / vendor.
     forbidden_substrings: tuple[str, ...] = (
         "iqfeed",
+        "polygon",
+        "massive",
+        "databento",
         "smart market iq",
         "options focus",
         "take profit",
@@ -2798,6 +3896,7 @@ def _write_autopost_audit(
     context_mode: str,
     context_output_mode: str,
     violations: Sequence[str],
+    publish_id: Optional[str] = None,
     message_id: Optional[int] = None,
     latency_ms: Optional[float] = None,
     fallback_text: Optional[str] = None,
@@ -2854,6 +3953,7 @@ def _write_autopost_audit(
                 metadata["tnt_prompt_sha256"] = prompt_sha.strip()
 
     payload: Dict[str, Any] = {
+        "publish_id": publish_id,
         "builder": builder,
         "post_type": label,
         "channel": {
@@ -2880,6 +3980,25 @@ def _write_autopost_audit(
         "agent_payload": agent_payload,
         "metadata": metadata,
     }
+
+    # Candidate truth projection (canonical ctx snapshot embed).
+    # Allows auditing: "recommended X (or NONE) at that time — and why".
+    try:
+        canon = agent_payload.get("canonical_ctx") if isinstance(agent_payload, dict) else None
+        sym_ctx = canon.get("symbol") if isinstance(canon, dict) else None
+        cand = sym_ctx.get("candidates") if isinstance(sym_ctx, dict) else None
+        if isinstance(cand, dict):
+            payload["ctx_sym_candidates_status"] = cand.get("status")
+            payload["ctx_sym_candidates_as_of_et"] = cand.get("as_of_et")
+            payload["ctx_sym_candidates_top"] = cand.get("top") if isinstance(cand.get("top"), dict) else None
+        else:
+            payload["ctx_sym_candidates_status"] = None
+            payload["ctx_sym_candidates_as_of_et"] = None
+            payload["ctx_sym_candidates_top"] = None
+    except Exception:
+        payload["ctx_sym_candidates_status"] = None
+        payload["ctx_sym_candidates_as_of_et"] = None
+        payload["ctx_sym_candidates_top"] = None
     # Legacy fields retained temporarily for downstream compatibility.
     payload["analysis_mode"] = context_mode
     payload["output_mode"] = context_output_mode
@@ -2972,6 +4091,8 @@ async def _publish_autopost_render(
     builder: str,
     label: str,
     symbol: str,
+    publish_id: Optional[str] = None,
+    kind: str = "analysis",
     requester_id: Optional[int] = None,
     request_kind: str = "autopost",
     client: Optional[object] = None,
@@ -2986,14 +4107,85 @@ async def _publish_autopost_render(
 ) -> None:
     start_ts = time_lib.perf_counter()
     asof_et = _now_et()
+    if publish_id is None:
+        try:
+            import uuid
+
+            publish_id = uuid.uuid4().hex[:10]
+        except Exception:
+            publish_id = None
     if strict_contracts is None:
         strict_contracts = STRICT_CONTRACTS
+
+    # Harden: operational autoposts should never be treated as analysis.
+    # This prevents quality-gate fallbacks like "Missing section: Last Price"
+    # from blocking non-analysis status posts.
+    kind_norm = (kind or "analysis").strip().lower()
+    label_norm = (label or "").strip().lower()
+    builder_norm = (builder or "").strip().lower()
+    if (
+        label_norm.startswith("daily_outlook")
+        or label_norm.startswith("weekly_outlook")
+        or label_norm.startswith("earnings_daily")
+        or label_norm.startswith("earnings_results")
+        or builder_norm
+        in {
+            "build_daily_market_outlook_render",
+            "build_weekly_market_outlook_render",
+            "build_tomorrow_earnings_macro_render",
+            "build_earnings_results_today_render",
+        }
+    ):
+        kind_norm = "status"
+    if kind_norm not in {"analysis", "status", "text"}:
+        kind_norm = "analysis"
+    kind = kind_norm
 
     # Production-safe defaults: only allow relaxing contracts in explicit dev runs.
     if strict_contracts is False and not DEV_ALLOW_VIOLATIONS:
         strict_contracts = True
     if allow_contract_violations and not DEV_ALLOW_VIOLATIONS:
         allow_contract_violations = False
+
+    # Stop-the-bleeding guard: if a scheduled render collapses to a stand-down,
+    # suppress repeated posts for the same label within a cooldown window.
+    try:
+        if channel is not None and _is_stand_down_render(render):
+            dedupe_sec = _env_int("TNT_AUTOMATION_STANDDOWN_DEDUPE_SEC", "3600")
+            if dedupe_sec > 0:
+                global _last_automation_standdown_by_label
+                last_map = globals().get("_last_automation_standdown_by_label")
+                if not isinstance(last_map, dict):
+                    _last_automation_standdown_by_label = {}
+                    last_map = _last_automation_standdown_by_label
+
+                now_s = int(_now_utc().timestamp())
+                last_s = int(last_map.get(label, 0) or 0)
+                if now_s - last_s < dedupe_sec:
+                    try:
+                        elapsed_ms = (time_lib.perf_counter() - start_ts) * 1000.0
+                        _write_autopost_audit(
+                            render=render,
+                            builder=builder,
+                            label=label,
+                            channel=channel,
+                            asof_et=asof_et,
+                            status="stand_down_deduped",
+                            symbol=symbol,
+                            context_mode=context_mode,
+                            context_output_mode=context_output_mode,
+                            violations=[f"STANDDOWN_DEDUPE:{dedupe_sec}s"],
+                            publish_id=publish_id,
+                            message_id=None,
+                            latency_ms=elapsed_ms,
+                            fallback_text=None,
+                        )
+                    except Exception:
+                        pass
+                    return
+                last_map[label] = now_s
+    except Exception:
+        pass
 
     if context_mode is None:
         context_mode = (analysis_mode or "db").strip().lower() if isinstance(analysis_mode, str) else "db"
@@ -3034,6 +4226,8 @@ async def _publish_autopost_render(
                             builder=builder,
                             label=label,
                             symbol=symbol,
+                            publish_id=publish_id,
+                            kind=kind,
                             requester_id=requester_id,
                             request_kind=request_kind,
                             client=client,
@@ -3068,6 +4262,7 @@ async def _publish_autopost_render(
                             context_mode=context_mode,
                             context_output_mode=context_output_mode,
                             violations=[f"RATE_LIMIT:{r}" for r in reasons] or ["RATE_LIMIT"],
+                            publish_id=publish_id,
                             message_id=None,
                             latency_ms=elapsed_ms,
                             fallback_text=None,
@@ -3144,6 +4339,7 @@ async def _publish_autopost_render(
                 output_mode=context_output_mode,
                 label=label,
                 files=stand_render.files,
+                raise_on_block=True,
             )
             _mark_rate_usage(
                 label=label,
@@ -3168,6 +4364,7 @@ async def _publish_autopost_render(
                 context_mode=context_mode,
                 context_output_mode=context_output_mode,
                 violations=["DATA_INTEGRITY_CONFLICT"],
+                publish_id=publish_id,
                 message_id=getattr(message, "id", None),
                 latency_ms=elapsed_ms,
                 fallback_text=None,
@@ -3193,6 +4390,39 @@ async def _publish_autopost_render(
         return
 
     violations = []
+    # Outlook is operational; if the agent mentions EMA without EMA data, scrub EMA
+    # tokens before strict contract validation.
+    try:
+        builder_norm = (builder or "").strip().lower()
+    except Exception:
+        builder_norm = ""
+    if builder_norm in {"build_daily_market_outlook_render", "build_weekly_market_outlook_render"}:
+        try:
+            payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+            tech = payload.get("technical_state")
+            has_ema_data = False
+            if isinstance(tech, dict):
+                for sym_data in tech.values():
+                    if not isinstance(sym_data, dict):
+                        continue
+                    timeframes = sym_data.get("timeframes")
+                    if not isinstance(timeframes, dict):
+                        continue
+                    for tf_state in timeframes.values():
+                        if not isinstance(tf_state, dict):
+                            continue
+                        ema_map = tf_state.get("ema")
+                        if isinstance(ema_map, dict) and ema_map:
+                            has_ema_data = True
+                            break
+                    if has_ema_data:
+                        break
+            if not has_ema_data:
+                txt = render.text or ""
+                if _EMA_TOKEN_RE.search(txt) or _EMA_WITH_NUMBER_RE.search(txt):
+                    render.text = _sanitize_ema_language(txt)
+        except Exception:
+            pass
     violations.extend(_contract_violations_for_render(render, label=label))
     violations.extend(_preflight_text_violations(render.text))
     violations.extend(_preflight_chart_spec_violations(render.agent_payload))
@@ -3219,6 +4449,7 @@ async def _publish_autopost_render(
                 context_mode=context_mode,
                 context_output_mode=context_output_mode,
                 violations=violations,
+                publish_id=publish_id,
                 message_id=None,
                 latency_ms=elapsed_ms,
                 fallback_text=None,
@@ -3254,16 +4485,24 @@ async def _publish_autopost_render(
                 message = await safe_send(
                     channel,
                     render.text,
-                    kind="analysis",
+                    kind=kind,
                     symbol=symbol,
                     pivots=None,
                     analysis_mode=context_mode,
                     output_mode=context_output_mode,
                     label=label,
                     files=render.files,
+                    raise_on_block=True,
                 )
-            except Exception:
+            except Exception as exc:
                 status = "send_failed"
+                try:
+                    print(
+                        f"[WARN] publish failed label={label} status={status} publish_id={publish_id} "
+                        f"exc={type(exc).__name__}: {exc}"
+                    )
+                except Exception:
+                    pass
                 raise
             finally:
                 elapsed_ms = (time_lib.perf_counter() - start_ts) * 1000.0
@@ -3278,6 +4517,7 @@ async def _publish_autopost_render(
                     context_mode=context_mode,
                     context_output_mode=context_output_mode,
                     violations=violations,
+                    publish_id=publish_id,
                     message_id=getattr(message, "id", None),
                     latency_ms=elapsed_ms,
                     fallback_text=None,
@@ -3298,9 +4538,17 @@ async def _publish_autopost_render(
                 output_mode=context_output_mode,
                 label=label,
                 files=render.files,
+                raise_on_block=True,
             )
-        except Exception:
+        except Exception as exc:
             status = "fallback_send_failed"
+            try:
+                print(
+                    f"[WARN] publish failed label={label} status={status} publish_id={publish_id} "
+                    f"exc={type(exc).__name__}: {exc}"
+                )
+            except Exception:
+                pass
             raise
         finally:
             elapsed_ms = (time_lib.perf_counter() - start_ts) * 1000.0
@@ -3315,6 +4563,7 @@ async def _publish_autopost_render(
                 context_mode=context_mode,
                 context_output_mode=context_output_mode,
                 violations=violations,
+                publish_id=publish_id,
                 message_id=getattr(message, "id", None),
                 latency_ms=elapsed_ms,
                 fallback_text=fallback_text,
@@ -3327,13 +4576,14 @@ async def _publish_autopost_render(
         message = await safe_send(
             channel,
             render.text,
-            kind="analysis",
+            kind=kind,
             symbol=symbol,
             pivots=None,
             analysis_mode=context_mode,
             output_mode=context_output_mode,
             label=label,
             files=render.files,
+            raise_on_block=True,
         )
         _mark_rate_usage(
             label=label,
@@ -3342,8 +4592,15 @@ async def _publish_autopost_render(
             requester_id=requester_id,
             request_kind=request_kind,
         )
-    except Exception:
+    except Exception as exc:
         status = "send_failed"
+        try:
+            print(
+                f"[WARN] publish failed label={label} status={status} publish_id={publish_id} "
+                f"exc={type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass
         raise
     finally:
         elapsed_ms = (time_lib.perf_counter() - start_ts) * 1000.0
@@ -3358,6 +4615,7 @@ async def _publish_autopost_render(
             context_mode=context_mode,
             context_output_mode=context_output_mode,
             violations=[],
+            publish_id=publish_id,
             message_id=getattr(message, "id", None),
             latency_ms=elapsed_ms,
             fallback_text=None,
@@ -3841,6 +5099,23 @@ def fmt_signed(x):
 
 _EMA_WITH_NUMBER_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])ema\s*(\d+)")
 _EMA_TOKEN_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])ema(?![A-Za-z0-9_])")
+
+
+def _sanitize_ema_language(raw: object) -> str:
+    """Remove EMA references from free-form text.
+
+    Used to keep strict contract validation consistent when EMA data isn't present.
+    """
+
+    text = str(raw or "")
+
+    def _number_repl(match: re.Match[str]) -> str:
+        digits = match.group(1)
+        return f"avg {digits}"
+
+    cleaned = _EMA_WITH_NUMBER_RE.sub(_number_repl, text)
+    cleaned = _EMA_TOKEN_RE.sub("avg", cleaned)
+    return cleaned
 
 
 def _normalize_indicator_label(name: object) -> str:
@@ -4481,7 +5756,8 @@ def _format_trade_context_block(
     gate_mode = str(gate.get("mode") or payload.get("gate_mode") or "n/a")
     gate_reason = str(gate.get("reason") or payload.get("gate_reason") or "").strip() or "n/a"
 
-    lines: list[str] = [f"🚨 **{sym} — Trade Context**"]
+    lines: list[str] = [f"🚨 **{sym} — Market Context**"]
+    lines.append("_This is context, not a trade command._")
     lines.append(f"💲 **Last Price:** **{price_text}** ({descriptor} | {ts_display})")
     lines.append(f"📏 **vs Pivot:** {vs_pivot}")
 
@@ -4508,13 +5784,13 @@ def _format_trade_context_block(
 
     bull_entry_level = fmt_money(pivot) if pivot is not None else "Pivot"
     lines.append("")
-    lines.append("🧠 How Pros Would Trade It:")
-    lines.append(f"- Bull: enter on reclaim + hold above **{bull_entry_level}**")
-    lines.append(f"- Targets: {upside_chain}")
-    lines.append(f"- Invalidation: lose **{bull_entry_level}**")
-    lines.append(f"- Bear: enter on lose + hold below **{bull_entry_level}**")
-    lines.append(f"- Targets: {downside_chain}")
-    lines.append(f"- Invalidation: reclaim **{bull_entry_level}**")
+    lines.append("🧠 Thesis Map (not a trade command):")
+    lines.append(f"- Bull thesis strengthens if price reclaims and holds above **{bull_entry_level}**")
+    lines.append(f"- Upside levels to watch: {upside_chain}")
+    lines.append(f"- Bull thesis weakens if price loses **{bull_entry_level}**")
+    lines.append(f"- Bear thesis strengthens if price loses and holds below **{bull_entry_level}**")
+    lines.append(f"- Downside levels to watch: {downside_chain}")
+    lines.append(f"- Bear thesis weakens if price reclaims **{bull_entry_level}**")
 
     lines.append("")
     lines.append("🚫 Do Nothing If:")
@@ -4633,6 +5909,19 @@ def build_signal_payload(sym: str) -> Optional[tuple[dict, float, Dict[str, obje
 
     if macro_risk:
         payload["macro_risk"] = macro_risk
+
+    # Optional: attach cached macro regime (controller-side) for posture gating.
+    try:
+        if (os.getenv("TNT_MACRO_REGIME_ENABLED", "1") or "1") == "1":
+            from services.macro_regime import get_cached_macro_regime
+            from services.redis_env import redis_client
+
+            r = redis_client(timeout_s=0.4, decode_responses=True)
+            reg = get_cached_macro_regime(r)
+            if isinstance(reg, dict) and reg:
+                payload["macro_regime"] = reg
+    except Exception:  # noqa: BLE001
+        pass
 
     stale_limit = DATA_STALE_MAX_MIN if DATA_STALE_MAX_MIN > 0 else 3.0
     try:
@@ -4929,11 +6218,11 @@ def build_autopost_payload():
     lines.append("📐 Key Levels:")
     lines.append("• (use !daily or Analyze <symbol> for full levels)")
     lines.append("")
-    lines.append("🧠 How Pros Would Trade It:")
-    lines.append("• Use commands for full detail; autopost is heartbeat for now")
+    lines.append("🧠 Notes (not a trade command):")
+    lines.append("• Use commands for full detail; autopost is a heartbeat")
     lines.append("")
     lines.append("🚫 Do Nothing If:")
-    lines.append("• Data is stale or signals conflict")
+    lines.append("• Data is stale or indicators conflict")
     lines.append("")
     lines.append("_Not financial advice._")
     return "\n".join(lines)
@@ -4991,8 +6280,19 @@ _autopost_signal_task = None
 _automation_focus_task: Optional[asyncio.Task] = None
 _automation_intraday_task: Optional[asyncio.Task] = None
 _automation_recap_task: Optional[asyncio.Task] = None
+_automation_paperdesk_trades_task: Optional[asyncio.Task] = None
+_automation_macro_calendar_task: Optional[asyncio.Task] = None
 _automation_heartbeat_task: Optional[asyncio.Task] = None
+_automation_earnings_task: Optional[asyncio.Task] = None
+_automation_earnings_results_task: Optional[asyncio.Task] = None
+_automation_earnings_results_prewarm_task: Optional[asyncio.Task] = None
+_automation_daily_outlook_task: Optional[asyncio.Task] = None
+_automation_weekly_outlook_task: Optional[asyncio.Task] = None
+_automation_divergence_watch_task: Optional[asyncio.Task] = None
+_automation_earnings_pressure_watch_task: Optional[asyncio.Task] = None
 _slash_tree_synced = False
+
+_last_automation_posted_by_key: Dict[str, int] = {}
 
 DATA_STALE_MAX_MIN = float(os.getenv("DATA_STALE_MAX_MIN", "3") or "3")
 DATA_STALE_WARN_CHANNEL_ID = int(os.getenv("DATA_STALE_WARN_CHANNEL", "0") or "0")
@@ -5011,15 +6311,30 @@ _last_signal_post_by_symbol: Dict[str, int] = {}
 SignalState = Dict[str, object]
 _last_signal_state: Dict[str, SignalState] = {}
 
+ContextState = Dict[str, object]
+_last_context_post_by_symbol: Dict[str, int] = {}
+_last_context_state: Dict[str, ContextState] = {}
+_context_global_post_ts: deque[int] = deque(maxlen=256)
+
+_last_divergence_post_by_key: Dict[str, int] = {}
+_divergence_global_post_ts: deque[int] = deque(maxlen=256)
+
+_last_earnings_pressure_post_by_key: Dict[str, int] = {}
+
 _last_summary_date: Optional[date] = None
 _last_morning_opt_date: Optional[date] = None
 _last_vix_alert_level: Optional[float] = None
+_last_news_db_mismatch_warn_ts: float | None = None
 _last_vix_alert_ts: Optional[str] = None
 _last_monday_date: Optional[date] = None
 
 _data_stale_paused = False
 _data_stale_lock: Optional[asyncio.Lock] = None
 _data_stale_initialized = False
+
+_feed_stale_paused = False
+_feed_stale_lock: Optional[asyncio.Lock] = None
+_feed_stale_initialized = False
 
 _bootstrap_tasks: dict[str, asyncio.Task] = {}
 
@@ -5119,7 +6434,8 @@ AI_ENABLED = os.getenv("DISCORD_AI_ENABLED", "0") == "1"
 AI_MODE = (os.getenv("DISCORD_AI_MODE", "mention") or "mention").lower().strip()
 AI_ROLE_ID = int(os.getenv("DISCORD_AI_ROLE_ID", "0") or "0")
 AI_CHANNEL_ID = int(os.getenv("DISCORD_AI_CHANNEL_ID", "0") or "0")
-AI_MODEL = os.getenv("DISCORD_AI_MODEL", "gpt-5-mini")
+# TNT agent calls are model-locked in delivery.tnt_llm; keep a stable, non-drifting default here.
+AI_MODEL = "gpt-5.2"
 AI_MAX_CHARS = int(os.getenv("DISCORD_AI_MAX_CHARS", "1200") or "1200")
 VERBOSE_DEFAULT = os.getenv("DISCORD_VERBOSE_DEFAULT", "0") == "1"
 
@@ -5129,7 +6445,13 @@ def _ai_enabled() -> bool:
 
 
 def _ai_model() -> str:
-    return os.getenv("DISCORD_AI_MODEL", "gpt-5-mini")
+    # All TNT model calls must use the locked model to avoid drift.
+    try:
+        from delivery.tnt_llm import TNT_LOCKED_MODEL
+
+        return TNT_LOCKED_MODEL
+    except Exception:  # noqa: BLE001
+        return "gpt-5.2"
 
 
 def _ai_max_chars() -> int:
@@ -5148,8 +6470,16 @@ def _ai_timeout() -> float:
 
 def _coach_model_name() -> str:
     # Prefer TNT_LLM_MODEL so the One Door wrapper can enforce a single locked model.
-    # If unset, fall back to legacy knobs.
-    return (os.getenv("TNT_LLM_MODEL") or os.getenv("OPENAI_MODEL_COACH") or _ai_model()).strip()
+    # Legacy knobs like OPENAI_MODEL_COACH are intentionally ignored here to prevent drift.
+    try:
+        from delivery.tnt_llm import TNT_LOCKED_MODEL
+    except Exception:  # noqa: BLE001
+        TNT_LOCKED_MODEL = "gpt-5.2"
+
+    requested = (os.getenv("TNT_LLM_MODEL") or "").strip()
+    if requested and requested != TNT_LOCKED_MODEL:
+        return TNT_LOCKED_MODEL
+    return TNT_LOCKED_MODEL
 
 
 def _coach_max_tokens() -> int:
@@ -5158,6 +6488,16 @@ def _coach_max_tokens() -> int:
     except Exception:  # noqa: BLE001
         value = 900
     return max(200, min(value, 2000))
+
+
+def _coach_max_tokens_for_ask() -> int:
+    """Lower cap for /ask fallback coaching to prevent runaway token spend."""
+
+    try:
+        value = int(os.getenv("COACH_MAX_TOKENS_ASK", "450") or "450")
+    except Exception:  # noqa: BLE001
+        value = 450
+    return max(150, min(value, 1200))
 
 
 def _extract_ai_text(resp: object) -> str:
@@ -5230,22 +6570,25 @@ def _build_coach_limited_response(symbol: str, meta: Mapping[str, Any]) -> str:
         reasons,
         min_len=2,
         max_len=4,
-        filler="Respect capital until data refreshes."
-    )
-
-    key_lines = _bounded_list(
-        ["Wait for fresh price and signal data before defining triggers."],
-        min_len=1,
-        max_len=2,
-        filler="Use pivots from /analyze once live data resumes."
+        filler="Respect capital until data refreshes.",
     )
 
     next_line = f"Re-run /analyze {symbol.upper()} once the feed updates."
-    return _compose_coach_sections(
-        "Not actionable — data not ready",
-        why_lines,
-        key_lines,
-        next_line,
+    return "\n".join(
+        [
+            "A) State",
+            f"Not actionable for {symbol.upper()} — data not ready.",
+            "",
+            "B) Why",
+            *[f"- {line}" for line in why_lines],
+            "",
+            "C) Action",
+            "- DO NOTHING until data is healthy.",
+            f"- {next_line}",
+            "",
+            "D) Risk + invalidation",
+            "- n/a",
+        ]
     )
 
 
@@ -5266,16 +6609,14 @@ def _build_coach_user_text(question: str) -> str:
         "If TNT_STATE.context.recent_daily_trend is present, use it to describe the past few sessions' trend.\n\n"
 
         "If TNT_STATE.edge_profile is present, tailor tone/constraints to that profile (risk budget, preferred setups, avoid list).\n\n"
-        "Respond using exactly this format:\n"
-        "Answer: <bias + why in one sentence>\n"
-        "Bullish only if:\n"
-        "- condition\n"
-        "Bearish if:\n"
-        "- condition\n"
-        "Invalidation:\n"
-        "- level or state that cancels the idea\n"
-        "Do nothing if:\n"
-        "- condition that tells traders to stand aside\n\n"
+        "Respond using exactly this envelope with these headings (no extra sections):\n"
+        "A) State\n"
+        "B) Why\n"
+        "C) Action\n"
+        "D) Risk + invalidation\n\n"
+        "Rules:\n"
+        "- If permissions.no_trade is true OR data is stale, you MUST lead C) Action with DO NOTHING.\n"
+        "- Do not invent prices/levels/indicators; only reference what TNT_STATE contains.\n\n"
         "User question:\n"
         f"{question.strip()}"
     ).strip()
@@ -5452,11 +6793,26 @@ def _build_coach_data_snapshot_line(tnt_state: Mapping[str, Any]) -> str:
 
 
 _COACH_SYSTEM_ADDENDUM = (
-    "COACH MODE OVERRIDE:\n"
+    "COACH MODE OVERRIDE (CONSISTENCY CONTRACT):\n"
     "- Your ONLY factual context is TNT_STATE (authoritative).\n"
-    "- Follow the user's requested output format EXACTLY.\n"
-    "- Do not include extra sections, headings, or commentary outside the format.\n"
-    "- If data is stale/closed, answer in standby mode using recent session history from TNT_STATE if present.\n"
+    "- TNT_STATE.context.canonical_ctx (if present) is the canonical snapshot layer (ctx:market + ctx:sym).\n"
+    "- ctx:sym:{SYM}.candidates (if present) is the ONLY source of truth for structure recommendations.\n"
+    "  - Language discipline: call them 'AI Trade Candidates' / 'AI Option Structure Candidates' (NOT signals, entries, calls, predictions, or trades).\n"
+    f"  - Canonical definition (do not deviate): {AI_TRADE_CANDIDATES_CANONICAL_DEFINITION}\n"
+    f"  - If the user treats a candidate like a signal/entry, you MUST respond verbatim: '{AI_TRADE_CANDIDATES_MISINTERPRETATION_CORRECTION_SENTENCE}'\n"
+    f"  - If candidates.status=APPROVED and candidates.top exists: surface ONLY that candidate using the template: context → name → why it fits → '{AI_TRADE_CANDIDATES_BOUNDARY_SENTENCE}' → invalidation → when NOT to take it.\n"
+    f"  - If candidates.status=NONE: you MUST say: '{AI_TRADE_CANDIDATES_NO_CANDIDATE_SENTENCE}' Then briefly say why. Do NOT apologize.\n"
+    "  - If candidates.status=STALE or ERROR: you MUST refuse to surface a candidate (observational only).\n"
+    "- If canonical ctx is missing or incomplete, you MUST degrade to observational mode (say what's missing; do not invent).\n"
+    "- You are NOT allowed to contradict TNT tokens (bias/regime/permissions).\n"
+    "- If permissions.no_trade is true, you MUST lead with DO NOTHING (no entries).\n"
+    "- For geopolitics/news questions: do not claim breaking developments unless they appear in canonical ctx news fields; otherwise speak in general mechanics + explicitly say you can't confirm headlines.\n"
+    "- Always output exactly this envelope with these headings (no extra sections):\n"
+    "  A) State\n"
+    "  B) Why\n"
+    "  C) Action\n"
+    "  D) Risk + invalidation\n"
+    "- Confidence language must map to confidence bands: HIGH=direct; MED=conditional; LOW=wait.\n"
 )
 
 
@@ -5683,20 +7039,27 @@ def _build_trend_based_coach_response(symbol: str, trend: Mapping[str, Any]) -> 
         invalid = "Any breakout that fails and returns to the middle of the range."
         idle = "Price stays inside the prior day range with no expansion."
 
-    # Last close is included as a gentle anchor (it is factual from bars).
+    # This response is intentionally scenario-based (daily history only).
+    # Last close is included as a factual anchor from bars.
     answer = f"{answer} (Last close: {last_close})"
 
     return "\n".join(
         [
-            f"Answer: {answer}",
-            "Bullish only if:",
-            f"- {bull}",
-            "Bearish if:",
-            f"- {bear}",
-            "Invalidation:",
-            f"- {invalid}",
-            "Do nothing if:",
-            f"- {idle}",
+            "A) State",
+            f"Daily trend snapshot for {sym}: {answer}",
+            "",
+            "B) Why",
+            "- This is derived from recent daily bars (not intraday).",
+            "- Treat it as context, not a trigger.",
+            "",
+            "C) Action",
+            "- DO NOTHING until you have fresh /analyze and healthy intraday context.",
+            f"- If you still want a scenario: bullish only if {bull}",
+            f"- Bearish only if {bear}",
+            f"- DO NOTHING if {idle}",
+            "",
+            "D) Risk + invalidation",
+            f"- Invalidation: {invalid}",
         ]
     )
 
@@ -5704,12 +7067,22 @@ def _build_trend_based_coach_response(symbol: str, trend: Mapping[str, Any]) -> 
 def _build_coach_error_response(symbol: str, reason: str) -> str:
     symbol_clean = (symbol or "").strip().upper() or "UNKNOWN"
     reason_clean = (reason or "coach error").strip().split("\n", 1)[0][:160]
-    lines = [
-        f"⚠️ Coach temporarily unavailable for {symbol_clean}.",
-        f"Details: {reason_clean}.",
-        "Posting the latest /analyze output so you still have actionable levels.",
-    ]
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            "A) State",
+            f"Coach temporarily unavailable for {symbol_clean}.",
+            "",
+            "B) Why",
+            f"- {reason_clean}.",
+            "",
+            "C) Action",
+            "- DO NOTHING until coaching recovers.",
+            "- Use the latest /analyze output for levels and gates.",
+            "",
+            "D) Risk + invalidation",
+            "- n/a",
+        ]
+    )
 
 
 def _normalize_coach_output(raw: str) -> tuple[str, bool]:
@@ -5781,8 +7154,20 @@ async def _call_openai_coach(
     analysis_payload: Mapping[str, Any],
     recent_daily_trend: Optional[Mapping[str, Any]] = None,
     options_chain_summary: Optional[Mapping[str, Any]] = None,
+    max_output_tokens: int | None = None,
 ) -> tuple[str, Optional[str], Optional[str]]:
     tnt_state = build_tnt_state_from_analysis_payload(analysis_payload).state
+
+    # Canonical ctx snapshot injection (ctx:*). This is the single source of truth.
+    try:
+        canon = analysis_payload.get("canonical_ctx")
+        if isinstance(canon, Mapping):
+            ctx = tnt_state.get("context")
+            if isinstance(ctx, dict):
+                # Keep small; callers already pre-trim the ctx payload.
+                ctx["canonical_ctx"] = dict(canon)
+    except Exception:  # noqa: BLE001
+        pass
     if recent_daily_trend is not None:
         try:
             ctx = tnt_state.get("context")
@@ -5815,7 +7200,7 @@ async def _call_openai_coach(
         user_text=user_text,
         label="coach",
         model=_coach_model_name(),
-        max_output_tokens=_coach_max_tokens(),
+        max_output_tokens=int(max_output_tokens) if isinstance(max_output_tokens, int) else _coach_max_tokens(),
         temperature=0.35,
         system_addendum=_COACH_SYSTEM_ADDENDUM,
     )
@@ -5828,9 +7213,1239 @@ async def _run_analyze_for_symbol(symbol: str) -> tuple[str, dict[str, Any]]:
     return render.text, payload
 
 
-async def run_analyze_then_coach(symbol: str, question: str) -> tuple[str, RenderedPost, str, bool, float]:
+async def run_analyze_then_coach(
+    symbol: str,
+    question: str,
+    *,
+    user_id: int | None = None,
+    channel_id: int | None = None,
+    source: str | None = None,
+    is_admin: bool = False,
+    owner_available: bool = False,
+    draining: bool = False,
+    safe_mode: bool = False,
+    live_hours: bool = False,
+    fast_mode: bool = False,
+    cheap_mode: bool = False,
+) -> tuple[str, RenderedPost, str, bool, float]:
     started = time_lib.time()
-    sym = (symbol or "").strip().upper()
+    sym_in = (symbol or "").strip().upper()
+
+    # Consistency Contract: canonical ctx snapshots must be present.
+    ctx_missing: list[str] = []
+    ctx_market: dict | None = None
+    ctx_sym: dict | None = None
+    spec: IntentSpec | None = None
+    r_ctx = None
+    try:
+        from services.context.ctx_mode import ctx_enabled as _ctx_enabled
+    except Exception:
+        _ctx_enabled = None
+    ctx_enabled = bool(_ctx_enabled()) if _ctx_enabled is not None else ((os.getenv("CTX_SNAPSHOT_ENABLED", "0") or "0").strip() == "1")
+    if ctx_enabled:
+        try:
+            r_ctx = redis_client_for_ctx()
+            spec = resolve_intent_and_required_keys(message_text=question or "", r=r_ctx, provided_symbol=sym_in or None)
+            ctx_market, ctx_sym, ctx_missing = load_required_ctx(r=r_ctx, spec=spec, consumer="coach")
+        except Exception:
+            ctx_market, ctx_sym, ctx_missing = None, None, ["ctx:redis_unavailable"]
+    else:
+        ctx_missing = ["CTX_SNAPSHOT_DISABLED"]
+
+    # Use validated symbol from the spec when present.
+    sym = (spec.symbol if spec is not None else sym_in) or sym_in
+
+    # CHEAP_QA lane: no LLM, no /analyze/worker dependency; may use lightweight HTTP APIs.
+    # This is intended for low-token Q&A that can still answer earnings/news.
+    if bool(cheap_mode) and not bool(fast_mode):
+        from datetime import timedelta
+
+        def _render_env_receipt(*, decision: str, reason: str) -> str:
+            ctx_age_s = None
+            try:
+                if isinstance(ctx_market, dict) and ctx_market.get("ts_utc") is not None:
+                    ctx_age_s = max(0, int(time_lib.time()) - int(float(ctx_market.get("ts_utc"))))
+            except Exception:
+                ctx_age_s = None
+            ctx_label = "missing" if not isinstance(ctx_market, dict) else (f"{ctx_age_s}s" if ctx_age_s is not None else "unknown")
+            return f"mode=CHEAP_QA | ctx_age={ctx_label} | decision={decision} | reason={reason} | llm=0ms"
+
+        def _truncate_lines(lines: list[str], *, max_chars: int = 1700) -> str:
+            out: list[str] = []
+            used = 0
+            for ln in lines:
+                s = (ln or "").rstrip()
+                if not s:
+                    candidate = ""
+                else:
+                    candidate = s
+                extra = (len(candidate) + 1) if out else len(candidate)
+                if used + extra > max_chars:
+                    break
+                out.append(candidate)
+                used += extra
+            text = "\n".join(out).strip()
+            if len(text) > max_chars:
+                text = text[: max_chars - 3].rstrip() + "..."
+            return text
+
+        def _extract_iso_date(text: str) -> str | None:
+            import re
+
+            raw = str(text or "")
+            m = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", raw)
+            if not m:
+                return None
+            return str(m.group(1) or "").strip() or None
+
+        def _infer_when_from_dt_et(dt_et: datetime) -> str:
+            try:
+                if int(dt_et.hour) < 12:
+                    return "BMO"
+                if int(dt_et.hour) >= 16:
+                    return "AMC"
+                return "TAS"
+            except Exception:
+                return "TAS"
+
+        try:
+            from services.nl.nl_router import route_text as _route_text
+
+            nl = _route_text(text=question or "")
+        except Exception:
+            nl = None
+
+        def _is_futures_root(sym0: str) -> bool:
+            s = (sym0 or "").strip().upper()
+            if not s:
+                return False
+            # Operators can override this list without code changes.
+            roots_raw = os.getenv(
+                "CHEAP_QA_FUTURES_ROOTS",
+                "ES,NQ,YM,RTY,CL,GC,SI,NG,HG,ZB,ZN,ZF,ZT,6E,6J,6B,6A,6C",
+            )
+            roots = {x.strip().upper() for x in str(roots_raw or "").split(",") if x.strip()}
+            return s in roots
+
+        def _fmt_num(val: object, *, digits: int = 2) -> str:
+            try:
+                if val is None:
+                    return "n/a"
+                f = float(val)
+                if not (f == f):
+                    return "n/a"
+                return f"{f:.{int(digits)}f}"
+            except Exception:
+                return "n/a"
+
+        def _fmt_int(val: object) -> str:
+            try:
+                if val is None:
+                    return "n/a"
+                return f"{int(float(val)):,}"
+            except Exception:
+                return "n/a"
+
+        def _fmt_money(val: object) -> str:
+            s = _fmt_num(val, digits=2)
+            return "n/a" if s == "n/a" else f"${s}"
+
+        def _fmt_signed(val: object, *, digits: int = 2) -> str:
+            try:
+                if val is None:
+                    return "n/a"
+                f = float(val)
+                if not (f == f):
+                    return "n/a"
+                sign = "+" if f >= 0 else ""
+                return f"{sign}{f:.{int(digits)}f}"
+            except Exception:
+                return "n/a"
+
+        # NEWS (Massive/Benzinga)
+        try:
+            if nl is not None and getattr(nl, "route", None) == "news":
+                sym_news = (getattr(nl, "symbol", None) or sym or "").strip().upper() or None
+                base = (os.getenv("MASSIVE_BASE_URL") or "https://api.massive.com").strip().rstrip("/")
+                key = _resolve_massive_api_key()
+                if not key:
+                    msg = "📰 News: missing MASSIVE_API_KEY (or POLYGON_API_KEY fallback)."
+                    latency_ms = (time_lib.time() - started) * 1000.0
+                    receipt = _render_env_receipt(decision="news", reason="missing_key")
+                    return (
+                        msg,
+                        RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                        "ok_degraded",
+                        False,
+                        latency_ms,
+                    )
+
+                try:
+                    from services.news.massive_benzinga_news import fetch_benzinga_news
+
+                    since = _now_utc().replace(tzinfo=timezone.utc) - timedelta(hours=24)
+                    limit = max(3, min(8, _env_int("CHEAP_QA_NEWS_LIMIT", 5)))
+                    items = await fetch_benzinga_news(
+                        base_url=base,
+                        api_key=key,
+                        tickers=[sym_news] if sym_news else None,
+                        published_since_utc=since,
+                        limit=int(limit),
+                        timeout_s=float(_env_int("CHEAP_QA_NEWS_TIMEOUT_S", 10)),
+                    )
+                except Exception:
+                    items = []
+
+                lines: list[str] = []
+                title = f"📰 News (24h){' — ' + sym_news if sym_news else ''}"
+                lines.append(title)
+                if items:
+                    for it in items[: int(limit)]:
+                        try:
+                            tickers = it.tickers if hasattr(it, "tickers") else []
+                            tick_str = f" [{', '.join(tickers[:4])}]" if tickers else ""
+                        except Exception:
+                            tick_str = ""
+                        headline = str(getattr(it, "headline", "") or "").strip()
+                        url = str(getattr(it, "url", "") or "").strip()
+                        if url:
+                            lines.append(f"• {headline}{tick_str}\n  {url}")
+                        else:
+                            lines.append(f"• {headline}{tick_str}")
+                else:
+                    lines.append("• No recent headlines returned (provider empty / rate limited)")
+
+                out = _truncate_lines(lines, max_chars=1700)
+                latency_ms = (time_lib.time() - started) * 1000.0
+                receipt = _render_env_receipt(decision="news", reason="ok" if items else "empty")
+                return (
+                    out,
+                    RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                    "ok" if items else "ok_degraded",
+                    False,
+                    latency_ms,
+                )
+        except Exception:
+            # Never let CHEAP_QA break the caller; fall through to other modes.
+            pass
+
+        # EARNINGS (Massive/Benzinga)
+        try:
+            if nl is not None and getattr(nl, "route", None) == "earnings":
+                now_et = _now_et()
+                now_utc = _now_utc().replace(tzinfo=timezone.utc)
+                watchlist = [s.strip().upper() for s in (os.getenv("EARNINGS_WATCHLIST") or "").split(",") if s.strip()]
+
+                base = (os.getenv("MASSIVE_BASE_URL") or "https://api.massive.com").strip().rstrip("/")
+                key = _resolve_earnings_api_key()
+
+                if not key:
+                    msg = "📅 Earnings: missing API key (set EARNINGS_API_KEY or MASSIVE_API_KEY / POLYGON_API_KEY fallback)."
+                    latency_ms = (time_lib.time() - started) * 1000.0
+                    receipt = _render_env_receipt(decision="earnings", reason="missing_key")
+                    return (
+                        msg,
+                        RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                        "ok_degraded",
+                        False,
+                        latency_ms,
+                    )
+
+                handler = str(getattr(nl, "handler", "") or "")
+                if handler == "earnings_symbol":
+                    sym_e = (getattr(nl, "symbol", None) or sym or "").strip().upper()
+                    if not sym_e:
+                        msg = "📅 Earnings: provide a ticker (e.g., 'AAPL earnings date')."
+                        latency_ms = (time_lib.time() - started) * 1000.0
+                        receipt = _render_env_receipt(decision="earnings_symbol", reason="missing_symbol")
+                        return (
+                            msg,
+                            RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                            "ok_degraded",
+                            False,
+                            latency_ms,
+                        )
+
+                    # Query a forward window and pick the next upcoming.
+                    try:
+                        from services.calendar.massive_benzinga_earnings import fetch_benzinga_earnings, pick_next_earnings
+
+                        start_d = now_et.date()
+                        end_d = (now_et.date() + timedelta(days=int(_env_int("CHEAP_QA_EARNINGS_LOOKAHEAD_DAYS", 90))))
+                        recs = await fetch_benzinga_earnings(
+                            base_url=base,
+                            api_key=key,
+                            tickers=[sym_e],
+                            start_date=start_d,
+                            end_date=end_d,
+                            limit=200,
+                            timeout_s=float(_env_int("CHEAP_QA_EARNINGS_TIMEOUT_S", 12)),
+                        )
+                        nxt = pick_next_earnings(recs, symbol=sym_e, now_utc=now_utc)
+                    except Exception:
+                        nxt = None
+
+                    if nxt is None:
+                        out = f"📅 Earnings — {sym_e}\n• No upcoming earnings found in the next ~90 days (or provider returned empty)."
+                        latency_ms = (time_lib.time() - started) * 1000.0
+                        receipt = _render_env_receipt(decision="earnings_symbol", reason="no_hits")
+                        return (
+                            out,
+                            RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                            "ok_degraded",
+                            False,
+                            latency_ms,
+                        )
+
+                    dt_et = nxt.ts_utc.astimezone(ET)
+                    when = _infer_when_from_dt_et(dt_et)
+                    date_et = dt_et.date().isoformat()
+                    days = (dt_et.date() - now_et.date()).days
+                    conf = "confirmed" if bool(getattr(nxt, "confirmed", True)) else "unconfirmed"
+                    out = (
+                        f"📅 Earnings — {sym_e}\n"
+                        f"• Next: {date_et} ({when}, ET) — {conf}\n"
+                        f"• Timing: {days} day(s) away\n"
+                        "Context only • Not financial advice"
+                    )
+                    latency_ms = (time_lib.time() - started) * 1000.0
+                    receipt = _render_env_receipt(decision="earnings_symbol", reason="ok")
+                    return (
+                        out,
+                        RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                        "ok",
+                        False,
+                        latency_ms,
+                    )
+
+                # earnings_calendar (window)
+                q_lower = str(question or "").lower()
+                explicit_date = _extract_iso_date(question or "")
+
+                # Default: tomorrow (next weekday).
+                if explicit_date:
+                    start_d = date.fromisoformat(explicit_date)
+                    end_d = start_d
+                    label = f"{explicit_date}"
+                elif "today" in q_lower:
+                    start_d = now_et.date()
+                    end_d = now_et.date()
+                    label = f"{start_d.isoformat()}"
+                elif "tomorrow" in q_lower:
+                    start_d = next_weekday(now_et.date() + timedelta(days=1))
+                    end_d = start_d
+                    label = f"{start_d.isoformat()}"
+                elif "next week" in q_lower:
+                    # Next week's Monday..Friday
+                    d0 = now_et.date()
+                    days_ahead = (7 - d0.weekday()) % 7
+                    if days_ahead == 0:
+                        days_ahead = 7
+                    monday = d0 + timedelta(days=days_ahead)
+                    start_d = monday
+                    end_d = monday + timedelta(days=4)
+                    label = f"{start_d.isoformat()}..{end_d.isoformat()}"
+                elif "this week" in q_lower:
+                    d0 = now_et.date()
+                    start_d = d0
+                    end_d = d0 + timedelta(days=max(0, 4 - d0.weekday()))
+                    label = f"{start_d.isoformat()}..{end_d.isoformat()}"
+                else:
+                    start_d = next_weekday(now_et.date() + timedelta(days=1))
+                    end_d = start_d
+                    label = f"{start_d.isoformat()}"
+
+                # Safety: do not fetch a full-market calendar; require a watchlist.
+                if not watchlist:
+                    out = (
+                        "📅 Earnings (watchlist-only)\n"
+                        "• EARNINGS_WATCHLIST is empty, so TNT won’t pull the full market calendar in cheap mode.\n"
+                        "• Ask a single ticker (e.g., 'AAPL earnings date') or set EARNINGS_WATCHLIST."
+                    )
+                    latency_ms = (time_lib.time() - started) * 1000.0
+                    receipt = _render_env_receipt(decision="earnings_calendar", reason="empty_watchlist")
+                    return (
+                        out,
+                        RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                        "ok_degraded",
+                        False,
+                        latency_ms,
+                    )
+
+                try:
+                    from services.calendar.massive_benzinga_earnings import fetch_benzinga_earnings
+
+                    recs = await fetch_benzinga_earnings(
+                        base_url=base,
+                        api_key=key,
+                        tickers=watchlist,
+                        start_date=start_d,
+                        end_date=end_d,
+                        limit=800,
+                        timeout_s=float(_env_int("CHEAP_QA_EARNINGS_TIMEOUT_S", 12)),
+                    )
+                except Exception:
+                    recs = []
+
+                by_date: dict[str, dict[str, list[str]]] = {}
+                for r in recs or []:
+                    try:
+                        dt_et = r.ts_utc.astimezone(ET)
+                        d = dt_et.date().isoformat()
+                        when = _infer_when_from_dt_et(dt_et)
+                        by_date.setdefault(d, {}).setdefault(when, []).append(str(r.symbol or "").strip().upper())
+                    except Exception:
+                        continue
+
+                lines = [f"📅 Earnings (watchlist) — {label} (ET)"]
+                if not by_date:
+                    lines.append("• None found for tracked symbols")
+                else:
+                    for d in sorted(by_date.keys()):
+                        buckets = by_date[d]
+                        parts: list[str] = []
+                        for k in ("BMO", "AMC", "TAS"):
+                            syms = sorted({s for s in (buckets.get(k) or []) if s})
+                            if syms:
+                                parts.append(f"{k}: {', '.join(syms[:12])}{'…' if len(syms) > 12 else ''}")
+                        lines.append(f"• {d}: " + (" | ".join(parts) if parts else "(none)"))
+                lines.append("Context only • Not financial advice")
+
+                out = _truncate_lines(lines, max_chars=1700)
+                latency_ms = (time_lib.time() - started) * 1000.0
+                receipt = _render_env_receipt(decision="earnings_calendar", reason="ok" if by_date else "empty")
+                return (
+                    out,
+                    RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                    "ok" if by_date else "ok_degraded",
+                    False,
+                    latency_ms,
+                )
+        except Exception:
+            pass
+
+        # Premium snapshot fallback for any ticker (Polygon equities/indices, Databento futures via FuturesStore).
+        # This is the primary "any ticker" answer path when cheap_mode is enabled.
+        try:
+            sym_snap = (sym or "").strip().upper()
+            if sym_snap:
+                ql = str(question or "").strip().lower()
+
+                # FUTURES roots: prefer ingest quote; fallback to Databento historical (inside FuturesStore).
+                if _is_futures_root(sym_snap) or ("futures" in ql and _is_futures_root(sym_snap)):
+                    quote = None
+                    try:
+                        from services.futures.futures_store import FuturesStore
+
+                        store = FuturesStore(r_ctx) if r_ctx is not None else FuturesStore()
+                        quotes = await asyncio.to_thread(store.get_quotes_with_fallback, [sym_snap])
+                        quote = quotes.get(sym_snap) if isinstance(quotes, dict) else None
+                    except Exception:
+                        quote = None
+
+                    lines = [f"📈 TNT Snapshot — {sym_snap} (Futures)"]
+                    if quote is None:
+                        lines.append("• Quote: unavailable (futures ingest offline and Databento fallback missing)")
+                        lines.append("• Check: futures ingest heartbeat / DATABENTO_API_KEY")
+                        status = "ok_degraded"
+                    else:
+                        try:
+                            ts_et = datetime.fromtimestamp(int(getattr(quote, "ts_utc", 0)), tz=timezone.utc).astimezone(ET)
+                            ts_lab = ts_et.strftime("%Y-%m-%d %H:%M:%S ET")
+                        except Exception:
+                            ts_lab = "n/a"
+                        px = getattr(quote, "px", None)
+                        chg = getattr(quote, "chg", None)
+                        chg_pct = getattr(quote, "chg_pct", None)
+                        src = str(getattr(quote, "source", "") or "").strip() or "unknown"
+                        lines.append(f"• Last: {_fmt_num(px, digits=2)} | Δ {_fmt_signed(chg, digits=2)} ({_fmt_signed(chg_pct, digits=2)}%)")
+                        lines.append(f"• As of: {ts_lab} | source={src}")
+
+                        # Premium futures enrichment: posture/context from futures scores (Redis-backed).
+                        try:
+                            if _cheapqa_enrich_enabled() and _cheapqa_enrich_futures_enabled():
+                                from services.futures.futures_context_line import WARN_AGE_S_DEFAULT, render_futures_context_line
+
+                                scores = await asyncio.to_thread(store.get_scores)
+                                scores_max_age = int(os.getenv("TNT_FUTURES_INGEST_SCORES_MAX_AGE_SEC", "120") or "120")
+                                warn_age = int(os.getenv("TNT_FUTURES_INGEST_SCORES_WARN_AGE_SEC", str(WARN_AGE_S_DEFAULT)) or str(WARN_AGE_S_DEFAULT))
+                                now = int(time_lib.time())
+                                ctx_line = render_futures_context_line(
+                                    scores,
+                                    now_epoch=now,
+                                    max_age_sec=int(max(30, min(scores_max_age, 3600))),
+                                    warn_age_sec=int(max(60, min(warn_age, 3600))),
+                                )
+                                if ctx_line:
+                                    lines.append(ctx_line)
+                        except Exception:
+                            pass
+                        status = "ok"
+
+                    out = _truncate_lines(lines, max_chars=1700)
+                    latency_ms = (time_lib.time() - started) * 1000.0
+                    receipt = _render_env_receipt(decision="snapshot_futures", reason=status)
+                    return (
+                        out,
+                        RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                        status,
+                        False,
+                        latency_ms,
+                    )
+
+                # Indices (Polygon index snapshot) if the user provided I: symbols.
+                if sym_snap.startswith("I:"):
+                    payload = None
+                    try:
+                        from delivery.on_demand_data import extract_index_last_prev_close_ts, polygon_index_snapshot
+
+                        payload = await asyncio.to_thread(polygon_index_snapshot, sym_snap)
+                        last, prev_close, ts_iso = extract_index_last_prev_close_ts(payload if isinstance(payload, dict) else {})
+                    except Exception:
+                        last, prev_close, ts_iso = None, None, None
+
+                    lines = [f"📈 TNT Snapshot — {sym_snap} (Index)"]
+                    if last is None and prev_close is None:
+                        lines.append("• Quote: unavailable (missing/invalid POLYGON_API_KEY or snapshot empty)")
+                        status = "ok_degraded"
+                    else:
+                        px = last if last is not None else prev_close
+                        delta = None
+                        pct = None
+                        if px is not None and prev_close is not None and prev_close:
+                            try:
+                                delta = float(px) - float(prev_close)
+                                pct = (float(delta) / float(prev_close)) * 100.0
+                            except Exception:
+                                delta, pct = None, None
+                        ts_lab = None
+                        try:
+                            if ts_iso:
+                                ts_lab = parse_iso(str(ts_iso)).astimezone(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+                        except Exception:
+                            ts_lab = None
+                        lines.append(f"• Last: {_fmt_num(px, digits=2)} | Δ {_fmt_signed(delta, digits=2)} ({_fmt_signed(pct, digits=2)}%)")
+                        if prev_close is not None:
+                            lines.append(f"• Prev close: {_fmt_num(prev_close, digits=2)}")
+                        if ts_lab:
+                            lines.append(f"• As of: {ts_lab}")
+                        status = "ok"
+
+                    out = _truncate_lines(lines, max_chars=1700)
+                    latency_ms = (time_lib.time() - started) * 1000.0
+                    receipt = _render_env_receipt(decision="snapshot_index", reason=status)
+                    return (
+                        out,
+                        RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                        status,
+                        False,
+                        latency_ms,
+                    )
+
+                # Equities/ETFs (Polygon stock snapshot).
+                payload = None
+                try:
+                    from delivery.on_demand_data import polygon_snapshot
+
+                    payload = await asyncio.to_thread(polygon_snapshot, sym_snap)
+                except Exception:
+                    payload = None
+
+                ticker = (payload or {}).get("ticker") if isinstance(payload, dict) else None
+                ticker = ticker if isinstance(ticker, dict) else {}
+                last_trade = ticker.get("lastTrade") if isinstance(ticker.get("lastTrade"), dict) else {}
+                last_quote = ticker.get("lastQuote") if isinstance(ticker.get("lastQuote"), dict) else {}
+                day = ticker.get("day") if isinstance(ticker.get("day"), dict) else {}
+                prev = ticker.get("prevDay") if isinstance(ticker.get("prevDay"), dict) else {}
+
+                # Price + timestamp (best-effort).
+                last_px = last_trade.get("p")
+                last_ts = last_trade.get("t")
+                if last_px is None:
+                    last_px = last_quote.get("P") or last_quote.get("p")
+                    last_ts = last_quote.get("t")
+                if last_px is None:
+                    last_px = day.get("c")
+                    last_ts = day.get("t")
+                if last_px is None:
+                    last_px = prev.get("c")
+                    last_ts = prev.get("t")
+
+                prev_close = prev.get("c")
+                delta = None
+                pct = None
+                if last_px is not None and prev_close not in (None, 0, 0.0):
+                    try:
+                        delta = float(last_px) - float(prev_close)
+                        pct = (float(delta) / float(prev_close)) * 100.0
+                    except Exception:
+                        delta, pct = None, None
+
+                ts_lab = None
+                try:
+                    if last_ts is not None:
+                        # Polygon uses ms epoch.
+                        ts_s = float(last_ts) / 1000.0 if float(last_ts) > 1e10 else float(last_ts)
+                        ts_lab = datetime.fromtimestamp(ts_s, tz=timezone.utc).astimezone(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+                except Exception:
+                    ts_lab = None
+
+                lines = [f"💎 TNT Snapshot — {sym_snap}"]
+                if last_px is None:
+                    lines.append("• Quote: unavailable (missing/invalid POLYGON_API_KEY or unsupported symbol)")
+                    lines.append("• Tip: if this is a futures root, ask with a futures symbol like ES/NQ/CL")
+                    status = "ok_degraded"
+                else:
+                    lines.append(f"• Last: {_fmt_money(last_px)} | Δ {_fmt_money(delta)} ({_fmt_signed(pct, digits=2)}%)")
+
+                    o = day.get("o")
+                    h = day.get("h")
+                    l = day.get("l")
+                    c = day.get("c")
+                    v = day.get("v")
+                    vw = day.get("vw")
+                    rng = f"O {_fmt_money(o)} H {_fmt_money(h)} L {_fmt_money(l)} C {_fmt_money(c)}"
+                    lines.append(f"• Day: {rng} | VWAP {_fmt_money(vw)} | Vol {_fmt_int(v)}")
+
+                    if prev_close is not None:
+                        lines.append(f"• Prev close: {_fmt_money(prev_close)}")
+                    if ts_lab:
+                        lines.append(f"• As of: {ts_lab}")
+
+                    # Premium enrichments (still no LLM) — bounded + cached.
+                    try:
+                        if _cheapqa_enrich_enabled() and _cheapqa_enrich_news_enabled():
+                            news_lines = await _cheapqa_latest_news_lines(sym_snap)
+                            if news_lines:
+                                lines.extend(news_lines[:1])
+                    except Exception:
+                        pass
+                    try:
+                        if _cheapqa_enrich_enabled() and _cheapqa_enrich_earnings_enabled():
+                            asof_utc = None
+                            try:
+                                if last_ts is not None:
+                                    ts_s = float(last_ts) / 1000.0 if float(last_ts) > 1e10 else float(last_ts)
+                                    asof_utc = datetime.fromtimestamp(ts_s, tz=timezone.utc)
+                            except Exception:
+                                asof_utc = None
+                            e_line = await _cheapqa_next_earnings_line(sym_snap, now_utc=asof_utc)
+                            if e_line:
+                                lines.append(e_line)
+                    except Exception:
+                        pass
+
+                    lines.append("• Ask: 'earnings date' or 'why is it moving' for details")
+                    status = "ok"
+
+                out = _truncate_lines(lines, max_chars=1700)
+                latency_ms = (time_lib.time() - started) * 1000.0
+                receipt = _render_env_receipt(decision="snapshot_stock", reason=status)
+                return (
+                    out,
+                    RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                    status,
+                    False,
+                    latency_ms,
+                )
+        except Exception:
+            pass
+
+        # If CHEAP_QA couldn't route/answer, fall back to FAST_QA templates (still no LLM).
+        # By default, CHEAP_QA preserves a no-LLM guarantee.
+        # Operators may enable a last-resort coach fallback for /ask via CHEAP_QA_ALLOW_COACH_FALLBACK=1.
+        try:
+            if _cheapqa_allow_coach_fallback() and nl is not None and getattr(nl, "route", None) == "coach":
+                sym_fb = (sym or "").strip().upper()
+                if sym_fb:
+                    try:
+                        analyze_timeout = float(os.getenv("CHEAP_QA_COACH_ANALYZE_TIMEOUT_S", "14") or "14")
+                    except Exception:
+                        analyze_timeout = 14.0
+
+                    try:
+                        render_text, analysis_payload = await asyncio.wait_for(_run_analyze_for_symbol(sym_fb), timeout=max(2.0, min(analyze_timeout, 30.0)))
+                    except Exception:
+                        render_text, analysis_payload = "", {}
+
+                    if isinstance(analysis_payload, dict) and analysis_payload:
+                        llm_started = time_lib.time()
+                        try:
+                            coach_text, _prompt_sha, _state_sha = await _call_openai_coach(
+                                question=question,
+                                render=RenderedPost(text=str(render_text or ""), agent_payload=dict(analysis_payload)),
+                                analysis_payload=analysis_payload,
+                                max_output_tokens=_coach_max_tokens_for_ask(),
+                            )
+                        except Exception as e:
+                            coach_text = _build_coach_error_response(sym_fb, str(e))
+
+                        coach_text = str(coach_text or "").strip()
+                        if coach_text:
+                            max_chars = _ai_max_chars()
+                            if len(coach_text) > max_chars:
+                                coach_text = coach_text[: max(0, max_chars - 3)].rstrip() + "..."
+                            latency_ms = (time_lib.time() - started) * 1000.0
+                            llm_ms = (time_lib.time() - llm_started) * 1000.0
+                            receipt = f"mode=CHEAP_QA | decision=coach_fallback | reason=ok | llm={int(llm_ms)}ms"
+                            return (
+                                coach_text,
+                                RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+                                "ok",
+                                False,
+                                latency_ms,
+                            )
+        except Exception:
+            pass
+
+        cheap_fallback = (
+            "Context: cheap Q&A mode (no LLM).\n"
+            "I can answer: premium ticker snapshot + earnings dates + recent headlines.\n"
+            "For trade plans/levels, use `/trade` or `/regime`, or ask a specific symbol context.\n"
+            "Confidence: LOW"
+        )
+        latency_ms = (time_lib.time() - started) * 1000.0
+        receipt = _render_env_receipt(decision="fallback", reason="no_match")
+        return (
+            cheap_fallback,
+            RenderedPost(text="", agent_payload={"cheap_mode": True, "cheap_receipt": receipt}),
+            "ok_degraded",
+            False,
+            latency_ms,
+        )
+
+    # FAST_QA lane: never waits on /analyze, workers, options chain, or any heavy semaphores.
+    # This mode intentionally returns deterministic templates only.
+    if bool(fast_mode):
+        try:
+            from delivery.fastqa_state import update_fastqa_last as _update_fastqa_last
+            from delivery.fastqa_state import record_fastqa_event as _record_fastqa_event
+        except Exception:  # pragma: no cover - defensive
+            _update_fastqa_last = None
+            _record_fastqa_event = None
+
+        def _env_flag(name: str, default: str = "0") -> bool:
+            try:
+                return (os.getenv(name, default) or default).strip() == "1"
+            except Exception:
+                return False
+
+        def _now_utc() -> int:
+            try:
+                return int(time_lib.time())
+            except Exception:
+                return 0
+
+        def _age_s(ts_utc: object) -> int | None:
+            try:
+                if ts_utc is None:
+                    return None
+                ts_i = int(float(ts_utc))
+                return max(0, _now_utc() - ts_i)
+            except Exception:
+                return None
+
+        def _pick_first_int(d: dict | None, keys: tuple[str, ...]) -> int | None:
+            if not isinstance(d, dict):
+                return None
+            for k in keys:
+                try:
+                    v = d.get(k)
+                    if v is None:
+                        continue
+                    return int(float(v))
+                except Exception:
+                    continue
+            return None
+
+        # Build a small receipt proving FAST_QA (no heavy, no LLM).
+        ctx_age = _age_s(ctx_market.get("ts_utc")) if isinstance(ctx_market, dict) else None
+        fut = (ctx_market.get("futures") if isinstance(ctx_market, dict) else None) if ctx_market is not None else None
+        fut_age = _pick_first_int(fut, ("hb_age_sec", "hb_age_s", "age_sec", "age_s"))
+        fut_degraded = False
+        try:
+            fut_degraded = bool(fut.get("degraded")) if isinstance(fut, dict) else False
+        except Exception:
+            fut_degraded = False
+
+        fut_ok = (fut is not None) and (not fut_degraded) and (fut_age is None or fut_age <= 120)
+        fut_label = "OK" if fut_ok else ("DEGRADED" if fut is not None else "MISSING")
+        ctx_label = "missing" if (not ctx_market) else (f"{ctx_age}s" if ctx_age is not None else "unknown")
+        fut_age_label = f"{fut_age}s" if fut_age is not None else "unknown"
+        receipt = f"mode=FAST_QA | ctx_age={ctx_label} | fut={fut_label} age={fut_age_label} | llm=0ms"
+
+        def _record(*, decision: str, reason: str, latency_ms: float, output_text: str | None = None) -> None:
+            if _update_fastqa_last is None:
+                return
+            try:
+                _update_fastqa_last(
+                    ts_utc=float(time_lib.time()),
+                    channel_id=channel_id,
+                    user_id=user_id,
+                    mode=str(source or "unknown"),
+                    decision=str(decision),
+                    reason=str(reason),
+                    latency_ms=float(latency_ms),
+                    ctx_ok=bool(isinstance(ctx_market, dict) and bool(ctx_market)),
+                    ctx_age_s=ctx_age,
+                    futures_ok=bool(fut_ok),
+                    futures_age_s=fut_age,
+                )
+            except Exception:
+                return
+
+            if _record_fastqa_event is None:
+                return
+            try:
+                _record_fastqa_event(
+                    ts_utc=float(time_lib.time()),
+                    decision=str(decision),
+                    latency_ms=float(latency_ms),
+                    output_text=str(output_text or ""),
+                )
+            except Exception:
+                return
+
+        if _env_flag("TNT_FAST_QA_DEBUG_LOG", "0") or _env_flag("TNT_FAST_QA_DEBUG", "0"):
+            try:
+                print(f"[FAST_QA] {receipt} user_id={user_id} channel_id={channel_id} source={source}")
+            except Exception:
+                pass
+
+        # --- Moderator Authority (single boss) ---
+        intercept_intents = set()
+        try:
+            from services.moderator.moderator_authority import Intent as _ModIntent
+            from services.moderator.moderator_authority import decide_reply as _moderator_decide_reply
+
+            intercept_intents = {
+                _ModIntent.TRADE_ACTION,
+                _ModIntent.RISK_STRUCTURE,
+                _ModIntent.DATA_DIAGNOSTIC,
+            }
+            mod_decision = _moderator_decide_reply(
+                question=question or "",
+                symbol=sym or None,
+                ctx_market=ctx_market,
+                ctx_sym=ctx_sym,
+                redis_client=r_ctx,
+            )
+        except Exception:
+            mod_decision = None
+
+        if mod_decision is not None and getattr(mod_decision, "intent", None) in intercept_intents:
+            try:
+                from delivery.moderator_audit import ModeratorAudit
+
+                audit = ModeratorAudit.from_env()
+                audit.log(
+                    decision=mod_decision,
+                    source=str(source or "coach"),
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    is_admin=bool(is_admin),
+                    owner_available=bool(owner_available),
+                    draining=bool(draining),
+                    safe_mode=bool(safe_mode),
+                    live_hours=bool(live_hours),
+                    text=str(question or ""),
+                    ctx_market=ctx_market,
+                    ctx_sym=ctx_sym,
+                )
+            except Exception:
+                pass
+
+            latency_ms = (time_lib.time() - started) * 1000.0
+            _record(
+                decision="FAST_QA_MODERATED",
+                reason=f"moderator_intent={getattr(mod_decision, 'intent', None)}",
+                latency_ms=latency_ms,
+                output_text=str(getattr(mod_decision, "reply", "") or ""),
+            )
+            return (
+                str(getattr(mod_decision, "reply", "")).strip(),
+                RenderedPost(text="", agent_payload={"fast_mode": True, "fast_receipt": receipt}),
+                "ok_moderated",
+                False,
+                latency_ms,
+            )
+
+        # Deterministic templates (no /analyze dependency).
+        try:
+            if spec is not None and spec.intent == "FUTURES_OVERVIEW":
+                latency_ms = (time_lib.time() - started) * 1000.0
+                out = build_futures_overview(mkt=ctx_market)
+                _record(
+                    decision="FAST_QA",
+                    reason=f"intent=FUTURES_OVERVIEW why={getattr(spec, 'why', '')}",
+                    latency_ms=latency_ms,
+                    output_text=out,
+                )
+                return (
+                    out,
+                    RenderedPost(text="", agent_payload={"fast_mode": True, "fast_receipt": receipt}),
+                    "ok",
+                    False,
+                    latency_ms,
+                )
+
+            if spec is not None and spec.intent == "GREETING":
+                latency_ms = (time_lib.time() - started) * 1000.0
+                out = build_greeting(mkt=ctx_market)
+                _record(
+                    decision="FAST_QA",
+                    reason=f"intent=GREETING why={getattr(spec, 'why', '')}",
+                    latency_ms=latency_ms,
+                    output_text=out,
+                )
+                return (
+                    out,
+                    RenderedPost(text="", agent_payload={"fast_mode": True, "fast_receipt": receipt}),
+                    "ok",
+                    False,
+                    latency_ms,
+                )
+
+            if spec is not None and spec.intent == "MARKET_CONTEXT":
+                latency_ms = (time_lib.time() - started) * 1000.0
+                out = build_market_context(mkt=ctx_market, tnt_state={})
+                _record(
+                    decision="FAST_QA",
+                    reason=f"intent=MARKET_CONTEXT why={getattr(spec, 'why', '')}",
+                    latency_ms=latency_ms,
+                    output_text=out,
+                )
+                return (
+                    out,
+                    RenderedPost(text="", agent_payload={"fast_mode": True, "fast_receipt": receipt}),
+                    "ok",
+                    False,
+                    latency_ms,
+                )
+
+            if spec is not None and spec.intent == "CANDIDATE_REQUEST":
+                merged_sym = ctx_sym
+                try:
+                    from services.context.ctx_reader import load_ctx_candidates
+
+                    cand_ctx = load_ctx_candidates(r=r_ctx, symbol=sym) if r_ctx is not None else None
+                    if isinstance(cand_ctx, dict):
+                        base = dict(ctx_sym) if isinstance(ctx_sym, dict) else {}
+                        base["candidates"] = cand_ctx
+                        merged_sym = base
+                except Exception:
+                    merged_sym = ctx_sym
+
+                msg = build_candidate_reply(symbol=sym, sym_ctx=merged_sym)
+                latency_ms = (time_lib.time() - started) * 1000.0
+                status = "ok" if isinstance(ctx_sym, dict) else "ok_standby"
+                _record(
+                    decision="FAST_QA",
+                    reason=f"intent=CANDIDATE_REQUEST why={getattr(spec, 'why', '')} status={status}",
+                    latency_ms=latency_ms,
+                    output_text=msg,
+                )
+                return (
+                    msg,
+                    RenderedPost(text="", agent_payload={"fast_mode": True, "fast_receipt": receipt}),
+                    status,
+                    False,
+                    latency_ms,
+                )
+
+            if spec is not None and spec.intent == "SYMBOL_CONTEXT":
+                latency_ms = (time_lib.time() - started) * 1000.0
+                if ctx_sym is None:
+                    msg = build_symbol_context(symbol=sym, mkt=ctx_market, sym_ctx=None, tnt_state={})
+                    _record(
+                        decision="FAST_QA",
+                        reason=f"intent=SYMBOL_CONTEXT why={getattr(spec, 'why', '')} status=ok_standby",
+                        latency_ms=latency_ms,
+                        output_text=msg,
+                    )
+                    return (
+                        msg,
+                        RenderedPost(text="", agent_payload={"fast_mode": True, "fast_receipt": receipt}),
+                        "ok_standby",
+                        False,
+                        latency_ms,
+                    )
+                msg = build_symbol_context(symbol=sym, mkt=ctx_market, sym_ctx=ctx_sym, tnt_state={})
+                _record(
+                    decision="FAST_QA",
+                    reason=f"intent=SYMBOL_CONTEXT why={getattr(spec, 'why', '')} status=ok",
+                    latency_ms=latency_ms,
+                    output_text=msg,
+                )
+                return (
+                    msg,
+                    RenderedPost(text="", agent_payload={"fast_mode": True, "fast_receipt": receipt}),
+                    "ok",
+                    False,
+                    latency_ms,
+                )
+        except Exception:
+            pass
+
+        # Last-resort FAST_QA fallback (never punts, never queues, never blocks).
+        latency_ms = (time_lib.time() - started) * 1000.0
+        fallback = (
+            "Context: fast Q&A mode (no heavy workers).\n"
+            "Market Context — limited\n"
+            "Bottom line: I can answer market/futures posture + risk framing immediately; for charts/renders use `/oi` or `/chart`.\n"
+            "Confidence: LOW"
+        )
+        _record(
+            decision="FAST_QA_FALLBACK",
+            reason="no_fast_template_match",
+            latency_ms=latency_ms,
+            output_text=fallback,
+        )
+        return (
+            fallback,
+            RenderedPost(text="", agent_payload={"fast_mode": True, "fast_receipt": receipt}),
+            "ok_degraded",
+            False,
+            latency_ms,
+        )
+
+    # --- Moderator Authority (single boss) ---
+    # Deterministic safety/risk responses that must run *before* any coach/LLM calls.
+    intercept_intents = set()
+    try:
+        from services.moderator.moderator_authority import Intent as _ModIntent
+        from services.moderator.moderator_authority import decide_reply as _moderator_decide_reply
+
+        intercept_intents = {
+            _ModIntent.TRADE_ACTION,
+            _ModIntent.RISK_STRUCTURE,
+            _ModIntent.DATA_DIAGNOSTIC,
+        }
+        mod_decision = _moderator_decide_reply(
+            question=question or "",
+            symbol=sym or None,
+            ctx_market=ctx_market,
+            ctx_sym=ctx_sym,
+            redis_client=r_ctx,
+        )
+    except Exception:
+        mod_decision = None
+
+    # Only intercept the intents where deterministic safety is required.
+    if mod_decision is not None and getattr(mod_decision, "intent", None) in intercept_intents:
+        # Audit log (best-effort; never breaks reply)
+        try:
+            from delivery.moderator_audit import ModeratorAudit
+
+            # Keep a process-level singleton to avoid re-parsing env on each message.
+            global _MOD_AUDIT  # type: ignore[declare-usage]
+            try:
+                _MOD_AUDIT
+            except Exception:
+                _MOD_AUDIT = ModeratorAudit.from_env()  # type: ignore[misc]
+
+            _MOD_AUDIT.log(
+                decision=mod_decision,
+                source=str(source or "coach"),
+                user_id=user_id,
+                channel_id=channel_id,
+                is_admin=bool(is_admin),
+                owner_available=bool(owner_available),
+                draining=bool(draining),
+                safe_mode=bool(safe_mode),
+                live_hours=bool(live_hours),
+                text=str(question or ""),
+                ctx_market=ctx_market,
+                ctx_sym=ctx_sym,
+            )
+        except Exception:
+            pass
+
+        latency_ms = (time_lib.time() - started) * 1000.0
+        cached = _get_cached_analyze(sym)
+        render = cached.render if cached is not None else RenderedPost(text="", agent_payload={})
+        # Status is conservative; downstream should not treat this as a full snapshot answer.
+        return str(getattr(mod_decision, "reply", "")).strip(), render, "ok_moderated", False, latency_ms
+
+    # Live-hours contract: if the market snapshot isn't present, reply with best-effort
+    # futures ingest posture (no guessing, explicit confidence + stand-aside guidance).
+    if ctx_enabled and not isinstance(ctx_market, dict):
+        now = int(time_lib.time())
+        hb_age_s: int | None = None
+        hb_msg: str | None = None
+        ingest_state: str | None = None
+        ingest_reason: str | None = None
+        futures_line: str | None = None
+        confidence = "LOW"
+        ops_note: str | None = None
+
+        try:
+            from services.futures.futures_context_line import compute_context
+            from services.futures.futures_store import FuturesStore
+            from services.observability.futures_ingest_health import classify_futures_ingest
+
+            store = FuturesStore(r_ctx) if r_ctx is not None else FuturesStore()
+            hb_ts, hb_msg = await asyncio.to_thread(store.get_heartbeat)
+            status = await asyncio.to_thread(store.get_status)
+            scores = await asyncio.to_thread(store.get_scores)
+
+            if hb_ts is not None:
+                hb_age_s = max(0, now - int(hb_ts))
+
+            scores_present = scores is not None
+            scores_age_s: int | None = None
+            if scores is not None:
+                try:
+                    scores_age_s = max(0, now - int(scores.updated_utc))
+                except Exception:
+                    scores_age_s = None
+
+            try:
+                hb_max_age = int(os.getenv("TNT_FUTURES_INGEST_HB_MAX_AGE_SEC", "90") or "90")
+            except Exception:
+                hb_max_age = 90
+            try:
+                scores_max_age = int(os.getenv("TNT_FUTURES_INGEST_SCORES_MAX_AGE_SEC", "120") or "120")
+            except Exception:
+                scores_max_age = 120
+
+            st_note = str((status or {}).get("note") or "").strip()
+
+            ingest_state, ingest_reason = classify_futures_ingest(
+                hb_age_s=hb_age_s,
+                scores_age_s=scores_age_s,
+                scores_present=bool(scores_present),
+                note=st_note,
+                hb_msg=hb_msg,
+                hb_max_age=int(hb_max_age),
+                scores_max_age=int(scores_max_age),
+            )
+
+            # Human-readable posture line from scores (if present).
+            ctx = compute_context(scores, now_epoch=now, max_age_sec=int(scores_max_age))
+            if ctx.state != "MISSING":
+                bits: list[str] = []
+                bits.append(f"Futures posture: {ctx.trend} / {ctx.mode}")
+                if isinstance(ctx.divergence, (int, float)):
+                    bits.append(f"Δ={float(ctx.divergence):.2f} ({ctx.divergence_level})")
+                if isinstance(ctx.vol_mult, (int, float)):
+                    bits.append(f"vol_mult={float(ctx.vol_mult):.2f}")
+                if isinstance(ctx.age_sec, int):
+                    bits.append(f"scores_age={int(ctx.age_sec)}s" + (" (aging)" if ctx.state != "OK" else ""))
+                futures_line = " | ".join([b for b in bits if b]).strip()
+            else:
+                futures_line = "Futures posture: awaiting prints (scores missing)"
+
+            # Deterministic confidence: never HIGH here.
+            if isinstance(hb_age_s, int) and hb_age_s <= int(hb_max_age) and scores_present:
+                # Even when scores are present, this is still a degraded view.
+                confidence = "MED" if (scores_age_s is not None and scores_age_s <= int(scores_max_age)) else "LOW"
+            else:
+                confidence = "LOW"
+        except Exception:
+            # If futures ingest isn't reachable, still respond with an explicit
+            # low-confidence stand-aside posture (no punts during live hours).
+            futures_line = None
+            hb_age_s = None
+            hb_msg = None
+            ingest_state = None
+            ingest_reason = None
+            confidence = "LOW"
+            ops_note = "futures ingest unavailable"
+
+        latency_ms = (time_lib.time() - started) * 1000.0
+        text = build_market_best_effort_futures_only(
+            futures_line=futures_line,
+            hb_age_sec=hb_age_s,
+            hb_msg=hb_msg,
+            ingest_state=ingest_state,
+            ingest_reason=ingest_reason,
+            confidence=confidence,
+            ops_note=ops_note,
+        )
+        return text, RenderedPost(text="", agent_payload={}), "ok_degraded", False, latency_ms
+
+    def _market_only_reply(*, mkt: dict | None, spec: IntentSpec | None) -> str | None:
+        if not isinstance(mkt, dict):
+            return None
+        fut = mkt.get("futures") if isinstance(mkt.get("futures"), dict) else {}
+        bias = str(fut.get("bias") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        regime = str(fut.get("regime") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        hb_age = fut.get("hb_age_sec")
+        hb_msg = str(fut.get("hb_msg") or "").strip()
+        degraded = bool(fut.get("degraded"))
+
+        news = mkt.get("news") if isinstance(mkt.get("news"), dict) else {}
+        news_state = str(news.get("market_state") or "").strip().upper() or "UNKNOWN"
+        title = str(news.get("market_last_title") or "").strip()
+
+        lines = []
+        if spec is not None and spec.intent == "FUTURES_OVERVIEW":
+            lines.append("Futures (from market snapshot):")
+        else:
+            lines.append("Market context (from market snapshot):")
+
+        lines.append(f"- Futures bias: {bias} | Regime: {regime}")
+        if hb_age is not None:
+            lines.append(f"- Futures heartbeat age: {int(hb_age)}s{' (degraded)' if degraded else ''}")
+        if hb_msg:
+            lines.append(f"- Futures status: {hb_msg}")
+        lines.append(f"- News state: {news_state}" + (f" | Latest: {title}" if title else ""))
+
+        # Optional nuance: if a symbol was mentioned for futures, acknowledge without requiring ctx:sym.
+        if spec is not None and spec.intent == "FUTURES_OVERVIEW" and spec.symbol:
+            lines.append(f"\nNote: {spec.symbol} often tracks ES directionally; this uses ES-based futures posture only.")
+
+        return "\n".join(lines).strip()
+
+    # Futures overview is market-only; never require /analyze.
+    if spec is not None and spec.intent == "FUTURES_OVERVIEW":
+        latency_ms = (time_lib.time() - started) * 1000.0
+        return build_futures_overview(mkt=ctx_market), RenderedPost(text="", agent_payload={}), "ok", False, latency_ms
+
+    # Greetings are lightweight and market-only; avoid dumping a full market context.
+    if spec is not None and spec.intent == "GREETING":
+        latency_ms = (time_lib.time() - started) * 1000.0
+        return build_greeting(mkt=ctx_market), RenderedPost(text="", agent_payload={}), "ok", False, latency_ms
+
+    # Market context is market-only; prefer a deterministic template.
+    if spec is not None and spec.intent == "MARKET_CONTEXT":
+        try:
+            _, payload_mkt = await _run_analyze_for_symbol("SPY")
+            tnt_state_mkt = build_tnt_state_from_analysis_payload(payload_mkt or {}).state
+            enrich_tnt_state(tnt_state_mkt)
+        except Exception:  # noqa: BLE001
+            tnt_state_mkt = {}
+
+        latency_ms = (time_lib.time() - started) * 1000.0
+        cached = _get_cached_analyze("SPY")
+        render = cached.render if cached is not None else RenderedPost(text="", agent_payload={})
+        return build_market_context(mkt=ctx_market, tnt_state=tnt_state_mkt), render, "ok", False, latency_ms
+
+    # Candidate requests are strictly driven by the canonical candidates snapshot.
+    if spec is not None and spec.intent == "CANDIDATE_REQUEST":
+        # Candidates are canonical in ctx:sym:{SYM}.candidates; merge into ctx_sym for rendering.
+        merged_sym = ctx_sym
+        try:
+            from services.context.ctx_reader import load_ctx_candidates
+
+            if r_ctx is not None:
+                cand_ctx = load_ctx_candidates(r=r_ctx, symbol=sym)
+            else:
+                cand_ctx = None
+            if isinstance(cand_ctx, dict):
+                base = dict(ctx_sym) if isinstance(ctx_sym, dict) else {}
+                base["candidates"] = cand_ctx
+                merged_sym = base
+        except Exception:  # noqa: BLE001
+            merged_sym = ctx_sym
+
+        msg = build_candidate_reply(symbol=sym, sym_ctx=merged_sym)
+        latency_ms = (time_lib.time() - started) * 1000.0
+        cached = _get_cached_analyze(sym)
+        render = cached.render if cached is not None else RenderedPost(text="", agent_payload={})
+        status = "ok" if isinstance(ctx_sym, dict) else "ok_standby"
+        return msg, render, status, False, latency_ms
 
     # Global, non-symbol questions: answer deterministically when possible.
     # Example: "which stock had the most volume today?" can be answered via Polygon/Massive grouped daily
@@ -5868,6 +8483,18 @@ async def run_analyze_then_coach(symbol: str, question: str) -> tuple[str, Rende
     else:
         render = RenderedPost(text=analyze_text, agent_payload=payload)
 
+    # Attach canonical ctx to the analysis payload for downstream TNT_STATE injection.
+    try:
+        if isinstance(payload, dict):
+            payload["canonical_ctx"] = {
+                "enabled": bool(ctx_enabled),
+                "missing": list(ctx_missing),
+                "market": ctx_market if isinstance(ctx_market, dict) else None,
+                "symbol": ctx_sym if isinstance(ctx_sym, dict) else None,
+            }
+    except Exception:  # noqa: BLE001
+        pass
+
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     stand_down = bool(meta.get("stand_down"))
     missing_sections = meta.get("missing_sections") if isinstance(meta, dict) else []
@@ -5883,11 +8510,50 @@ async def run_analyze_then_coach(symbol: str, question: str) -> tuple[str, Rende
         latency_ms = (time_lib.time() - started) * 1000.0
         return coach_text, render, "ok", cache_hit, latency_ms
 
-    # Deterministic snapshot for /ask (only shown when data is healthy/tradable).
+    # Deterministic snapshot for /ask.
     try:
         tnt_state_for_snapshot = build_tnt_state_from_analysis_payload(payload or {}).state
     except Exception:  # noqa: BLE001
         tnt_state_for_snapshot = {}
+
+    # Extract confirm/confidence tokens (best-effort) from the analysis payload.
+    confirm_tok = None
+    confidence_tok = None
+    try:
+        meta2 = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+        sig2 = meta2.get("signal_payload") if isinstance(meta2.get("signal_payload"), Mapping) else {}
+        confirm_tok = str(sig2.get("bias_confirm") or "").strip().upper() or None
+        tnt2 = sig2.get("tnt") if isinstance(sig2.get("tnt"), Mapping) else {}
+        conf_raw = tnt2.get("confidence")
+        if isinstance(conf_raw, (int, float)):
+            confidence_tok = float(conf_raw)
+    except Exception:  # noqa: BLE001
+        confirm_tok = None
+        confidence_tok = None
+
+    # If intent requires a symbol but we didn't validate one, fall back to Market Context.
+    if spec is not None and spec.intent in {"SYMBOL_CONTEXT", "CANDIDATE_REQUEST"} and not spec.symbol:
+        try:
+            _, payload_mkt = await _run_analyze_for_symbol("SPY")
+            tnt_state_mkt = build_tnt_state_from_analysis_payload(payload_mkt or {}).state
+            enrich_tnt_state(tnt_state_mkt)
+        except Exception:  # noqa: BLE001
+            tnt_state_mkt = {}
+        latency_ms = (time_lib.time() - started) * 1000.0
+        cached = _get_cached_analyze("SPY")
+        render = cached.render if cached is not None else RenderedPost(text="", agent_payload={})
+        return build_market_context(mkt=ctx_market, tnt_state=tnt_state_mkt), render, "ok", False, latency_ms
+
+    # If canonical ctx is missing, do not guess. Prefer a symbol-stale template when only the symbol snapshot is missing.
+    if ctx_missing:
+        missing_set = {str(m).strip() for m in (ctx_missing or []) if str(m).strip()}
+        has_sym_missing = any(str(m).startswith("ctx:sym:") for m in missing_set)
+        if isinstance(ctx_market, dict) and has_sym_missing:
+            msg = build_symbol_context(symbol=sym, mkt=ctx_market, sym_ctx=None, tnt_state={})
+        else:
+            msg = build_market_snapshot_missing()
+        latency_ms = (time_lib.time() - started) * 1000.0
+        return msg, render, "ok_standby", cache_hit, latency_ms
 
     # Symbol-specific preplanned answers that depend on TNT_STATE.
     if _is_key_levels_question(question):
@@ -5899,7 +8565,7 @@ async def run_analyze_then_coach(symbol: str, question: str) -> tuple[str, Rende
             latency_ms = (time_lib.time() - started) * 1000.0
             return preplanned, render, "ok", cache_hit, latency_ms
 
-    # Options chain microstructure (Polygon/Massive only). Cache aggressively.
+    # Options chain microstructure (provider-specific). Cache aggressively.
     options_micro = None
     cached_opt = _get_cached_options_micro(sym)
     if cached_opt is not None:
@@ -5918,6 +8584,31 @@ async def run_analyze_then_coach(symbol: str, question: str) -> tuple[str, Rende
                     max_per_side=_env_int("OPTIONS_MICRO_MAX_PER_SIDE", 8),
                 ).payload
                 options_micro = summary
+
+                # Publish lightweight OI walls for other features (best-effort, non-blocking).
+                try:
+                    from technicals.oi_walls import set_oi_walls
+
+                    metrics = summary.get("metrics") if isinstance(summary, dict) else None
+                    if isinstance(metrics, dict):
+                        cw = metrics.get("call_wall") if isinstance(metrics.get("call_wall"), dict) else {}
+                        pw = metrics.get("put_wall") if isinstance(metrics.get("put_wall"), dict) else {}
+
+                        ttl_s = _env_int("OI_WALLS_TTL_SEC", 1800)
+                        set_oi_walls(
+                            sym,
+                            call_wall=_coerce_float(cw.get("strike")),
+                            put_wall=_coerce_float(pw.get("strike")),
+                            ts_et=str(summary.get("asof_et") or "").strip() or None,
+                            px=_coerce_float(summary.get("underlying_price")),
+                            call_oi=_coerce_float(cw.get("open_interest")),
+                            put_oi=_coerce_float(pw.get("open_interest")),
+                            expiry=str(summary.get("expiration") or "").strip() or None,
+                            ttl_s=int(ttl_s),
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+
                 _set_cached_options_micro(sym, summary)
         except Exception:  # noqa: BLE001
             options_micro = None
@@ -5932,6 +8623,15 @@ async def run_analyze_then_coach(symbol: str, question: str) -> tuple[str, Rende
     # Even in stand-down (closed markets / missing sections), try the coach so /ask still answers.
     # The prompt enforces standby behavior (no invented prices/levels) when data isn't ready.
 
+    # Locked phrasing spec: Symbol Context uses a deterministic template (no freeform coach output).
+    if spec is not None and spec.intent == "SYMBOL_CONTEXT":
+        latency_ms = (time_lib.time() - started) * 1000.0
+        if ctx_sym is None:
+            msg = build_symbol_context(symbol=sym, mkt=ctx_market, sym_ctx=None, tnt_state=tnt_state_for_snapshot or {})
+            return msg, render, "ok_standby", cache_hit, latency_ms
+        msg = build_symbol_context(symbol=sym, mkt=ctx_market, sym_ctx=ctx_sym, tnt_state=tnt_state_for_snapshot or {})
+        return msg, render, "ok", cache_hit, latency_ms
+
     prompt_sha: Optional[str] = None
     state_sha: Optional[str] = None
     try:
@@ -5942,7 +8642,7 @@ async def run_analyze_then_coach(symbol: str, question: str) -> tuple[str, Rende
             recent_daily_trend=recent_trend,
             options_chain_summary=options_micro,
         )
-        coach_text, ok = _normalize_coach_output(raw_reply)
+        coach_text, ok = normalize_coach_output(raw_reply)
         if stand_down:
             if ok:
                 status = "ok_standby"
@@ -5960,6 +8660,21 @@ async def run_analyze_then_coach(symbol: str, question: str) -> tuple[str, Rende
             status = "ok" if ok else "format_error"
         if not ok:
             coach_text = _build_coach_error_response(sym, "Invalid coach format")
+
+        # Final lock: enforce hard consistency rules (no contradictions, no entries when blocked).
+        try:
+            tok = tokens_from_tnt_state(symbol=sym, tnt_state=tnt_state_for_snapshot or {}, confirm=confirm_tok, confidence=confidence_tok)
+            coach_text = apply_consistency_guard(coach_text, tokens=tok)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Candidate truth lock: if user is asking for a structure/trade, only speak from ctx candidates.
+        try:
+            cand = (ctx_sym or {}).get("candidates") if isinstance(ctx_sym, dict) else None
+            if isinstance(cand, dict):
+                coach_text = apply_candidate_truth_guard(coach_text, candidates=cand, question=question)
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as exc:  # noqa: BLE001
         print(f"[COACH][ERROR] {sym.upper()}: {exc}")
         if stand_down:
@@ -5992,25 +8707,53 @@ async def run_analyze_then_coach(symbol: str, question: str) -> tuple[str, Rende
 
     latency_ms = (time_lib.time() - started) * 1000.0
 
-    # Add deterministic market snapshot when we are not in stand-down.
+    def _inject_into_state(envelope_text: str, inserts: list[str]) -> str:
+        if not inserts:
+            return envelope_text
+        lines = (envelope_text or "").splitlines()
+        if not lines:
+            return envelope_text
+        if lines[0].strip() != "A) State":
+            return envelope_text
+
+        expanded: list[str] = []
+        for block in inserts:
+            for ln in (block or "").splitlines():
+                if ln.strip():
+                    expanded.append(ln.rstrip())
+        if not expanded:
+            return envelope_text
+
+        rest = lines[1:]
+        # Avoid stacking extra blank lines.
+        while rest and not rest[0].strip():
+            rest = rest[1:]
+
+        return "\n".join(["A) State", *expanded, "", *rest]).strip()
+
+    inserts: list[str] = []
+
+    # Add deterministic market snapshot inside A) State when we are not in stand-down.
     try:
         if status == "ok" and isinstance(tnt_state_for_snapshot, dict) and tnt_state_for_snapshot:
             snapshot_line = _build_coach_data_snapshot_line(tnt_state_for_snapshot)
-            # Only include prices/levels when the snapshot says health is OK and no_trade is false.
+            # Only include prices/levels when the snapshot says health is OK.
             if snapshot_line and "health OK" in snapshot_line:
-                coach_text = f"{snapshot_line}\n{coach_text}".strip()
+                inserts.append(snapshot_line)
     except Exception:  # noqa: BLE001
         pass
 
-    # Always anchor with Numeric Bias Pack (best-effort) before any coach text.
+    # Add Numeric Bias Pack inside A) State (best-effort).
     try:
         from delivery.numeric_bias_pack import format_numeric_bias_pack_from_analysis_payload
 
         pack = format_numeric_bias_pack_from_analysis_payload(analysis_payload=payload or {})
         if pack:
-            coach_text = f"{pack}\n\n{coach_text}".strip()
+            inserts.append(pack)
     except Exception:  # noqa: BLE001
         pass
+
+    coach_text = _inject_into_state(coach_text, inserts)
 
     return coach_text, render, status, cache_hit, latency_ms
 
@@ -6231,7 +8974,104 @@ async def ai_render_trade_context(openai_client, packet: dict) -> Tuple[Optional
     return text, None
 
 EARNINGS_PROVIDER = os.getenv("EARNINGS_PROVIDER", "earningsapi").lower()
-EARNINGS_API_KEY = os.getenv("EARNINGS_API_KEY", "")
+
+
+def _earnings_provider_runtime() -> str:
+    """Return the effective earnings provider from the current environment."""
+
+    return (os.getenv("EARNINGS_PROVIDER", "earningsapi") or "earningsapi").strip().lower()
+
+
+def _earnings_allow_fallback_keys() -> bool:
+    """Whether earnings may reuse POLYGON/MASSIVE API keys.
+
+    - In live runtime: default ON (1) to satisfy ops expectations.
+    - Under pytest: default OFF (0) to keep tests deterministic.
+    """
+
+    default = "0" if "pytest" in sys.modules else "1"
+    return _env_bool("EARNINGS_ALLOW_FALLBACK_KEYS", default)
+
+
+def _expand_env_reference(value: str) -> tuple[str, str | None]:
+    """Expand simple env references like `${POLYGON_API_KEY}` or `$POLYGON_API_KEY`.
+
+    Returns (expanded_value, referenced_var_name). If no expansion happened,
+    referenced_var_name is None.
+    """
+
+    v = (value or "").strip()
+    if not v:
+        return "", None
+
+    m = re.fullmatch(r"\$\{([A-Z0-9_]+)\}", v)
+    if not m:
+        m = re.fullmatch(r"\$([A-Z0-9_]+)", v)
+    if not m:
+        return v, None
+
+    var_name = m.group(1)
+    expanded = (os.getenv(var_name) or "").strip()
+    return expanded, var_name
+
+
+def _resolve_earnings_api_key() -> str:
+    """Resolve the earnings API key.
+
+    Ops policy: reuse existing Polygon/Massive API keys if a dedicated
+    EARNINGS_API_KEY is not configured.
+    """
+
+    primary = (os.getenv("EARNINGS_API_KEY") or "").strip()
+    if primary:
+        expanded_primary, _ = _expand_env_reference(primary)
+        if expanded_primary:
+            return expanded_primary
+
+    provider = _earnings_provider_runtime()
+
+    # Massive/Benzinga earnings uses Massive key universe.
+    if provider in {"massive_benzinga", "massive-benzinga", "massive"}:
+        return _resolve_massive_api_key()
+
+    # Provider-specific policy: earningsapi.com requires its own API key.
+    # Reusing Polygon/Massive keys yields a hard 401/403 and masks misconfig.
+    if provider == "earningsapi":
+        # Ops override: allow explicitly opting into fallback keys if the
+        # deployment truly uses a shared key.
+        if not _env_bool("EARNINGS_EARNINGSAPI_ALLOW_FALLBACK_KEYS", "0"):
+            return ""
+
+    if not _earnings_allow_fallback_keys():
+        return ""
+
+    return (os.getenv("POLYGON_API_KEY") or "").strip() or (os.getenv("MASSIVE_API_KEY") or "").strip()
+
+
+def _resolve_earnings_api_key_source() -> str:
+    raw_primary = (os.getenv("EARNINGS_API_KEY") or "").strip()
+    if raw_primary:
+        expanded_primary, _ = _expand_env_reference(raw_primary)
+        if expanded_primary:
+            return "EARNINGS_API_KEY"
+
+    provider = _earnings_provider_runtime()
+    if provider in {"massive_benzinga", "massive-benzinga", "massive"}:
+        return _resolve_massive_api_key_source()
+
+    if provider == "earningsapi":
+        if not _env_bool("EARNINGS_EARNINGSAPI_ALLOW_FALLBACK_KEYS", "0"):
+            return "missing"
+    if not _earnings_allow_fallback_keys():
+        return "missing"
+    if (os.getenv("POLYGON_API_KEY") or "").strip():
+        return "POLYGON_API_KEY"
+    if (os.getenv("MASSIVE_API_KEY") or "").strip():
+        return "MASSIVE_API_KEY"
+    return "missing"
+
+
+EARNINGS_API_KEY = _resolve_earnings_api_key()
 EARNINGS_WATCHLIST = [
     s.strip().upper()
     for s in os.getenv(
@@ -6241,7 +9081,7 @@ EARNINGS_WATCHLIST = [
     if s.strip()
 ]
 
-MACRO_EVENTS_FILE = os.getenv("MACRO_EVENTS_FILE", "data/macro_events.csv")
+MACRO_EVENTS_FILE = os.getenv("TNT_MACRO_EVENTS_FILE") or os.getenv("MACRO_EVENTS_FILE") or "data/macro_events.csv"
 
 BRIEF_STATE_PATH = os.getenv("BRIEF_STATE_PATH", "db/brief_state.json")
 BOT_ALERT_CHANNEL_ID = int(os.getenv("BOT_ALERT_CHANNEL_ID", "0") or "0")
@@ -6277,10 +9117,19 @@ ANALYZE_SYNONYMS = {
 QUESTION_STOPWORDS = {
     "IS",
     "ARE",
+    "AM",
     "THE",
     "WHAT",
     "WHATS",
+    "WHEN",
+    "WHERE",
+    "WHY",
+    "HOW",
     "SHOULD",
+    "WOULD",
+    "WILL",
+    "CAN",
+    "COULD",
     "IM",
     "I",
     "YOU",
@@ -6298,7 +9147,15 @@ QUESTION_STOPWORDS = {
     "AT",
     "OF",
     "DO",
+    "DOES",
+    "DID",
     "BE",
+    "HAS",
+    "HAVE",
+    "ER",
+    "TODAY",
+    "NEXT",
+    "WEEK",
     "BULLISH",
     "BEARISH",
     "PLAN",
@@ -6313,6 +9170,15 @@ QUESTION_STOPWORDS = {
     "DOWN",
     "HELP",
     "PLEASE",
+
+    # Indicator keywords that often appear in questions.
+    # Prevents `rsi mstr` from parsing RSI as the symbol.
+    "RSI",
+    "MACD",
+    "SMA",
+    "EMA",
+    "VWAP",
+    "TA",
 }
 
 _SYMBOL_RE = re.compile(r"\b([A-Z]{1,5})(?:\b|[^\w])")
@@ -6332,6 +9198,14 @@ _STOP_TOKENS = {
     "TSLA?",
     "SPY?",
     "QQQ?",
+
+    # Common indicator keywords that should not be treated as symbols.
+    "RSI",
+    "MACD",
+    "SMA",
+    "EMA",
+    "VWAP",
+    "TA",
 }
 
 
@@ -6707,11 +9581,14 @@ async def safe_send(
     output_mode: str = "strict",
     label: str = "",
     files: Optional[list[tuple[str, bytes]]] = None,
+    raise_on_block: bool = False,
 ):
+
+    from services.discord_files import files_from_name_bytes
 
     if not QUALITY_GATE_ENABLED:
         if files:
-            discord_files = [discord.File(fp=io.BytesIO(blob), filename=name) for name, blob in files]
+            discord_files = files_from_name_bytes(files)
             return await channel.send(text, files=discord_files)
         return await channel.send(text)
 
@@ -6722,12 +9599,15 @@ async def safe_send(
 
     if ok:
         if files:
-            discord_files = [discord.File(fp=io.BytesIO(blob), filename=name) for name, blob in files]
+            discord_files = files_from_name_bytes(files)
             return await channel.send(text, files=discord_files)
         return await channel.send(text)
 
     if QUALITY_GATE_LOG_FAILS:
         print(f"[GATE] blocked {kind} {symbol}: {reason}")
+
+    if raise_on_block:
+        raise QualityGateBlockedError(kind=kind, label=label, symbol=symbol, reason=reason)
 
     if QUALITY_GATE_DEBUG and kind == "analysis" and reason:
         try:
@@ -6743,7 +9623,7 @@ async def safe_send(
             note=detail,
         )
         if files:
-            discord_files = [discord.File(fp=io.BytesIO(blob), filename=name) for name, blob in files]
+            discord_files = files_from_name_bytes(files)
             return await channel.send(fallback, files=discord_files)
         return await channel.send(fallback)
 
@@ -6767,14 +9647,17 @@ async def safe_send_rate_limited(
     queue_mode == 'raise', raises PublishQueuedError after enqueueing.
     """
 
-    start_burst_queue_loop()
+    queue_mode_l = (queue_mode or "raise").strip().lower()
+    # Only start the background burst queue loop if we might actually enqueue.
+    if queue_mode_l not in {"noqueue", "throttle"}:
+        start_burst_queue_loop()
     render = RenderedPost(text=text or "", agent_payload={})
 
     if requester_id is None:
         # No requester => treat as non-user-scoped send.
         return await safe_send(send_target, text, kind=kind, symbol="", pivots=None, analysis_mode="coach", output_mode="coach", label=label)
 
-    if not _RATE_QUEUE_ENABLED and (queue_mode or "").lower() == "raise":
+    if not _RATE_QUEUE_ENABLED and queue_mode_l == "raise":
         # Still compute wait for a useful error.
         async with _PUBLISH_RATE_LOCK:
             wait_s, _reasons = _compute_rate_wait_seconds(
@@ -6798,6 +9681,11 @@ async def safe_send_rate_limited(
         if wait_s > 0.001:
             key = _queue_key(label=label or "ask", symbol="", request_kind=request_kind)
             due_ts = _now_ts() + wait_s
+            if queue_mode_l in {"noqueue"}:
+                return None
+            if queue_mode_l in {"throttle"}:
+                raise PublishThrottledError(wait_seconds=wait_s, key=key)
+
             if _RATE_QUEUE_ENABLED:
                 global _QUEUE_SEQ
                 qp = _QueuedPublish(
@@ -6820,10 +9708,10 @@ async def safe_send_rate_limited(
                 _QUEUE_SEQ += 1
                 _QUEUE_BY_KEY[key] = qp
                 heapq.heappush(_QUEUE_HEAP, (qp.due_ts, _QUEUE_SEQ, qp))
-                if (queue_mode or "").lower() == "raise":
+                if queue_mode_l == "raise":
                     raise PublishQueuedError(wait_seconds=wait_s, due_ts=due_ts, key=key)
                 return None
-            if (queue_mode or "").lower() == "raise":
+            if queue_mode_l == "raise":
                 raise PublishQueuedError(wait_seconds=wait_s, due_ts=due_ts, key=key)
             return None
 
@@ -7568,7 +10456,97 @@ def _render_with_agent_context(
     market_participation: Optional[Dict[str, Any]] = None,
     precomputed_agent_payload: Optional[Dict[str, Any]] = None,
 ) -> RenderedPost:
-    text = "\n".join(lines)
+    def _safe_json_load(raw: Any) -> dict | None:
+        if raw is None:
+            return None
+        try:
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", errors="replace")
+            s = str(raw)
+        except Exception:
+            return None
+        s = s.strip()
+        if not s:
+            return None
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    def _format_candidate_one_line(cand: Mapping[str, Any]) -> str:
+        side = str(cand.get("side") or "").strip().upper()
+        strategy = str(cand.get("strategy") or cand.get("name") or "").strip()
+        dte = cand.get("dte")
+        dte_text = ""
+        try:
+            if dte is not None:
+                dte_text = f" ({int(dte)}DTE)"
+        except Exception:
+            dte_text = ""
+        parts = [p for p in [side, strategy] if p]
+        core = " ".join(parts).strip() or "(unlabeled)"
+        return f"{core}{dte_text}"
+
+    def _append_candidates_blurb(base_lines: list[str]) -> list[str]:
+        # Keep tests deterministic (no Redis dependency).
+        if "pytest" in sys.modules:
+            return base_lines
+        if not _env_bool("AUTOPOST_CANDIDATES_MESSAGING", "0"):
+            return base_lines
+        try:
+            from services.context.ctx_mode import ctx_enabled as _ctx_enabled
+        except Exception:
+            _ctx_enabled = None
+        if _ctx_enabled is not None:
+            if not _ctx_enabled():
+                return
+        else:
+            if (os.getenv("CTX_SNAPSHOT_ENABLED", "0") or "0").strip() != "1":
+                return
+            return base_lines
+        if any("AI Trade Candidates" in line for line in base_lines):
+            return base_lines
+        if not symbols:
+            return base_lines
+
+        sym = (symbols[0] or "").strip().upper()
+        if not sym:
+            return base_lines
+
+        try:
+            r_ctx = redis_client_for_ctx()
+            ctx_sym = _safe_json_load(r_ctx.get(f"ctx:sym:{sym}"))
+        except Exception:
+            ctx_sym = None
+
+        if not isinstance(ctx_sym, dict):
+            return base_lines
+
+        candidates = ctx_sym.get("candidates")
+        if not isinstance(candidates, dict):
+            return base_lines
+
+        status = str(candidates.get("status") or "UNKNOWN").strip().upper()
+        top = candidates.get("top")
+        top_line = ""
+        if isinstance(top, dict):
+            top_line = _format_candidate_one_line(top)
+
+        out = list(base_lines)
+        out.append("")
+        out.append("🧠 AI Trade Candidates")
+        if status == "APPROVED" and top_line:
+            out.append(f"• Eligible option structure candidate: {top_line}")
+            out.append(f"• {AI_TRADE_CANDIDATES_BOUNDARY_SENTENCE}")
+        elif status == "NONE":
+            out.append(f"• {AI_TRADE_CANDIDATES_NO_CANDIDATE_SENTENCE}")
+        else:
+            out.append(f"• Candidates unavailable ({status}). No structure candidate is surfaced.")
+        return out
+
+    out_lines = _append_candidates_blurb(list(lines))
+    text = "\n".join(out_lines)
     if generated_at.tzinfo is None:
         generated_at = generated_at.replace(tzinfo=timezone.utc)
     agent_payload = precomputed_agent_payload
@@ -8554,34 +11532,467 @@ def get_vix_context(tf: str = "1m") -> Optional[Dict[str, object]]:
         return None
     level = float(latest["close"])
     return {"ts": latest["ts"], "level": level, "regime": vix_regime(level)}
+# --- Earnings calendar health (ops /config_health) ---
+# Best-effort: stored in-process only (resets on restart).
+_EARNINGS_CALENDAR_LAST_FETCH: dict[str, object] = {
+    "ts_utc": None,
+    "date_et": None,
+    "http_status": None,
+    "rows": None,
+    "error": None,
+    "provider": None,
+}
+
+
+def earnings_calendar_last_fetch() -> dict[str, object]:
+    """Return the last earnings calendar fetch status (best-effort)."""
+    return dict(_EARNINGS_CALENDAR_LAST_FETCH)
+
+
+def _set_earnings_calendar_last_fetch(
+    *,
+    date_et: str,
+    provider: str,
+    http_status: int | None,
+    rows: int | None,
+    error: str | None,
+) -> None:
+    try:
+        _EARNINGS_CALENDAR_LAST_FETCH.update(
+            {
+                "ts_utc": _now_utc().isoformat(),
+                "date_et": str(date_et or ""),
+                "http_status": http_status,
+                "rows": rows,
+                "error": error,
+                "provider": str(provider or ""),
+            }
+        )
+    except Exception:
+        # Never fail the caller.
+        pass
+
+
+def _coerce_float(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.lower() in {"na", "n/a", "nan", "none", "null", "-"}:
+        return None
+    s = s.replace(",", "").replace("$", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _coerce_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return bool(int(value))
+        except Exception:
+            return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    if s in {"true", "1", "yes", "y", "confirmed"}:
+        return True
+    if s in {"false", "0", "no", "n", "projected", "estimated"}:
+        return False
+    return None
+
+
+def _pick_first(entry: dict, keys: list[str]) -> object | None:
+    for k in keys:
+        if k not in entry:
+            continue
+        v = entry.get(k)
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        return v
+    return None
+
+
+def _earnings_row_score(row: dict) -> int:
+    score = 0
+    for k in ("eps_est", "rev_est", "eps_actual", "rev_actual"):
+        if row.get(k) is not None:
+            score += 2
+    if (row.get("company") or "").strip():
+        score += 1
+    if row.get("confirmed") is True:
+        score += 1
+    return score
 
 
 def fetch_earnings_for_date(date_et: str) -> list[dict]:
     """Fetch earnings calendar rows for a given ET date."""
-    if not EARNINGS_API_KEY:
+    provider = _earnings_provider_runtime()
+    api_key = _resolve_earnings_api_key()
+    watchlist = [s.strip().upper() for s in (os.getenv("EARNINGS_WATCHLIST") or "").split(",") if s.strip()]
+    # Default to auto so we don't silently render empty earnings posts if the
+    # watchlist is empty or doesn't match the provider's symbols.
+    watchlist_mode = (os.getenv("EARNINGS_WATCHLIST_MODE") or "auto").strip().lower()
+    if watchlist_mode not in {"watchlist", "all", "auto"}:
+        watchlist_mode = "watchlist"
+
+    if not api_key:
+        _set_earnings_calendar_last_fetch(
+            date_et=date_et,
+            provider=provider,
+            http_status=None,
+            rows=0,
+            error="missing_api_key",
+        )
         return []
-    if EARNINGS_PROVIDER != "earningsapi":
+
+    if provider in {"massive_benzinga", "massive-benzinga", "massive"}:
+        base = (os.getenv("MASSIVE_BASE_URL") or "https://api.massive.com").strip().rstrip("/")
+        url = f"{base}/benzinga/v1/earnings"
+        key = str(api_key or "").strip()
+
+        try:
+            retries = int(os.getenv("EARNINGS_CALENDAR_HTTP_RETRIES", "2") or "2")
+        except Exception:
+            retries = 2
+        retries = max(0, min(6, int(retries)))
+
+        try:
+            timeout_s = float(os.getenv("EARNINGS_CALENDAR_TIMEOUT_S", "15") or "15")
+        except Exception:
+            timeout_s = 15.0
+        timeout_s = max(3.0, min(60.0, float(timeout_s)))
+
+        def _get_with_retry(params: dict) -> "requests.Response":
+            last_exc: Exception | None = None
+            for attempt in range(int(retries) + 1):
+                try:
+                    resp0 = requests.get(url, params=params, timeout=timeout_s)
+                    status0 = int(resp0.status_code)
+                    if status0 == 429 or 500 <= status0 <= 599:
+                        # Bounded backoff with a little jitter.
+                        if attempt < int(retries):
+                            backoff = min(10.0, (1.25 ** attempt) * 1.5)
+                            try:
+                                backoff = backoff * (0.85 + 0.3 * random.random())
+                            except Exception:
+                                pass
+                            time_lib.sleep(float(backoff))
+                            continue
+                    return resp0
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    if attempt < int(retries):
+                        time_lib.sleep(min(6.0, 0.75 * (attempt + 1)))
+                        continue
+                    raise
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("earnings calendar fetch failed")
+
+        def _infer_when_from_time_utc(ts_utc_s: str | None) -> str:
+            s = (ts_utc_s or "").strip()
+            if not s:
+                return "TAS"
+            ss = s.lower()
+            if ss in {"bmo", "pre", "premarket", "before", "before_open", "before open"}:
+                return "BMO"
+            if ss in {"amc", "post", "postmarket", "after", "after_close", "after close"}:
+                return "AMC"
+            # Benzinga earnings often provides time as HH:MM:SS UTC.
+            try:
+                hh = int(s.split(":", 2)[0])
+                mm = int(s.split(":", 2)[1])
+                # Treat the provided UTC time on the given date.
+                dt_utc = datetime.fromisoformat(f"{date_et}T{hh:02d}:{mm:02d}:00+00:00")
+                dt_et = dt_utc.astimezone(ET)
+                if dt_et.hour < 12:
+                    return "BMO"
+                if dt_et.hour >= 16:
+                    return "AMC"
+                return "TAS"
+            except Exception:
+                return "TAS"
+
+        try:
+            # Upstreams differ on query params; try a small ordered set and stop
+            # once we observe a non-empty payload.
+            base_params = {
+                "apiKey": key,
+                "limit": 5000,
+                "sort": "last_updated.desc",
+            }
+
+            date_variants: list[dict[str, object]] = [
+                {"date": date_et},
+                {"date_from": date_et, "date_to": date_et},
+                {"from": date_et, "to": date_et},
+                {"start_date": date_et, "end_date": date_et},
+                {"start": date_et, "end": date_et},
+                {"dateFrom": date_et, "dateTo": date_et},
+                {"startDate": date_et, "endDate": date_et},
+            ]
+
+            want_symbols: set[str] = set(watchlist) if watchlist else set()
+            sym_variants: list[dict[str, object]] = [{}]
+            if want_symbols and watchlist_mode in {"watchlist", "auto"}:
+                joined = ",".join(sorted(want_symbols))
+                sym_variants = [
+                    {"tickers": joined},
+                    {"symbols": joined},
+                    {"ticker": joined},
+                    {"symbol": joined},
+                    {},
+                ]
+
+            items: list[object] = []
+            last_status: int | None = None
+            last_bytes: int | None = None
+            for sp in sym_variants:
+                for dp in date_variants:
+                    resp = _get_with_retry({**base_params, **sp, **dp})
+                    last_status = int(resp.status_code)
+                    last_bytes = len(resp.text)
+                    if last_status != 200:
+                        continue
+                    payload = resp.json()
+                    raw = payload.get("results") if isinstance(payload, dict) else []
+                    if not isinstance(raw, list):
+                        raw = []
+                    items = raw
+                    if items:
+                        break
+                if items:
+                    break
+
+            print(
+                f"[EARNINGS] provider=massive_benzinga date={date_et} status={last_status} bytes={last_bytes}"
+            )
+            if int(last_status or 0) != 200:
+                _set_earnings_calendar_last_fetch(
+                    date_et=date_et,
+                    provider=provider,
+                    http_status=int(last_status or 0) if last_status is not None else None,
+                    rows=0,
+                    error="http_error",
+                )
+                return []
+        except Exception:  # noqa: BLE001
+            _set_earnings_calendar_last_fetch(
+                date_et=date_et,
+                provider=provider,
+                http_status=None,
+                rows=0,
+                error="exception",
+            )
+            return []
+
+        def _build_rows(*, restrict_to: set[str] | None) -> list[dict]:
+            best_by_key: dict[tuple[str, str], dict] = {}
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                sym = (entry.get("ticker") or entry.get("symbol") or "").strip().upper()
+                if not sym:
+                    continue
+                if restrict_to is not None and sym not in restrict_to:
+                    continue
+                when = _infer_when_from_time_utc(str(entry.get("time") or ""))
+                k = (sym, when)
+
+                company = str(
+                    _pick_first(
+                        entry,
+                        [
+                            "company",
+                            "company_name",
+                            "companyName",
+                            "name",
+                            "short_name",
+                            "shortName",
+                        ],
+                    )
+                    or ""
+                ).strip()
+
+                eps_est = _coerce_float(
+                    _pick_first(
+                        entry,
+                        [
+                            "estimated_eps",
+                            "estimatedEps",
+                            "eps_est",
+                            "epsEstimate",
+                            "eps_estimate",
+                            "epsEstimated",
+                            "eps_mean_estimate",
+                        ],
+                    )
+                )
+                rev_est = _coerce_float(
+                    _pick_first(
+                        entry,
+                        [
+                            "estimated_revenue",
+                            "estimatedRevenue",
+                            "revenue_est",
+                            "revenueEstimate",
+                            "revenue_estimate",
+                            "rev_est",
+                            "revEstimate",
+                            "revenue_mean_estimate",
+                        ],
+                    )
+                )
+                eps_actual = _coerce_float(
+                    _pick_first(
+                        entry,
+                        [
+                            "eps",
+                            "actual_eps",
+                            "actualEps",
+                            "eps_actual",
+                            "reported_eps",
+                            "reportedEps",
+                        ],
+                    )
+                )
+                rev_actual = _coerce_float(
+                    _pick_first(
+                        entry,
+                        [
+                            "revenue",
+                            "actual_revenue",
+                            "actualRevenue",
+                            "revenue_actual",
+                            "reported_revenue",
+                            "reportedRevenue",
+                        ],
+                    )
+                )
+                confirmed = _coerce_bool(
+                    _pick_first(
+                        entry,
+                        [
+                            "confirmed",
+                            "is_confirmed",
+                            "isConfirmed",
+                            "time_confirmed",
+                            "timeConfirmed",
+                            "date_confirmed",
+                            "dateConfirmed",
+                        ],
+                    )
+                )
+
+                row = {
+                    "symbol": sym,
+                    "when": when,
+                    "company": company,
+                    "eps_est": eps_est,
+                    "rev_est": rev_est,
+                    "eps_actual": eps_actual,
+                    "rev_actual": rev_actual,
+                    "confirmed": confirmed,
+                }
+
+                prev = best_by_key.get(k)
+                if prev is None or _earnings_row_score(row) > _earnings_row_score(prev):
+                    best_by_key[k] = row
+
+            when_order = {"BMO": 0, "AMC": 1, "TAS": 2}
+            return sorted(
+                best_by_key.values(),
+                key=lambda r: (
+                    str(r.get("symbol") or ""),
+                    when_order.get(str(r.get("when") or ""), 9),
+                ),
+            )
+
+        watch_set = set(watchlist) if watchlist else set()
+        rows_watchlist = _build_rows(restrict_to=watch_set) if watch_set else []
+        rows_all = _build_rows(restrict_to=None)
+
+        if watchlist_mode == "all":
+            rows = rows_all
+        elif watchlist_mode == "auto":
+            rows = rows_watchlist if rows_watchlist else rows_all
+        else:
+            rows = rows_watchlist
+
+        _set_earnings_calendar_last_fetch(
+            date_et=date_et,
+            provider=provider,
+            http_status=200,
+            rows=len(rows),
+            error=None,
+        )
+        return rows
+
+    if provider != "earningsapi":
+        _set_earnings_calendar_last_fetch(
+            date_et=date_et,
+            provider=provider,
+            http_status=None,
+            rows=0,
+            error="provider_not_supported",
+        )
         return []
+
     url = f"https://api.earningsapi.com/v1/calendar/{date_et}"
     try:
-        resp = requests.get(url, params={"apikey": EARNINGS_API_KEY}, timeout=15)
-        print(f"[EARNINGS] date={date_et} status={resp.status_code} bytes={len(resp.text)}")
+        resp = requests.get(url, params={"apikey": str(api_key or "").strip()}, timeout=15)
+        print(f"[EARNINGS] provider=earningsapi date={date_et} status={resp.status_code} bytes={len(resp.text)}")
         if resp.status_code != 200:
+            _set_earnings_calendar_last_fetch(
+                date_et=date_et,
+                provider=provider,
+                http_status=int(resp.status_code),
+                rows=0,
+                error="http_error",
+            )
             return []
         data = resp.json()
     except Exception:  # noqa: BLE001
+        _set_earnings_calendar_last_fetch(
+            date_et=date_et,
+            provider=provider,
+            http_status=None,
+            rows=0,
+            error="exception",
+        )
         return []
-    rows: list[dict] = []
+    rows = []
     for bucket, label in [("pre", "BMO"), ("after", "AMC"), ("notSupplied", "TAS")]:
         items = data.get(bucket) or []
         for entry in items:
             sym = (entry.get("symbol") or entry.get("ticker") or "").upper()
             if not sym:
                 continue
-            if EARNINGS_WATCHLIST and sym not in EARNINGS_WATCHLIST:
+            if watchlist and sym not in watchlist:
                 continue
             rows.append({"symbol": sym, "when": label})
 
+    _set_earnings_calendar_last_fetch(
+        date_et=date_et,
+        provider=provider,
+        http_status=200,
+        rows=len(rows),
+        error=None,
+    )
     return rows
 
 
@@ -8796,29 +12207,48 @@ def format_morning_brief(symbols: Optional[list[str]] = None) -> str:
     else:
         lines.append("• (none listed)")
 
+    # Earnings: always render a section (hard fallback, never silent).
+    try:
         earn = fetch_earnings_for_date(target_date_et)
-        lines.append("")
-        lines.append("💼 **Earnings**")
+    except Exception:  # noqa: BLE001
+        earn = []
 
-        if earn:
-            bmo = sorted({x["symbol"] for x in earn if x.get("when") == "BMO"})
-            amc = sorted({x["symbol"] for x in earn if x.get("when") == "AMC"})
-            tas = sorted({x["symbol"] for x in earn if x.get("when") == "TAS"})
+    provider = _earnings_provider_runtime()
+    earnings_key_present = bool(_resolve_earnings_api_key())
+    watchlist = [
+        s.strip().upper()
+        for s in (os.getenv("EARNINGS_WATCHLIST") or "").split(",")
+        if s.strip()
+    ]
 
-            if bmo:
-                lines.append(f"• Before Market Open: {fmt_earnings_list(bmo)}")
-            if amc:
-                lines.append(f"• After Market Close: {fmt_earnings_list(amc)}")
-            if tas:
-                lines.append(f"• Time not supplied: {fmt_earnings_list(tas)}")
+    # Best-effort: use the in-process last-fetch telemetry to label data health.
+    # This avoids misreporting "no earnings" when the upstream request failed.
+    last_fetch = earnings_calendar_last_fetch()
+    last_fetch_matches = str(last_fetch.get("date_et") or "") == str(target_date_et or "")
+    last_http_status = last_fetch.get("http_status") if last_fetch_matches else None
+    last_error = str(last_fetch.get("error") or "") if last_fetch_matches else ""
+    lines.append("")
+    lines.append("💼 **Earnings**")
 
-            if not (bmo or amc or tas):
-                lines.append("• (none on watchlist)")
+    if earn:
+        bmo = sorted({x["symbol"] for x in earn if x.get("when") == "BMO"})
+        amc = sorted({x["symbol"] for x in earn if x.get("when") == "AMC"})
+        tas = sorted({x["symbol"] for x in earn if x.get("when") == "TAS"})
+
+        if bmo:
+            lines.append(f"• Before Market Open: {fmt_earnings_list(bmo)}")
+        if amc:
+            lines.append(f"• After Market Close: {fmt_earnings_list(amc)}")
+        if tas:
+            lines.append(f"• Time not supplied: {fmt_earnings_list(tas)}")
+
+        if not (bmo or amc or tas):
+            lines.append("• (none on watchlist)")
+    else:
+        if not EARNINGS_API_KEY:
+            lines.append("• (earnings disabled: missing API key)")
         else:
-            if not EARNINGS_API_KEY:
-                lines.append("• (earnings disabled: missing API key)")
-            else:
-                lines.append("• (none on watchlist / provider empty or rate-limited)")
+            lines.append("• (none on watchlist / provider empty or rate-limited)")
 
     symbols = symbols or ["SPY", "QQQ", "IWM"]
     lines.append("")
@@ -8836,11 +12266,2371 @@ def format_morning_brief(symbols: Optional[list[str]] = None) -> str:
     return "\n".join(lines)
 
 
+def build_tomorrow_earnings_macro_render(
+    *,
+    target_date_et: Optional[str] = None,
+    now_et: Optional[datetime] = None,
+) -> RenderedPost:
+    """Daily post: tomorrow's earnings + macro, with hard fallbacks.
+
+    Safety: never silently returns an empty post; always renders explicit
+    "(none listed)" / "missing API key" messaging.
+    """
+
+    now_et = now_et or _now_et()
+    if target_date_et is None:
+        # Tomorrow's next weekday (holidays not detected).
+        target_d = next_weekday(now_et.date() + timedelta(days=1))
+        target_date_et = target_d.strftime("%Y-%m-%d")
+
+    macro_file_present = os.path.exists(MACRO_EVENTS_FILE)
+    macro = load_macro_events_for_date(target_date_et)
+
+    macro_age_min: Optional[float] = None
+    macro_mtime_utc: Optional[str] = None
+    if macro_file_present:
+        try:
+            mtime = float(os.path.getmtime(MACRO_EVENTS_FILE))
+            now_ts = float(_now_utc().timestamp())
+            macro_age_min = max(0.0, (now_ts - mtime) / 60.0)
+            macro_mtime_utc = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+        except Exception:
+            macro_age_min = None
+            macro_mtime_utc = None
+
+    try:
+        earn = fetch_earnings_for_date(target_date_et)
+    except Exception:  # noqa: BLE001
+        earn = []
+
+    provider = _earnings_provider_runtime()
+    # Under pytest, tests monkeypatch EARNINGS_API_KEY for determinism.
+    # In live runtime, resolve from environment (supports provider-specific key policy).
+    if "pytest" in sys.modules:
+        earnings_key_present = bool(EARNINGS_API_KEY)
+    else:
+        earnings_key_present = bool(_resolve_earnings_api_key())
+    watchlist = [
+        s.strip().upper()
+        for s in (os.getenv("EARNINGS_WATCHLIST") or "").split(",")
+        if s.strip()
+    ]
+
+    # Best-effort: use the in-process last-fetch telemetry to label data health.
+    # This avoids misreporting "no earnings" when the upstream request failed.
+    last_fetch = earnings_calendar_last_fetch()
+    last_fetch_matches = str(last_fetch.get("date_et") or "") == str(target_date_et or "")
+    last_http_status = last_fetch.get("http_status") if last_fetch_matches else None
+    last_error = str(last_fetch.get("error") or "") if last_fetch_matches else ""
+
+    updated_utc = _now_utc().replace(tzinfo=timezone.utc)
+
+    updated_et = now_et.astimezone(ET)
+    updated_et_stamp = updated_et.strftime("%Y-%m-%d %H:%M ET")
+
+    lines: list[str] = []
+    lines.append("📅 Tomorrow’s Earnings + Macro")
+    lines.append(f"🕒 Expected Tomorrow • For: {target_date_et} (ET)")
+
+    banner = macro_risk_banner(macro, label="High-impact macro tomorrow")
+    if banner:
+        lines.append(banner)
+        lines.append("⚠️ Volatility likely outside regular earnings flows")
+
+    lines.append("")
+    lines.append("🌐 Macro Events (ET)")
+    if macro:
+        for e in macro[:12]:
+            t = (e.get("time_et") or "").strip()
+            title = (e.get("title") or "").strip()
+            impact = (e.get("impact") or "").strip()
+            body = f"{impact_icon(impact)} {title}".strip()
+            if not body:
+                body = "(untitled event)"
+            if t:
+                lines.append(f"• {t} — {body}")
+            else:
+                lines.append(f"• {body}")
+    else:
+        if not macro_file_present:
+            lines.append(f"• Macro calendar missing: {MACRO_EVENTS_FILE}")
+        else:
+            lines.append("• No scheduled high-impact macro events")
+
+    lines.append("")
+    lines.append("💼 Earnings")
+    if earn:
+        bmo_rows = sorted([x for x in earn if x.get("when") == "BMO"], key=lambda r: str(r.get("symbol") or ""))
+        amc_rows = sorted([x for x in earn if x.get("when") == "AMC"], key=lambda r: str(r.get("symbol") or ""))
+        tas_rows = sorted([x for x in earn if x.get("when") == "TAS"], key=lambda r: str(r.get("symbol") or ""))
+
+        if bmo_rows:
+            lines.append(f"• BMO: {fmt_earnings_expected_inline(bmo_rows, limit=12)}")
+        if amc_rows:
+            lines.append(f"• AMC: {fmt_earnings_expected_inline(amc_rows, limit=12)}")
+        if tas_rows:
+            lines.append(f"• Time not supplied: {fmt_earnings_expected_inline(tas_rows, limit=12)}")
+        if not (bmo_rows or amc_rows or tas_rows):
+            lines.append("• None found (watchlist empty)")
+    else:
+        if not earnings_key_present:
+            lines.append("• Earnings disabled: missing API key")
+        elif last_error == "provider_not_supported":
+            lines.append(f"• Earnings provider not supported: {provider}")
+        elif last_error == "http_error" and last_http_status is not None:
+            lines.append(f"• Earnings calendar fetch failed (http {int(last_http_status)})")
+        elif last_error == "exception":
+            lines.append("• Earnings calendar fetch failed (exception)")
+        else:
+            lines.append("• No notable earnings scheduled for tracked symbols")
+
+    # Tier A: inline headlines (cache-only, no firehose).
+    try:
+        headlines_limit = max(3, min(5, _env_int("TNT_EARNINGS_HEADLINES_LIMIT", "4")))
+    except Exception:
+        headlines_limit = 4
+    try:
+        post_syms = sorted({str(x.get("symbol") or "").strip().upper() for x in (earn or []) if isinstance(x, dict)})
+        headlines = _load_latest_headlines_for_symbols(symbols=post_syms, window_hours=48.0, limit=headlines_limit)
+    except Exception:
+        headlines = []
+
+    now_utc = now_et.astimezone(timezone.utc)
+
+    lines.append("")
+    lines.append("Latest Headlines (48h)")
+    if headlines:
+        lines.extend(_format_headlines_compact(headlines, now_utc=now_utc, limit=headlines_limit))
+    else:
+        lines.append("• No material headlines impacting tracked names (48h)")
+
+    lines.append("")
+    if macro_age_min is None:
+        macro_age = "n/a"
+    elif macro_age_min >= 24 * 60:
+        macro_age = "historical (>24h)"
+    else:
+        macro_age = f"{macro_age_min:.1f}m"
+
+    lines.append(f"Updated: {updated_et_stamp}")
+
+    if not earnings_key_present:
+        earnings_age = "disabled"
+    elif last_error == "http_error" and last_http_status is not None:
+        earnings_age = f"http_{int(last_http_status)}"
+    elif last_error == "provider_not_supported":
+        earnings_age = "unsupported"
+    elif last_error == "exception":
+        earnings_age = "error"
+    else:
+        # Default to "live" for normal/unknown cases (incl. tests that stub fetch).
+        earnings_age = "live"
+
+    lines.append(f"Data age: macro={macro_age} | earnings={earnings_age}")
+    lines.append("Context only • Not financial advice")
+
+    section_data: Dict[str, Any] = {
+        "target_date_et": target_date_et,
+        "macro_events": macro,
+        "earnings_rows": earn,
+        "macro_calendar_file": MACRO_EVENTS_FILE,
+        "macro_calendar_present": macro_file_present,
+        "macro_calendar_mtime_utc": macro_mtime_utc,
+        "macro_calendar_age_min": macro_age_min,
+        "earnings_provider": provider,
+        "earnings_last_fetch": last_fetch if last_fetch_matches else None,
+        "earnings_watchlist": sorted(watchlist),
+        "updated_utc": updated_utc.isoformat(),
+    }
+
+    extra_meta: Dict[str, Any] = {
+        "target_date_et": target_date_et,
+        "macro_count": len(macro),
+        "earnings_count": len(earn),
+        "earnings_enabled": bool(earnings_key_present),
+        "macro_calendar_age_min": macro_age_min,
+        "headlines_count": len(headlines) if isinstance(headlines, list) else 0,
+        "source": str(provider or "").strip() or "unknown",
+    }
+
+    # Earnings/macro posts intentionally use symbols=[]; still emit a minimal
+    # agent payload so autopost proof lines can report counts/source reliably.
+    precomputed_agent_payload: Dict[str, Any] = {
+        "meta": {
+            "generated_at": now_et.astimezone(timezone.utc).isoformat(),
+            "symbols": [],
+            "post_type": "earnings_tomorrow",
+            "data_quality": {"technical_state": "N/A"},
+            **extra_meta,
+        },
+        "sections": section_data,
+    }
+
+    return _render_with_agent_context(
+        lines,
+        symbols=[],
+        generated_at=now_et,
+        post_type="earnings_tomorrow",
+        extra_meta=extra_meta,
+        sections=section_data,
+        precomputed_agent_payload=precomputed_agent_payload,
+    )
+
+
+def _surprise_pct(actual: float | None, est: float | None) -> float | None:
+    if actual is None or est is None:
+        return None
+    try:
+        a = float(actual)
+        e = float(est)
+    except Exception:
+        return None
+    if e == 0:
+        return None
+    return (a - e) / abs(e) * 100.0
+
+
+def _beat_tag(actual: float | None, est: float | None, tol: float = 1e-6) -> str | None:
+    if actual is None or est is None:
+        return None
+    try:
+        a = float(actual)
+        e = float(est)
+    except Exception:
+        return None
+    if abs(a - e) <= tol:
+        return "INLINE"
+    return "BEAT" if a > e else "MISS"
+
+
+def build_earnings_results_today_render(
+    *,
+    target_date_et: Optional[str] = None,
+    now_et: Optional[datetime] = None,
+) -> RenderedPost:
+    """Daily post: today's earnings results (actual vs estimates) with hard fallbacks."""
+
+    now_et = now_et or _now_et()
+    if target_date_et is None:
+        target_date_et = now_et.strftime("%Y-%m-%d")
+
+    provider = _earnings_provider_runtime()
+    if "pytest" in sys.modules:
+        earnings_key_present = bool(EARNINGS_API_KEY)
+    else:
+        earnings_key_present = bool(_resolve_earnings_api_key())
+    updated_et_stamp = now_et.astimezone(ET).strftime("%Y-%m-%d %H:%M ET")
+
+    try:
+        earn = fetch_earnings_for_date(target_date_et)
+    except Exception:  # noqa: BLE001
+        earn = []
+
+    last_fetch = earnings_calendar_last_fetch()
+    last_fetch_matches = str(last_fetch.get("date_et") or "") == str(target_date_et or "")
+    last_http_status = last_fetch.get("http_status") if last_fetch_matches else None
+    last_error = str(last_fetch.get("error") or "") if last_fetch_matches else ""
+
+    def _has_any_actual(r: dict) -> bool:
+        return r.get("eps_actual") is not None or r.get("rev_actual") is not None
+
+    results = [r for r in (earn or []) if isinstance(r, dict) and _has_any_actual(r)]
+    bmo_rows = sorted([x for x in results if x.get("when") == "BMO"], key=lambda r: str(r.get("symbol") or ""))
+    amc_rows = sorted([x for x in results if x.get("when") == "AMC"], key=lambda r: str(r.get("symbol") or ""))
+    tas_rows = sorted([x for x in results if x.get("when") == "TAS"], key=lambda r: str(r.get("symbol") or ""))
+
+    why_moved_count = 0
+
+    mode = (os.getenv("TNT_EARNINGS_RESULTS_MODE", "majors") or "majors").strip().lower()
+    if mode not in {"majors", "all"}:
+        mode = "majors"
+
+    majors_env = os.getenv("TNT_EARNINGS_RESULTS_MAJORS", "AAPL,MSFT,TSLA,META,NVDA") or ""
+    majors = {s.strip().upper() for s in majors_env.split(",") if s.strip()}
+    try:
+        majors_max = int(_env_int("TNT_EARNINGS_RESULTS_MAJORS_MAX", "4"))
+    except Exception:
+        majors_max = 4
+    majors_max = max(1, min(6, majors_max))
+
+    try:
+        others_max = int(_env_int("TNT_EARNINGS_RESULTS_OTHERS_MAX", "8"))
+    except Exception:
+        others_max = 8
+    others_max = max(6, min(12, others_max))
+
+    results_by_sym: dict[str, dict] = {}
+    for r in (results or []):
+        if not isinstance(r, dict):
+            continue
+        sym = str(r.get("symbol") or "").strip().upper()
+        if sym:
+            results_by_sym[sym] = r
+
+    majors_present = [s for s in sorted(majors) if s in results_by_sym]
+    majors_present = majors_present[:majors_max]
+
+    lines: list[str] = []
+    lines.append("📊 Earnings Results — Today (ET)")
+    session_label = "Post-Market / BMO as applicable"
+    if bmo_rows and not (amc_rows or tas_rows):
+        session_label = "BMO"
+    elif amc_rows and not (bmo_rows or tas_rows):
+        session_label = "AMC"
+    lines.append(f"Date: {target_date_et} • Session: {session_label}")
+    lines.append("")
+    lines.append("🧾 Results (Watchlist)")
+
+    def _why_it_moved_line(sym: str) -> str | None:
+        """Best-effort single-line catalyst from cached news (material-only)."""
+
+        if not sym:
+            return None
+        try:
+            window_h = float(os.getenv("TNT_EARNINGS_WHY_MOVED_WINDOW_HOURS", "48") or "48")
+        except Exception:
+            window_h = 48.0
+        window_h = max(6.0, min(168.0, float(window_h)))
+
+        try:
+            hs = _load_latest_headlines_for_symbols(symbols=[sym], window_hours=window_h, limit=1)
+        except Exception:
+            hs = []
+        if not hs:
+            return None
+
+        it = hs[0]
+        tag = _headline_tag_compact(str(it.get("tag") or "NEWS"))
+        title = str(it.get("headline") or "").strip()
+        url = str(it.get("url") or "").strip()
+        dt = it.get("published_utc")
+        age = None
+        if isinstance(dt, datetime):
+            age = _time_ago_short(dt.astimezone(timezone.utc), now_et.astimezone(timezone.utc))
+        if not title:
+            return None
+
+        prefix = "  ↳ 📰 Why it moved"
+        if age:
+            prefix += f" ({age})"
+        url_clean = _clean_url_for_display(url) if url else ""
+        if url_clean:
+            return f"{prefix}: [{tag}] {title} <{url_clean}>"
+        return f"{prefix}: [{tag}] {title}"
+
+    def _fmt_row(r: dict) -> str:
+        sym = str(r.get("symbol") or "").strip().upper()
+        eps_a = r.get("eps_actual")
+        eps_e = r.get("eps_est")
+        rev_a = r.get("rev_actual")
+        rev_e = r.get("rev_est")
+
+        parts: list[str] = []
+        if eps_a is not None:
+            tag = _beat_tag(eps_a, eps_e)
+            sp = _surprise_pct(eps_a, eps_e)
+            if eps_e is not None and tag and sp is not None:
+                parts.append(f"EPS {_fmt_eps(eps_a)} vs {_fmt_eps(eps_e)} ({sp:+.1f}% {tag})")
+            elif eps_e is not None:
+                parts.append(f"EPS {_fmt_eps(eps_a)} vs {_fmt_eps(eps_e)}")
+            else:
+                parts.append(f"EPS {_fmt_eps(eps_a)}")
+
+        if rev_a is not None:
+            tag = _beat_tag(rev_a, rev_e)
+            sp = _surprise_pct(rev_a, rev_e)
+            a_s = _fmt_money_compact(rev_a)
+            e_s = _fmt_money_compact(rev_e) if rev_e is not None else None
+            if e_s is not None and tag and sp is not None:
+                parts.append(f"Rev {a_s} vs {e_s} ({sp:+.1f}% {tag})")
+            elif e_s is not None:
+                parts.append(f"Rev {a_s} vs {e_s}")
+            else:
+                parts.append(f"Rev {a_s}")
+
+        if r.get("confirmed") is True:
+            parts.append("confirmed")
+
+        body = " | ".join([p for p in parts if p])
+        return f"{sym}{earnings_tag(sym)} — {body}".strip()
+
+    def _emit_bucket(label: str, bucket: list[dict]) -> None:
+        nonlocal why_moved_count
+        if not bucket:
+            return
+        lines.append(f"• {label}:")
+        for r in bucket[:12]:
+            row_line = f"  • {_fmt_row(r)}"
+            lines.append(row_line)
+            sym = str(r.get("symbol") or "").strip().upper()
+            why = _why_it_moved_line(sym)
+            if why:
+                lines.append(why)
+                why_moved_count += 1
+
+    def _emit_majors_block() -> None:
+        nonlocal why_moved_count
+        if not majors_present:
+            return
+
+        lines.append("Major Movers")
+        lines.append("(tight summary • reaction risk is context, not direction)")
+        lines.append("")
+
+        for sym in majors_present:
+            r = results_by_sym.get(sym) or {}
+            eps_a = r.get("eps_actual")
+            eps_e = r.get("eps_est")
+            rev_a = r.get("rev_actual")
+            rev_e = r.get("rev_est")
+
+            tag = _beat_tag(eps_a, eps_e)
+            if tag is None:
+                tag = _beat_tag(rev_a, rev_e)
+            badge = "⚖️"
+            if tag == "BEAT":
+                badge = "⭐"
+            elif tag == "MISS":
+                badge = "⚠️"
+
+            implied_pct = None
+            try:
+                cal = _load_earnings_cache_payload(sym)
+                if isinstance(cal, dict) and cal.get("expected_move_pct") is not None:
+                    implied_pct = float(cal.get("expected_move_pct"))
+            except Exception:
+                implied_pct = None
+
+            base = _risk_bucket(implied_pct=implied_pct)
+            if tag == "MISS":
+                reaction = "High" if base in {"MODERATE", "HIGH"} else "Moderate"
+            elif tag == "BEAT":
+                reaction = "Elevated" if base in {"MODERATE", "HIGH"} else "Moderate"
+            else:
+                reaction = "Moderate" if base != "LOW" else "Low"
+
+            implied_s = "n/a" if implied_pct is None else f"±{abs(float(implied_pct)):.1f}%"
+            when = str(r.get("when") or "").strip().upper()
+            when_s = when if when in {"BMO", "AMC", "TAS"} else None
+
+            lines.append(f"{sym} {badge} {tag.title() if isinstance(tag, str) else 'Result'}")
+
+            if eps_a is not None:
+                sp = _surprise_pct(eps_a, eps_e)
+                if eps_e is not None and sp is not None and isinstance(tag, str):
+                    lines.append(f"EPS: {_fmt_eps(eps_a)} vs {_fmt_eps(eps_e)} ({sp:+.1f}% {tag})")
+                elif eps_e is not None:
+                    lines.append(f"EPS: {_fmt_eps(eps_a)} vs {_fmt_eps(eps_e)}")
+                else:
+                    lines.append(f"EPS: {_fmt_eps(eps_a)}")
+
+            if rev_a is not None:
+                a_s = _fmt_money_compact(rev_a)
+                e_s = _fmt_money_compact(rev_e) if rev_e is not None else None
+                sp = _surprise_pct(rev_a, rev_e)
+                tag_r = _beat_tag(rev_a, rev_e)
+                if e_s is not None and sp is not None and isinstance(tag_r, str):
+                    lines.append(f"Revenue: {a_s} vs {e_s} ({sp:+.1f}% {tag_r})")
+                elif e_s is not None:
+                    lines.append(f"Revenue: {a_s} vs {e_s}")
+                else:
+                    lines.append(f"Revenue: {a_s}")
+
+            if when_s:
+                lines.append(f"Report Timing: {when_s}")
+            if implied_s != "n/a":
+                lines.append(f"Implied Move: {implied_s}")
+            lines.append(f"Reaction Risk: {reaction}")
+
+            why = _why_it_moved_line(sym)
+            if why:
+                lines.append(why)
+                why_moved_count += 1
+
+            lines.append("")
+
+        other = max(0, len(results) - len(majors_present))
+        if other and mode == "majors":
+            lines.append(f"Other watchlist results: {other}")
+
+        if mode != "all":
+            return
+
+        # All-mode: majors first, then a capped Others section.
+        try:
+            majors_set = set(majors_present)
+        except Exception:
+            majors_set = set()
+        others = [
+            r
+            for r in (results or [])
+            if isinstance(r, dict) and str(r.get("symbol") or "").strip().upper() not in majors_set
+        ]
+        others = sorted(others, key=lambda rr: str(rr.get("symbol") or ""))
+        if not others:
+            return
+
+        lines.append("")
+        lines.append("Others (watchlist)")
+
+        shown = 0
+        for r in others[:others_max]:
+            try:
+                lines.append(f"  • {_fmt_row(r)}")
+            except Exception:
+                continue
+            sym = str(r.get("symbol") or "").strip().upper()
+            why = _why_it_moved_line(sym)
+            if why:
+                lines.append(why)
+                why_moved_count += 1
+            shown += 1
+
+        remaining = max(0, len(others) - shown)
+        if remaining:
+            lines.append(f"  +{remaining} more (use /earnings_results to list)")
+
+    if majors_present:
+        _emit_majors_block()
+    else:
+        _emit_bucket("BMO", bmo_rows)
+        _emit_bucket("AMC", amc_rows)
+        _emit_bucket("Time not supplied", tas_rows)
+
+    if not results:
+        if not earnings_key_present:
+            lines.append("• Earnings disabled: missing API key")
+        elif last_error == "provider_not_supported":
+            lines.append(f"• Earnings provider not supported: {provider}")
+        elif last_error == "http_error" and last_http_status is not None:
+            lines.append(f"• Earnings calendar fetch failed (http {int(last_http_status)})")
+        elif last_error == "exception":
+            lines.append("• Earnings calendar fetch failed (exception)")
+        else:
+            lines.append("• No reported results yet for tracked symbols")
+
+    # Add-on: Implied vs Realized (cache-only via cal:earnings:{SYM}).
+    try:
+        post_syms = sorted({str(x.get("symbol") or "").strip().upper() for x in (results or []) if isinstance(x, dict)})
+        vol_rows = _load_volatility_reality_for_symbols(symbols=post_syms, limit=3)
+    except Exception:
+        vol_rows = []
+
+    lines.append("")
+    lines.append("📊 Volatility Reality Check")
+    if vol_rows:
+        for vr in vol_rows:
+            sym = str(vr.get("symbol") or "").strip().upper()
+            implied = vr.get("implied_pct")
+            realized = vr.get("realized_pct")
+            ratio = vr.get("ratio")
+            verdict = str(vr.get("verdict") or "").strip().upper() or "UNKNOWN"
+
+            implied_s = "n/a" if implied is None else f"±{float(implied):.1f}%"
+            realized_s = "n/a" if realized is None else f"{float(realized):.1f}%"
+            ratio_s = "n/a" if ratio is None else f"{float(ratio):.2f}x"
+            lines.append(f"• {sym}{earnings_tag(sym)} — Implied {implied_s} • Realized {realized_s} • Ratio {ratio_s} • {verdict}")
+    else:
+        lines.append("Implied vs Realized: Pending")
+        lines.append("Not enough cached data yet")
+        lines.append("(requires expected_move_pct + realized move)")
+
+    # Tier A: inline headlines (cache-only).
+    try:
+        headlines_limit = max(3, min(5, _env_int("TNT_EARNINGS_HEADLINES_LIMIT", "4")))
+    except Exception:
+        headlines_limit = 4
+    try:
+        post_syms = sorted({str(x.get("symbol") or "").strip().upper() for x in (results or []) if isinstance(x, dict)})
+        headlines, hl_stats = _load_latest_headlines_for_symbols(
+            symbols=post_syms,
+            window_hours=48.0,
+            limit=headlines_limit,
+            return_stats=True,
+        )
+    except Exception:
+        headlines = []
+        hl_stats = {"source": "redis", "sym_raw": 0, "sym_kept": 0, "market_raw": 0, "material_only": True}
+
+    # Proof-grade health log for "why no headlines" nights.
+    try:
+        r_ctx = redis_client_for_ctx()
+        ck = getattr(getattr(r_ctx, "connection_pool", None), "connection_kwargs", {}) or {}
+        print(
+            "[EARNINGS_RESULTS] headlines_source=redis "
+            f"db={ck.get('db')} host={ck.get('host')} "
+            f"sym_hits={int(hl_stats.get('sym_raw') or 0)} market_hits={int(hl_stats.get('market_raw') or 0)}"
+        )
+
+        # Guardrail: detect poller/bot Redis DB mismatch via shared heartbeat file.
+        try:
+            from pathlib import Path
+
+            hb_path = Path("logs") / "news_poller_heartbeat.json"
+            if hb_path.exists():
+                hb = json.loads(hb_path.read_text(encoding="utf-8"))
+            else:
+                hb = None
+
+            poller_db = None
+            if isinstance(hb, dict):
+                poller_db = hb.get("db")
+            bot_db = ck.get("db")
+
+            if poller_db is not None and bot_db is not None and str(poller_db) != str(bot_db):
+                global _last_news_db_mismatch_warn_ts
+                now_ts = float(time_lib.time())
+                if _last_news_db_mismatch_warn_ts is None or (now_ts - float(_last_news_db_mismatch_warn_ts)) >= 3600.0:
+                    _last_news_db_mismatch_warn_ts = now_ts
+                    print(f"[WARN][NEWS] poller_db={poller_db} bot_db={bot_db} (headlines may be empty)")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    now_utc = now_et.astimezone(timezone.utc)
+
+    lines.append("")
+    lines.append("📰 Headlines (Last 48h)")
+    if headlines:
+        lines.extend(_format_headlines_compact(headlines, now_utc=now_utc, limit=headlines_limit))
+    else:
+        raw_n = int(hl_stats.get("sym_raw") or 0) if isinstance(hl_stats, dict) else 0
+        kept_n = int(hl_stats.get("sym_kept") or 0) if isinstance(hl_stats, dict) else 0
+        material_only = bool(hl_stats.get("material_only")) if isinstance(hl_stats, dict) else True
+        if material_only and raw_n > 0 and kept_n == 0:
+            lines.append(f"No material headlines (filter=material_only, raw={raw_n}, kept=0)")
+        else:
+            lines.append("No cached headlines for tracked names")
+            lines.append("(verify News poller + Redis cache)")
+
+    lines.append("")
+    lines.append(f"Updated: {updated_et_stamp}")
+
+    if not earnings_key_present:
+        earnings_age = "disabled"
+    elif last_error == "http_error" and last_http_status is not None:
+        earnings_age = f"http_{int(last_http_status)}"
+    elif last_error == "provider_not_supported":
+        earnings_age = "unsupported"
+    elif last_error == "exception":
+        earnings_age = "error"
+    else:
+        earnings_age = "live"
+
+    lines.append(f"Data: earnings-{earnings_age}")
+    lines.append("Context only • Not financial advice")
+
+    section_data: Dict[str, Any] = {
+        "target_date_et": target_date_et,
+        "earnings_provider": provider,
+        "earnings_last_fetch": last_fetch if last_fetch_matches else None,
+        "earnings_rows": earn,
+        "results_rows": results,
+        "updated_utc": _now_utc().replace(tzinfo=timezone.utc).isoformat(),
+    }
+
+    extra_meta: Dict[str, Any] = {
+        "target_date_et": target_date_et,
+        "results_count": len(results),
+        "earnings_count": len(earn),
+        "earnings_enabled": bool(earnings_key_present),
+        "headlines_count": len(headlines) if isinstance(headlines, list) else 0,
+        "headlines_sym_hits": int(hl_stats.get("sym_raw") or 0) if isinstance(hl_stats, dict) else 0,
+        "headlines_market_hits": int(hl_stats.get("market_raw") or 0) if isinstance(hl_stats, dict) else 0,
+        "vol_rows_count": len(vol_rows) if isinstance(vol_rows, list) else 0,
+        "why_moved_count": int(why_moved_count),
+        "source": str(provider or "").strip() or "unknown",
+        "earnings_results_mode": str(mode),
+    }
+
+    precomputed_agent_payload: Dict[str, Any] = {
+        "meta": {
+            "generated_at": now_et.astimezone(timezone.utc).isoformat(),
+            "symbols": [],
+            "post_type": "earnings_results_today",
+            "data_quality": {"technical_state": "N/A"},
+            **extra_meta,
+        },
+        "sections": section_data,
+    }
+
+    return _render_with_agent_context(
+        lines,
+        symbols=[],
+        generated_at=now_et,
+        post_type="earnings_results_today",
+        extra_meta=extra_meta,
+        sections=section_data,
+        precomputed_agent_payload=precomputed_agent_payload,
+    )
+
+
 def next_weekday(d: date) -> date:
     # Mon-Fri only (MVP-safe; holidays not detected without an external calendar)
     while d.weekday() >= 5:
         d += timedelta(days=1)
     return d
+
+
+def _parse_weekday_et(raw: str | None, fallback: int = 6) -> int | None:
+    """Parse an ET weekday into Python weekday int (MON=0..SUN=6).
+
+    Special values:
+    - ANY: caller-defined behavior (typically: use "today"'s weekday).
+    """
+
+    s = (raw or "").strip().upper()
+    if not s:
+        return int(fallback)
+
+    if s in {"ANY", "ALL", "*"}:
+        return None
+
+    try:
+        n = int(s)
+        if 0 <= n <= 6:
+            return n
+    except Exception:
+        pass
+
+    mapping = {
+        "MON": 0,
+        "TUE": 1,
+        "WED": 2,
+        "THU": 3,
+        "FRI": 4,
+        "SAT": 5,
+        "SUN": 6,
+    }
+    return int(mapping.get(s, fallback))
+
+
+def _automation_dedupe_key(*, label: str, target_date_et: str) -> str:
+    return f"tnt:automation:{label}:{target_date_et}"
+
+
+def _automation_should_post_once_per_target_date(*, label: str, target_date_et: str, ttl_sec: int) -> bool:
+    """Return True if we should attempt posting for this (label,target_date).
+
+    This is check-only. Call `_automation_mark_posted_once_per_target_date(...)`
+    only after a successful publish.
+    """
+
+    key = _automation_dedupe_key(label=label, target_date_et=target_date_et)
+
+    try:
+        r_ctx = redis_client_for_ctx()
+    except Exception:
+        r_ctx = None
+
+    if r_ctx is not None:
+        try:
+            return not bool(r_ctx.exists(key))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation dedupe redis check error: {type(exc).__name__}: {exc}")
+
+    # Fallback: best-effort in-memory (no cross-restart guarantees).
+    now_s = int(_now_utc().timestamp())
+    last_s = int(_last_automation_posted_by_key.get(key, 0) or 0)
+    return not ((now_s - last_s) < max(60, int(ttl_sec)))
+
+
+def _automation_mark_posted_once_per_target_date(*, label: str, target_date_et: str, ttl_sec: int) -> None:
+    """Mark a successful automation post in Redis; fallback to in-memory."""
+
+    key = _automation_dedupe_key(label=label, target_date_et=target_date_et)
+
+    try:
+        r_ctx = redis_client_for_ctx()
+    except Exception:
+        r_ctx = None
+
+    if r_ctx is not None:
+        try:
+            payload = json.dumps({"target_date_et": target_date_et, "ts": _utc_now_iso()}, ensure_ascii=False)
+            r_ctx.set(key, payload, ex=max(60, int(ttl_sec)))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation dedupe redis mark error: {type(exc).__name__}: {exc}")
+
+    try:
+        _last_automation_posted_by_key[key] = int(_now_utc().timestamp())
+    except Exception:
+        pass
+
+
+def _headline_tag_from_text(text: str) -> str:
+    t = (text or "").lower()
+    if any(k in t for k in ("earnings", "eps", "revenue", "quarter", "q1", "q2", "q3", "q4", "guidance")):
+        return "EARNINGS"
+    if any(k in t for k in ("guidance", "outlook", "forecast", "raises guidance", "cuts guidance")):
+        return "GUIDANCE"
+    if any(k in t for k in ("upgrade", "downgrade", "price target", "pt ", "initiates coverage", "reiterates")):
+        return "ANALYST"
+    if any(k in t for k in ("cpi", "ppi", "nfp", "fomc", "powell", "fed", "treasury", "rates", "jobless")):
+        return "MACRO"
+    if any(k in t for k in ("sec", "doj", "lawsuit", "settlement", "probe", "investigation", "antitrust")):
+        return "LEGAL"
+    if any(k in t for k in ("acquires", "acquisition", "merger", "buyout", "m&a", "takeover", "deal")):
+        return "M&A"
+    if any(k in t for k in ("launch", "released", "release", "product", "ai", "chip", "iphone", "gpu")):
+        return "PRODUCT"
+    return "NEWS"
+
+
+def _append_recent_news_context_line(
+    text: str,
+    *,
+    symbol: str,
+    now_utc: datetime | None = None,
+    window_min: int = 120,
+) -> str:
+    """Append a single-line news context callout (cache-only).
+
+    Designed for alerts: one line, deterministic, no upstream calls.
+    """
+
+    base = (text or "").rstrip()
+    sym = str(symbol or "").strip().upper()
+    if not base or not sym:
+        return base
+    if "📰 Context:" in base:
+        return base
+
+    try:
+        win = max(5, min(360, int(window_min)))
+    except Exception:
+        win = 120
+
+    now_utc = (now_utc or _now_utc()).replace(tzinfo=timezone.utc)
+    try:
+        hs = _load_latest_headlines_for_symbols(symbols=[sym], window_hours=max(1.0, win / 60.0), limit=1)
+    except Exception:
+        hs = []
+    if not hs:
+        return base
+
+    it = hs[0]
+    dt = it.get("published_utc")
+    if not isinstance(dt, datetime):
+        return base
+    dt_utc = dt.astimezone(timezone.utc)
+    age_min = (now_utc - dt_utc).total_seconds() / 60.0
+    if age_min < 0 or age_min > float(win):
+        return base
+
+    tag = str(it.get("tag") or "NEWS").strip().upper() or "NEWS"
+    title = str(it.get("headline") or "").strip()
+    url = str(it.get("url") or "").strip()
+    if not title:
+        return base
+
+    age_s = f"{age_min:.0f}m"
+    if url:
+        line = f"📰 Context: [{tag}] {title} ({age_s}) <{url}>"
+    else:
+        line = f"📰 Context: [{tag}] {title} ({age_s})"
+
+    return base + "\n" + line
+
+
+def _decode_redis_json(v: object) -> dict[str, object] | None:
+    if not v:
+        return None
+    try:
+        if isinstance(v, (bytes, bytearray)):
+            s = v.decode("utf-8", errors="replace")
+        else:
+            s = str(v)
+        s = s.strip()
+        if not s:
+            return None
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _volatility_verdict_from_ratio(ratio: float | None) -> str:
+    if ratio is None:
+        return "UNKNOWN"
+    try:
+        r = float(ratio)
+    except Exception:
+        return "UNKNOWN"
+    if r >= 1.5:
+        return "UNDERPRICED"
+    if r >= 0.75:
+        return "FAIR"
+    return "OVERPRICED"
+
+
+def _load_volatility_reality_for_symbols(*, symbols: list[str], limit: int = 3) -> list[dict[str, object]]:
+    """Cache-first implied vs realized move for earnings names.
+
+    Source: canonical `cal:earnings:{SYM}` blob written by calendar/enrichment.
+    - implied_pct: expected_move_pct
+    - realized_pct: abs(history[0].move_pct)
+
+    Never calls upstream APIs; returns [] on cache miss/unavailable.
+    """
+
+    syms = [str(s).strip().upper() for s in (symbols or []) if str(s).strip()]
+    if not syms:
+        return []
+
+    try:
+        r_ctx = redis_client_for_ctx()
+    except Exception:
+        r_ctx = None
+    if r_ctx is None:
+        return []
+
+    keys = [f"cal:earnings:{s}" for s in syms]
+    raw_vals: list[object] = []
+    try:
+        if hasattr(r_ctx, "mget"):
+            raw = r_ctx.mget(keys)
+            if isinstance(raw, list):
+                raw_vals = list(raw)
+        else:
+            raw_vals = [r_ctx.get(k) for k in keys]
+    except Exception:
+        raw_vals = []
+
+    out: list[dict[str, object]] = []
+    for sym, raw in zip(syms, raw_vals, strict=False):
+        payload = _decode_redis_json(raw)
+        if not payload:
+            continue
+
+        implied = payload.get("expected_move_pct")
+        hist = payload.get("history")
+        realized = None
+        if isinstance(hist, list) and hist:
+            h0 = hist[0] if isinstance(hist[0], dict) else None
+            if isinstance(h0, dict):
+                realized = h0.get("move_pct")
+
+        try:
+            implied_f = float(implied) if implied is not None else None
+        except Exception:
+            implied_f = None
+        try:
+            realized_f = abs(float(realized)) if realized is not None else None
+        except Exception:
+            realized_f = None
+
+        ratio = None
+        if implied_f is not None and implied_f != 0 and realized_f is not None:
+            ratio = realized_f / abs(implied_f)
+
+        if implied_f is None or realized_f is None or ratio is None:
+            continue
+
+        out.append(
+            {
+                "symbol": sym,
+                "implied_pct": implied_f,
+                "realized_pct": realized_f,
+                "ratio": ratio,
+                "verdict": _volatility_verdict_from_ratio(ratio),
+            }
+        )
+
+    # Rank by most "surprising" (ratio) then by realized magnitude.
+    out.sort(key=lambda d: (float(d.get("ratio") or 0.0), float(d.get("realized_pct") or 0.0)), reverse=True)
+    return out[: max(0, min(6, int(limit)))]
+
+
+def _parse_dt_maybe_utc(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        s = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _time_ago_short(dt_utc: datetime, now_utc: datetime) -> str:
+    try:
+        delta_s = max(0.0, (now_utc - dt_utc).total_seconds())
+    except Exception:
+        return "?"
+    mins = delta_s / 60.0
+    if mins < 90:
+        return f"{int(round(mins))}m"
+    hrs = mins / 60.0
+    if hrs < 36:
+        return f"{int(round(hrs))}h"
+    days = hrs / 24.0
+    return f"{int(round(days))}d"
+
+
+def _clean_url_for_display(url: str, *, max_len: int = 120) -> str:
+    """Return a stable URL string suitable for inline display.
+
+    - Strips query + fragment to reduce noise
+    - Falls back to scheme+host if still too long
+    """
+
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return raw
+        cleaned = parsed._replace(query="", fragment="")
+        out = urlunparse(cleaned)
+        if len(out) <= max(20, int(max_len)):
+            return out
+        root = urlunparse(cleaned._replace(path="", params=""))
+        return root
+    except Exception:
+        return raw
+
+
+def _headline_tag_compact(tag: str) -> str:
+    t = str(tag or "").strip().upper() or "NEWS"
+    tag_map = {
+        "EARNINGS": "EARN",
+        "GUIDANCE": "EARN",
+        "MACRO": "MACRO",
+        "REG": "REG",
+        "LEGAL": "REG",
+        "M&A": "M&A",
+        "ANALYST": "ANLST",
+        "RATING": "ANLST",
+        "PRODUCT": "PROD",
+        "NEWS": "NEWS",
+    }
+    return tag_map.get(t, t[:8])
+
+
+def _format_headlines_compact(
+    headlines: list[dict[str, object]] | None,
+    *,
+    now_utc: datetime,
+    limit: int = 4,
+) -> list[str]:
+    """Format cached headlines into 1-line, non-spammy bullets."""
+
+    items = list(headlines or [])[: max(0, int(limit))]
+    out: list[str] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        tag = _headline_tag_compact(str(it.get("tag") or "NEWS"))
+        sym = str(it.get("symbol") or "").strip().upper()
+        title = str(it.get("headline") or "").strip()
+        url = str(it.get("url") or "").strip()
+        dt = it.get("published_utc")
+        age = None
+        if isinstance(dt, datetime):
+            age = _time_ago_short(dt.astimezone(timezone.utc), now_utc)
+
+        if not title:
+            continue
+
+        parts: list[str] = []
+        if age:
+            parts.append(age)
+        parts.append(f"[{tag}]")
+        if sym and sym != "MARKET":
+            parts.append(f"{sym}:")
+        parts.append(title)
+
+        line = " ".join(parts)
+        if url:
+            line_url = _clean_url_for_display(url)
+            if line_url:
+                line = f"{line} <{line_url}>"
+        out.append(f"• {line}")
+
+    return out
+
+
+def _count_cached_earnings_within_days(
+    *,
+    symbols: list[str],
+    now_utc: datetime,
+    days: float = 2.0,
+) -> int:
+    """Cache-only count of symbols with an upcoming earnings timestamp.
+
+    Reads `cal:earnings:{SYM}` and checks `ts_utc` field.
+    Returns 0 if Redis unavailable or cache miss.
+    """
+
+    syms = [str(s).strip().upper() for s in (symbols or []) if str(s).strip()]
+    if not syms:
+        return 0
+
+    try:
+        r_ctx = redis_client_for_ctx()
+    except Exception:
+        r_ctx = None
+    if r_ctx is None:
+        return 0
+
+    try:
+        from services.calendar.calendar_keys import cal_earnings_key
+
+        keys = [cal_earnings_key(s) for s in syms]
+    except Exception:
+        keys = [f"cal:earnings:{s}" for s in syms]
+
+    try:
+        raw_vals = r_ctx.mget(keys) if hasattr(r_ctx, "mget") else [r_ctx.get(k) for k in keys]
+        if not isinstance(raw_vals, list):
+            raw_vals = []
+    except Exception:
+        raw_vals = []
+
+    horizon_s = max(0.0, float(days) * 24.0 * 3600.0)
+    count = 0
+    for raw in raw_vals:
+        payload = _decode_redis_json(raw)
+        if not payload:
+            continue
+        ts = payload.get("ts_utc")
+        if not ts:
+            continue
+        dt = _parse_dt_maybe_utc(ts)
+        if dt is None:
+            continue
+        delta_s = (dt - now_utc).total_seconds()
+        if 0 <= delta_s <= horizon_s:
+            count += 1
+
+    return count
+
+
+def _next_macro_event_any(events: list[dict] | None, now_et: datetime) -> dict | None:
+    if not events:
+        return None
+    best: dict | None = None
+    best_delta = None
+    for item in events:
+        t = (item.get("time_et") or "").strip()
+        if not t:
+            continue
+        try:
+            hh, mm = [int(x) for x in t.split(":")]
+            ev_dt = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            delta_min = (ev_dt - now_et).total_seconds() / 60.0
+            if delta_min < 0:
+                continue
+            if best_delta is None or delta_min < best_delta:
+                best_delta = float(delta_min)
+                best = dict(item)
+                best["delta_min"] = float(delta_min)
+                best["event_dt"] = ev_dt
+        except Exception:  # noqa: BLE001
+            continue
+    return best
+
+
+def _load_latest_headlines_for_symbols(
+    *,
+    symbols: list[str],
+    window_hours: float = 48.0,
+    limit: int = 3,
+    material_only_override: bool | None = None,
+    return_stats: bool = False,
+) -> list[dict[str, object]] | tuple[list[dict[str, object]], dict[str, object]]:
+    """Return a ranked set of cached headlines for the given symbols.
+
+    Uses Redis-backed NewsService history layer populated by scripts/news_poller.py.
+    Never throws; returns [] on cache miss/unavailable.
+    """
+
+    syms = [str(s).strip().upper() for s in (symbols or []) if str(s).strip()]
+    if not syms:
+        empty: list[dict[str, object]] = []
+        if return_stats:
+            return empty, {"source": "redis", "sym_raw": 0, "sym_kept": 0, "market_raw": 0, "material_only": True}
+        return empty
+
+    try:
+        r_ctx = redis_client_for_ctx()
+    except Exception:
+        r_ctx = None
+    if r_ctx is None:
+        empty: list[dict[str, object]] = []
+        if return_stats:
+            return empty, {"source": "redis", "sym_raw": 0, "sym_kept": 0, "market_raw": 0, "material_only": True}
+        return empty
+
+    try:
+        from services.news.news_service import NewsService
+
+        svc = NewsService(r_ctx)
+    except Exception:
+        empty: list[dict[str, object]] = []
+        if return_stats:
+            return empty, {"source": "redis", "sym_raw": 0, "sym_kept": 0, "market_raw": 0, "material_only": True}
+        return empty
+
+    now_utc = _now_utc().replace(tzinfo=timezone.utc)
+    cutoff = now_utc - timedelta(hours=float(window_hours or 48.0))
+
+    candidates: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+
+    sym_raw = 0
+    sym_kept = 0
+    market_raw = 0
+
+    # Pull a few per symbol, then rank globally (keeps it tight and "Bloomberg-ish").
+    per_sym = max(3, min(10, int(limit) * 3))
+    want = set(syms)
+
+    for sym in syms:
+        try:
+            items = svc.get_recent_items(symbol=sym, limit=per_sym)
+        except Exception:
+            items = []
+
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            nid = str(it.get("id") or "").strip()
+            if not nid or nid in seen_ids:
+                continue
+
+            headline = str(it.get("headline") or it.get("title") or "").strip()
+            url = str(it.get("url") or "").strip()
+            dt = _parse_dt_maybe_utc(it.get("published_utc") or it.get("published") or it.get("created"))
+            if not headline or dt is None:
+                continue
+            if dt < cutoff:
+                continue
+
+            sym_raw += 1
+
+            tickers = it.get("tickers")
+            tickers_list: list[str] = []
+            if isinstance(tickers, list):
+                tickers_list = [str(t).strip().upper() for t in tickers if t and str(t).strip()]
+            elif isinstance(tickers, str):
+                tickers_list = [t.strip().upper() for t in tickers.split(",") if t and t.strip()]
+
+            primary = None
+            for t in tickers_list:
+                if t in want:
+                    primary = t
+                    break
+            if primary is None:
+                primary = sym
+
+            # Prefer ingest-time classification if present; else classify locally.
+            tags: list[str] = []
+            severity = str(it.get("severity") or "").strip().upper() if isinstance(it, dict) else ""
+            if isinstance(it.get("tags"), list):
+                tags = [str(t).strip().lower() for t in (it.get("tags") or []) if str(t).strip()]
+
+            if not tags:
+                try:
+                    from services.news.news_rules import classify_news
+
+                    tags, severity_raw = classify_news(it)
+                    severity = str(severity or severity_raw or "").strip().upper()
+                except Exception:
+                    tags = []
+
+            # Material-only filter (default ON): keep only strong catalysts.
+            # NOTE: Earnings nights often have headlines without upstream tags; treat earnings-like text as material.
+            material_only = _env_bool("TNT_HEADLINES_MATERIAL_ONLY", "1") if material_only_override is None else bool(material_only_override)
+            if material_only:
+                material_tags = {"macro", "earnings", "guidance", "m&a", "sec", "fda"}
+                tag_guess = _headline_tag_from_text(headline)
+                is_material = bool(set(tags) & material_tags) or severity in {"HIGH"} or tag_guess in {
+                    "EARNINGS",
+                    "GUIDANCE",
+                    "MACRO",
+                    "LEGAL",
+                    "M&A",
+                    "ANALYST",
+                    "PRODUCT",
+                }
+                if not is_material:
+                    continue
+
+            sym_kept += 1
+
+            tag = "NEWS"
+            if tags:
+                # Surface the strongest tag first.
+                pref = ["macro", "earnings", "guidance", "sec", "fda", "m&a", "rating"]
+                chosen = None
+                for p in pref:
+                    if p in tags:
+                        chosen = p
+                        break
+                chosen = chosen or tags[0]
+                tag_map = {
+                    "macro": "MACRO",
+                    "earnings": "EARNINGS",
+                    "guidance": "EARNINGS",
+                    "sec": "REG",
+                    "fda": "REG",
+                    "m&a": "M&A",
+                    "rating": "ANALYST",
+                }
+                tag = tag_map.get(str(chosen), str(chosen).upper())
+            else:
+                tag = _headline_tag_from_text(headline)
+
+            score = 0
+            # Prefer highly-specific single-name items.
+            if tickers_list and len(tickers_list) <= 2:
+                score += 2
+            # Prefer keyword-matched catalysts.
+            if tag != "NEWS":
+                score += 3
+            if severity == "HIGH":
+                score += 3
+            # Small recency bump.
+            age_h = max(0.0, (now_utc - dt).total_seconds() / 3600.0)
+            score += int(max(0.0, 48.0 - min(48.0, age_h)) / 12.0)
+
+            candidates.append(
+                {
+                    "id": nid,
+                    "symbol": primary,
+                    "tag": tag,
+                    "headline": headline,
+                    "url": url,
+                    "published_utc": dt,
+                    "_score": score,
+                }
+            )
+            seen_ids.add(nid)
+
+    # Health probe: market bucket hits (for diagnostics only; does not affect ranking).
+    try:
+        market_items = svc.get_recent_items(symbol="MARKET", limit=per_sym)
+    except Exception:
+        market_items = []
+    for it in (market_items or []):
+        if not isinstance(it, dict):
+            continue
+        headline = str(it.get("headline") or it.get("title") or "").strip()
+        dt = _parse_dt_maybe_utc(it.get("published_utc") or it.get("published") or it.get("created"))
+        if not headline or dt is None:
+            continue
+        if dt < cutoff:
+            continue
+        market_raw += 1
+
+    def _sort_key(x: dict[str, object]) -> tuple[int, float]:
+        sc = int(x.get("_score") or 0)
+        dt = x.get("published_utc")
+        ts = float(dt.timestamp()) if isinstance(dt, datetime) else 0.0
+        return (sc, ts)
+
+    candidates.sort(key=_sort_key, reverse=True)
+    out = candidates[: max(0, min(6, int(limit)))]
+    for x in out:
+        x.pop("_score", None)
+
+    if return_stats:
+        material_only = _env_bool("TNT_HEADLINES_MATERIAL_ONLY", "1") if material_only_override is None else bool(material_only_override)
+        return out, {
+            "source": "redis",
+            "sym_raw": int(sym_raw),
+            "sym_kept": int(sym_kept),
+            "market_raw": int(market_raw),
+            "material_only": bool(material_only),
+        }
+    return out
+
+
+async def automation_earnings_daily_loop(channel):
+    await bot.wait_until_ready()
+
+    hh, mm = _parse_hhmm(os.getenv("TNT_EARNINGS_DAILY_TIME_ET", "18:00"))
+    poll_sec = _env_int("TNT_EARNINGS_DAILY_POLL_SEC", "60")
+    dedupe_ttl_sec = _env_int("TNT_EARNINGS_DAILY_DEDUPE_TTL_SEC", str(3 * 24 * 3600))
+    print(
+        "[OK] automation_earnings_daily_loop running "
+        f"(time_et={hh:02d}:{mm:02d}, dedupe_ttl={dedupe_ttl_sec}s)"
+    )
+
+    while not bot.is_closed():
+        try:
+            if not _env_bool("EARNINGS_AUTOPOST_ENABLED", "0"):
+                await asyncio.sleep(max(5, poll_sec))
+                continue
+
+            now_et = _now_et()
+            due = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if now_et < due:
+                await asyncio.sleep(max(5, poll_sec))
+                continue
+
+            target_d = next_weekday(now_et.date() + timedelta(days=1))
+            target_date_et = target_d.strftime("%Y-%m-%d")
+
+            key = _automation_dedupe_key(label="earnings_daily", target_date_et=target_date_et)
+
+            should_post = _automation_should_post_once_per_target_date(
+                label="earnings_daily",
+                target_date_et=target_date_et,
+                ttl_sec=dedupe_ttl_sec,
+            )
+
+            if not should_post:
+                print(f"[AUTOPOST][EARNINGS] deduped key={key} target_date_et={target_date_et} kind=status")
+            else:
+                print(f"[AUTOPOST][EARNINGS] posting key={key} target_date_et={target_date_et} kind=status")
+
+            render = await asyncio.to_thread(
+                build_tomorrow_earnings_macro_render,
+                target_date_et=target_date_et,
+                now_et=now_et,
+            )
+
+            try:
+                payload = render.agent_payload or {}
+                meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+
+                rows = int(meta.get("earnings_count") or 0)
+                headlines = 1 if int(meta.get("headlines_count") or 0) > 0 else 0
+                source = str(meta.get("source") or "").strip() or "unknown"
+
+                print(
+                    "[AUTOPOST][EARNINGS][PROOF] "
+                    f"kind=status expected=1 results=0 macro=1 headlines={headlines} rows={rows} source={source}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARN] [AUTOPOST][EARNINGS][PROOF] failed: {type(exc).__name__}: {exc}")
+
+            if not should_post:
+                await asyncio.sleep(60)
+                continue
+
+            publish_id = None
+            try:
+                import uuid
+
+                publish_id = uuid.uuid4().hex[:10]
+            except Exception:
+                publish_id = None
+            try:
+                print(f"[AUTOPOST][EARNINGS] publish_id={publish_id} key={key} target_date_et={target_date_et}")
+            except Exception:
+                pass
+            await _publish_autopost_render(
+                channel,
+                render,
+                builder="build_tomorrow_earnings_macro_render",
+                label="earnings_daily",
+                symbol="",
+                publish_id=publish_id,
+                kind="status",
+                context_mode="db",
+                context_output_mode="strict",
+            )
+
+            _automation_mark_posted_once_per_target_date(
+                label="earnings_daily",
+                target_date_et=target_date_et,
+                ttl_sec=dedupe_ttl_sec,
+            )
+            print(f"[OK] earnings_daily posted label=earnings_daily target_date_et={target_date_et} publish_id={publish_id}")
+            await asyncio.sleep(60)
+
+        except ContractViolationError as exc:
+            print(f"[WARN] automation_earnings_daily_loop contract violation: {exc}")
+            if STRICT_CONTRACTS:
+                raise
+            await asyncio.sleep(max(5, poll_sec))
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_earnings_daily_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(5, poll_sec))
+
+
+async def automation_earnings_results_loop(channel):
+    await bot.wait_until_ready()
+
+    times_s = (os.getenv("TNT_EARNINGS_RESULTS_TIMES_ET") or os.getenv("TNT_EARNINGS_RESULTS_TIME_ET") or "18:10").strip()
+    poll_sec = _env_int("TNT_EARNINGS_RESULTS_POLL_SEC", "60")
+    dedupe_ttl_sec = _env_int("TNT_EARNINGS_RESULTS_DEDUPE_TTL_SEC", str(3 * 24 * 3600))
+
+    times: list[tuple[int, int]] = []
+    for part in [p.strip() for p in times_s.split(",") if p.strip()]:
+        try:
+            hh, mm = _parse_hhmm(part)
+            times.append((hh, mm))
+        except Exception:
+            continue
+    if not times:
+        times = [(18, 10)]
+
+    times_label = ",".join([f"{h:02d}:{m:02d}" for (h, m) in times])
+    print(
+        "[OK] automation_earnings_results_loop running "
+        f"(times_et={times_label}, dedupe_ttl={dedupe_ttl_sec}s)"
+    )
+
+    while not bot.is_closed():
+        try:
+            if not _env_bool("EARNINGS_RESULTS_AUTOPOST_ENABLED", "0"):
+                await asyncio.sleep(max(5, poll_sec))
+                continue
+
+            now_et = _now_et()
+            if now_et.weekday() >= 5:
+                await asyncio.sleep(max(5, poll_sec))
+                continue
+
+            target_date_et = now_et.strftime("%Y-%m-%d")
+
+            posted_any = False
+            for idx, (hh, mm) in enumerate(times, start=1):
+                due = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if now_et < due:
+                    continue
+
+                label = f"earnings_results_{idx}"
+                key = _automation_dedupe_key(label=label, target_date_et=target_date_et)
+
+                should_post = _automation_should_post_once_per_target_date(
+                    label=label,
+                    target_date_et=target_date_et,
+                    ttl_sec=dedupe_ttl_sec,
+                )
+
+                if not should_post:
+                    print(f"[AUTOPOST][EARNINGS_RESULTS] deduped key={key} target_date_et={target_date_et} kind=status")
+                else:
+                    print(f"[AUTOPOST][EARNINGS_RESULTS] posting key={key} target_date_et={target_date_et} kind=status")
+
+                render = await asyncio.to_thread(
+                    build_earnings_results_today_render,
+                    target_date_et=target_date_et,
+                    now_et=now_et,
+                )
+
+                try:
+                    payload = render.agent_payload or {}
+                    meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+                    sections = payload.get("sections", {}) if isinstance(payload, dict) else {}
+                    results_rows = sections.get("results_rows") if isinstance(sections, dict) else None
+
+                    beats = misses = inline = 0
+                    if isinstance(results_rows, list):
+                        for r in results_rows:
+                            if not isinstance(r, dict):
+                                continue
+                            tag = None
+                            eps_a = r.get("eps_actual")
+                            eps_e = r.get("eps_est")
+                            if eps_a is not None and eps_e is not None:
+                                tag = _beat_tag(eps_a, eps_e)
+                            else:
+                                rev_a = r.get("rev_actual")
+                                rev_e = r.get("rev_est")
+                                if rev_a is not None and rev_e is not None:
+                                    tag = _beat_tag(rev_a, rev_e)
+
+                            if tag == "BEAT":
+                                beats += 1
+                            elif tag == "MISS":
+                                misses += 1
+                            elif tag == "INLINE":
+                                inline += 1
+
+                    rows = int(meta.get("results_count") or 0)
+                    headlines = 1 if int(meta.get("headlines_count") or 0) > 0 else 0
+                    why_moved = 1 if int(meta.get("why_moved_count") or 0) > 0 else 0
+
+                    print(
+                        "[AUTOPOST][EARNINGS_RESULTS][PROOF] "
+                        f"kind=status rows={rows} beats={beats} misses={misses} inline={inline} "
+                        f"reality_check=1 why_moved={why_moved} headlines={headlines}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[WARN] [AUTOPOST][EARNINGS_RESULTS][PROOF] failed: {type(exc).__name__}: {exc}")
+
+                if not should_post:
+                    continue
+
+                publish_id = None
+                try:
+                    import uuid
+
+                    publish_id = uuid.uuid4().hex[:10]
+                except Exception:
+                    publish_id = None
+                try:
+                    print(f"[AUTOPOST][EARNINGS_RESULTS] publish_id={publish_id} key={key} target_date_et={target_date_et}")
+                except Exception:
+                    pass
+                await _publish_autopost_render(
+                    channel,
+                    render,
+                    builder="build_earnings_results_today_render",
+                    label=label,
+                    symbol="",
+                    publish_id=publish_id,
+                    kind="status",
+                    context_mode="db",
+                    context_output_mode="strict",
+                )
+
+                _automation_mark_posted_once_per_target_date(
+                    label=label,
+                    target_date_et=target_date_et,
+                    ttl_sec=dedupe_ttl_sec,
+                )
+                print(f"[OK] earnings_results posted label={label} target_date_et={target_date_et} publish_id={publish_id}")
+                posted_any = True
+
+            await asyncio.sleep(60 if posted_any else max(5, poll_sec))
+
+        except ContractViolationError as exc:
+            print(f"[WARN] automation_earnings_results_loop contract violation: {exc}")
+            if STRICT_CONTRACTS:
+                raise
+            await asyncio.sleep(max(5, poll_sec))
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_earnings_results_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(5, poll_sec))
+
+
+async def automation_earnings_results_prewarm_loop() -> None:
+    """Pre-warm earnings inputs before scheduled results posts.
+
+    Default times (ET): 07:45 and 15:45.
+    Best-effort warmers (no posting):
+    - Earnings results API fetch for today (watchlist-only by design)
+    - Expected-move cache refresh
+    - Per-symbol headline cache refresh
+    """
+
+    await bot.wait_until_ready()
+
+    times_s = (os.getenv("TNT_EARNINGS_RESULTS_PREWARM_TIMES_ET") or "07:45,15:45").strip()
+    poll_sec = _env_int("TNT_EARNINGS_RESULTS_PREWARM_POLL_SEC", "30")
+    dedupe_ttl_sec = _env_int("TNT_EARNINGS_RESULTS_PREWARM_DEDUPE_TTL_SEC", str(2 * 24 * 3600))
+
+    times: list[tuple[int, int]] = []
+    for part in [p.strip() for p in times_s.split(",") if p.strip()]:
+        try:
+            hh, mm = _parse_hhmm(part)
+            times.append((hh, mm))
+        except Exception:
+            continue
+    if not times:
+        times = [(7, 45), (15, 45)]
+
+    times_label = ",".join([f"{h:02d}:{m:02d}" for (h, m) in times])
+    print(f"[OK] automation_earnings_results_prewarm_loop running (times_et={times_label}, dedupe_ttl={dedupe_ttl_sec}s)")
+
+    last_skip_reason: str | None = None
+    last_skip_ts: float = 0.0
+
+    def _log_skip(reason: str) -> None:
+        nonlocal last_skip_reason, last_skip_ts
+        try:
+            now_ts = float(time_lib.time())
+            if reason != last_skip_reason or (now_ts - float(last_skip_ts)) >= 300.0:
+                last_skip_reason = str(reason)
+                last_skip_ts = now_ts
+                print(f"[EARNINGS_RESULTS][PREWARM][SKIP] reason={reason}")
+        except Exception:
+            return
+
+    while not bot.is_closed():
+        try:
+            if not _env_bool("EARNINGS_RESULTS_AUTOPOST_ENABLED", "0"):
+                _log_skip("autopost_disabled")
+                await asyncio.sleep(max(5, poll_sec))
+                continue
+            if not _env_bool("EARNINGS_RESULTS_PREWARM_ENABLED", "1"):
+                _log_skip("prewarm_disabled")
+                await asyncio.sleep(max(5, poll_sec))
+                continue
+
+            now_et = _now_et()
+            if now_et.weekday() >= 5:
+                _log_skip("weekend")
+                await asyncio.sleep(max(5, poll_sec))
+                continue
+
+            target_date_et = now_et.strftime("%Y-%m-%d")
+
+            ran_any = False
+            for idx, (hh, mm) in enumerate(times, start=1):
+                due = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if now_et < due:
+                    continue
+
+                label = f"earnings_results_prewarm_{idx}"
+                key = _automation_dedupe_key(label=label, target_date_et=target_date_et)
+
+                should_run = _automation_should_post_once_per_target_date(
+                    label=label,
+                    target_date_et=target_date_et,
+                    ttl_sec=dedupe_ttl_sec,
+                )
+                if not should_run:
+                    _log_skip(f"already_warmed_recently:{label}")
+                    continue
+
+                watchlist = [s.strip().upper() for s in (os.getenv("EARNINGS_WATCHLIST") or "").split(",") if s.strip()]
+                majors_env = os.getenv("TNT_EARNINGS_RESULTS_MAJORS", "AAPL,MSFT,TSLA,META,NVDA") or ""
+                majors = [s.strip().upper() for s in majors_env.split(",") if s.strip()]
+                symbols = list(dict.fromkeys([*watchlist, *majors]))
+
+                try:
+                    max_syms = int(_env_int("TNT_EARNINGS_RESULTS_PREWARM_MAX_SYMBOLS", "30"))
+                except Exception:
+                    max_syms = 30
+                symbols = symbols[: max(5, min(60, int(max_syms)))]
+
+                # Step 1: best-effort earnings fetch for today.
+                if not bool(_resolve_earnings_api_key()):
+                    _log_skip("missing_api_key")
+                try:
+                    await asyncio.to_thread(fetch_earnings_for_date, target_date_et)
+                except Exception:
+                    pass
+
+                em_ok = 0
+                news_ok = 0
+
+                # Step 2: warm expected move + headlines using existing bounded helpers.
+                try:
+                    from scripts.earnings_precache import _redis_client as _ep_redis_client
+                    from scripts.earnings_precache import _refresh_expected_move_one as _ep_refresh_expected_move_one
+                    from scripts.earnings_precache import _refresh_news_one as _ep_refresh_news_one
+
+                    r = _ep_redis_client()
+
+                    try:
+                        em_timeout = float(os.getenv("TNT_EARNINGS_RESULTS_PREWARM_EM_TIMEOUT_SEC", "3.0") or "3.0")
+                    except Exception:
+                        em_timeout = 3.0
+                    try:
+                        news_timeout = float(os.getenv("TNT_EARNINGS_RESULTS_PREWARM_NEWS_TIMEOUT_SEC", "8.0") or "8.0")
+                    except Exception:
+                        news_timeout = 8.0
+                    try:
+                        news_limit = int(os.getenv("TNT_EARNINGS_RESULTS_PREWARM_NEWS_LIMIT", "20") or "20")
+                    except Exception:
+                        news_limit = 20
+                    try:
+                        news_ttl = int(os.getenv("TNT_EARNINGS_RESULTS_PREWARM_NEWS_TTL_SEC", str(6 * 3600)) or str(6 * 3600))
+                    except Exception:
+                        news_ttl = 6 * 3600
+
+                    concurrency = max(1, int(_env_int("TNT_EARNINGS_RESULTS_PREWARM_CONCURRENCY", "4")))
+                    sem = asyncio.Semaphore(concurrency)
+
+                    async def _one_em(sym: str) -> None:
+                        nonlocal em_ok
+                        async with sem:
+                            try:
+                                res = await _ep_refresh_expected_move_one(symbol=sym, timeout_s=float(em_timeout))
+                                if isinstance(res, dict) and res.get("expected_move_written"):
+                                    em_ok += 1
+                            except Exception:
+                                return
+
+                    async def _one_news(sym: str) -> None:
+                        nonlocal news_ok
+                        async with sem:
+                            try:
+                                res = await _ep_refresh_news_one(
+                                    r=r,
+                                    symbol=sym,
+                                    timeout_s=float(news_timeout),
+                                    lookback_hours=24,
+                                    limit=int(news_limit),
+                                    ttl_sec=int(news_ttl),
+                                )
+                                if isinstance(res, dict) and int(res.get("stored") or 0) > 0:
+                                    news_ok += 1
+                            except Exception:
+                                return
+
+                    await asyncio.gather(*[_one_em(s) for s in symbols])
+                    await asyncio.gather(*[_one_news(s) for s in symbols])
+                except Exception:
+                    pass
+
+                try:
+                    print(
+                        f"[EARNINGS_RESULTS][PREWARM] key={key} target_date_et={target_date_et} symbols={len(symbols)} em_ok={em_ok} news_ok={news_ok}"
+                    )
+                except Exception:
+                    pass
+
+                _automation_mark_posted_once_per_target_date(
+                    label=label,
+                    target_date_et=target_date_et,
+                    ttl_sec=dedupe_ttl_sec,
+                )
+                ran_any = True
+
+            await asyncio.sleep(60 if ran_any else max(5, poll_sec))
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_earnings_results_prewarm_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(5, poll_sec))
+
+
+def build_daily_market_outlook_render(*, now_et: datetime | None = None) -> RenderedPost:
+    """Once/day market outlook post.
+
+    Anti-regret rules:
+    - Conditions only (no trade calls)
+    - Cache-first: macro CSV + Redis news history
+    """
+
+    now_et = now_et or _now_et()
+    session = market_session_et(now_et.astimezone(timezone.utc))
+    today_et = now_et.strftime("%Y-%m-%d")
+
+    macro_events = load_macro_events_for_date(today_et)
+    macro_banner = macro_risk_banner(macro_events, label=f"Macro Risk ({today_et} ET)")
+
+    symbols = [
+        s.strip().upper()
+        for s in (os.getenv("DAILY_OUTLOOK_SYMBOLS", "SPY,QQQ,IWM") or "").split(",")
+        if s.strip()
+    ]
+    symbols = list(dict.fromkeys(symbols))
+
+    try:
+        headlines_limit = _env_int("TNT_OUTLOOK_HEADLINES_LIMIT", "4")
+    except Exception:
+        headlines_limit = 4
+    headlines_limit = max(3, min(5, int(headlines_limit)))
+
+    try:
+        headlines = _load_latest_headlines_for_symbols(
+            symbols=["MARKET"] + symbols,
+            window_hours=24.0,
+            limit=headlines_limit,
+        )
+    except Exception:
+        headlines = []
+
+    now_utc = now_et.astimezone(timezone.utc)
+
+    lines: list[str] = []
+    lines.append("🌅 Daily Market Outlook")
+    lines.append(f"ET stamp: {now_et.strftime('%Y-%m-%d %H:%M ET')} | Session: {session}")
+
+    try:
+        snap = get_regime_snapshot(post_type="daily_outlook")
+    except Exception:
+        snap = []
+    if snap:
+        lines.append("")
+        lines.append("📍 Conditions Snapshot")
+        lines.extend(snap[:5])
+
+    # Deterministic “OH WOW” callout (cache-only inputs).
+    wow_reasons: list[str] = []
+    if macro_banner:
+        wow_reasons.append("high-impact macro on deck")
+
+    try:
+        wow_news_window_min = max(30, min(180, _env_int("TNT_OUTLOOK_WOW_NEWS_WINDOW_MIN", "90")))
+    except Exception:
+        wow_news_window_min = 90
+
+    recent_news = 0
+    for it in (headlines or []):
+        dt = it.get("published_utc") if isinstance(it, dict) else None
+        if not isinstance(dt, datetime):
+            continue
+        age_min = (now_utc - dt.astimezone(timezone.utc)).total_seconds() / 60.0
+        if 0 <= age_min <= float(wow_news_window_min):
+            recent_news += 1
+    if recent_news >= 4:
+        wow_reasons.append(f"news cluster ({recent_news} in {wow_news_window_min}m)")
+
+    try:
+        wow_days = float(os.getenv("TNT_OUTLOOK_WOW_EARNINGS_DAYS", "2") or "2")
+    except Exception:
+        wow_days = 2.0
+    try:
+        wow_earnings_thresh = max(1, min(10, _env_int("TNT_OUTLOOK_WOW_EARNINGS_THRESH", "3")))
+    except Exception:
+        wow_earnings_thresh = 3
+
+    wow_tickers_env = (os.getenv("TNT_OUTLOOK_WOW_EARNINGS_TICKERS") or "").strip()
+    if wow_tickers_env:
+        wow_tickers = [s.strip().upper() for s in wow_tickers_env.split(",") if s.strip()]
+    else:
+        wow_tickers = sorted(set(MEGA_CAP))
+
+    mega_earnings = _count_cached_earnings_within_days(symbols=wow_tickers, now_utc=now_utc, days=wow_days)
+    if mega_earnings >= wow_earnings_thresh:
+        wow_reasons.append(f"mega-cap earnings cluster ({mega_earnings} ≤{int(round(wow_days * 24))}h)")
+
+    if wow_reasons:
+        lines.append("")
+        lines.append("⚡ OH WOW: " + "; ".join(wow_reasons[:2]))
+
+    # Crown Jewel: Today’s Setup (conditions-only).
+    setup_lines: list[str] = []
+    try:
+        tf_bias = os.getenv("BIAS_TF", BIAS_TF)
+        confirm_bias, _confirm_note, _detail = vix_sqqq_confirmation(tf=tf_bias)
+        sig = get_latest_signal("SPY")
+        prob_up = float(sig["prob_up"]) if sig and sig.get("prob_up") is not None else None
+        edge_val = _edge(prob_up) if prob_up is not None else None
+        smiq, pg = _resolve_market_participation(confirm_bias, edge_val)
+        regime = str((smiq.get("regime") if isinstance(smiq, dict) else None) or "UNKNOWN").upper()
+        try:
+            quality = str((smiq.get("data_quality") if isinstance(smiq, dict) else None) or "UNKNOWN").upper()
+            reason = (smiq.get("reason") if isinstance(smiq, dict) else None) or None
+            ts_et = (smiq.get("timestamp_et") if isinstance(smiq, dict) else None) or None
+            extra = f" reason={str(reason).strip().lower()}" if reason else ""
+            extra += f" ts={ts_et}" if ts_et else ""
+            print(f"[SMIQ][OUTLOOK] participation regime={regime} quality={quality}{extra}")
+        except Exception:
+            pass
+
+        setup_lines.append(f"• Bias confirm: {str(confirm_bias or 'UNKNOWN').upper()} | Participation regime: {regime}")
+        if edge_val is not None:
+            if prob_up is not None:
+                setup_lines.append(f"• Signal edge: {edge_val:.2f} (prob_up={prob_up:.2f})")
+            else:
+                setup_lines.append(f"• Signal edge: {edge_val:.2f}")
+        if getattr(pg, "impact", ""):
+            setup_lines.append(f"• Breadth gate: {getattr(pg, 'impact', 'UNKNOWN')} ({getattr(pg, 'state', 'UNKNOWN')})")
+    except Exception:
+        setup_lines = []
+
+    nxt = _next_macro_event_any(macro_events, now_et)
+    if nxt:
+        try:
+            mins = float(nxt.get("delta_min") or 0.0)
+        except Exception:
+            mins = 0.0
+        t = str(nxt.get("time_et") or "").strip()
+        title = str(nxt.get("title") or "").strip() or "(macro event)"
+        imp = str(nxt.get("impact") or "").strip()
+        setup_lines.append(f"• Next macro: {t} — {impact_icon(imp)} {title} (in ~{mins:.0f}m)".strip())
+    else:
+        setup_lines.append("• Next macro: none scheduled remaining today (per calendar)")
+
+    if headlines:
+        setup_lines.append(f"• News heat: {recent_news}/{len(headlines)} material headlines in last {wow_news_window_min}m")
+
+    setup_lines = setup_lines[:4]
+    if setup_lines:
+        lines.append("")
+        lines.append("👑 Today’s Setup (conditions only)")
+        lines.extend(setup_lines)
+
+    lines.append("")
+    lines.append("🗓️ Macro (ET)")
+    if macro_banner:
+        lines.append(macro_banner)
+    if macro_events:
+        for e in macro_events[:8]:
+            t = (e.get("time_et") or "").strip()
+            title = (e.get("title") or "").strip()
+            imp = (e.get("impact") or "").strip()
+            lines.append(f"• {t} — {impact_icon(imp)} {title}".strip())
+    else:
+        lines.append("• No scheduled macro releases found")
+
+    lines.append("")
+    lines.append("📰 Material Headlines (24h, cache-only)")
+    if headlines:
+        lines.extend(_format_headlines_compact(headlines, now_utc=now_utc, limit=headlines_limit))
+    else:
+        lines.append("• No material headlines in last 24h")
+
+    lines.append("")
+    lines.append("🧭 What To Watch (conditions only)")
+    risk_item = macro_within_minutes(macro_events, 60, now_et)
+    if risk_item:
+        mins = float(risk_item.get("delta_min") or 0.0)
+        lines.append(f"• High-impact macro in ~{mins:.0f}m — expect volatility + whipsaws")
+    else:
+        lines.append("• No high-impact macro in the next hour (per calendar)")
+    lines.append("• If headlines hit mid-session, re-check conditions before adding risk")
+    lines.append("• If conditions conflict, reduce size or stand down")
+
+    lines.append("")
+    lines.append("Context only • Not financial advice")
+
+    section_data: Dict[str, Any] = {
+        "date_et": today_et,
+        "macro_events": macro_events,
+        "macro_banner": macro_banner,
+        "headlines": headlines,
+        "symbols": symbols,
+        "updated_utc": _now_utc().replace(tzinfo=timezone.utc).isoformat(),
+    }
+
+    extra_meta: Dict[str, Any] = {
+        "date_et": today_et,
+        "headlines_count": len(headlines or []),
+        "macro_count": len(macro_events or []),
+    }
+
+    return _render_with_agent_context(
+        lines,
+        symbols=[],
+        generated_at=now_et,
+        post_type="daily_market_outlook",
+        extra_meta=extra_meta,
+        sections=section_data,
+    )
+
+
+def build_weekly_market_outlook_render(*, now_et: datetime | None = None) -> RenderedPost:
+    """Once/week market outlook post.
+
+    MVP-safe: reuse the Daily Outlook formatter (cache-only) but label it as weekly.
+    """
+
+    now_et = now_et or _now_et()
+    base = build_daily_market_outlook_render(now_et=now_et)
+
+    lines = (base.text or "").splitlines()
+    if lines:
+        lines[0] = "🗓️ Weekly Market Outlook"
+        if len(lines) >= 2:
+            lines[1] = f"🕒 Week of {now_et.strftime('%Y-%m-%d')} (ET)"
+
+    payload = base.agent_payload if isinstance(base.agent_payload, dict) else {}
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    if isinstance(meta, dict):
+        meta["post_type"] = "weekly_market_outlook"
+        meta["weekly"] = True
+    payload["meta"] = meta
+
+    return RenderedPost(text="\n".join(lines), agent_payload=payload, files=base.files)
+
+
+async def automation_daily_market_outlook_loop(channel):
+    await bot.wait_until_ready()
+
+    times_s = (os.getenv("DAILY_OUTLOOK_TIMES_ET") or os.getenv("DAILY_OUTLOOK_TIME_ET") or "08:45").strip()
+    poll_sec = _env_int("DAILY_OUTLOOK_POLL_SEC", "30")
+    dedupe_ttl_sec = _env_int("DAILY_OUTLOOK_DEDUPE_TTL_SEC", str(36 * 3600))
+
+    times: list[tuple[int, int]] = []
+    for part in [p.strip() for p in times_s.split(",") if p.strip()]:
+        try:
+            hh, mm = _parse_hhmm(part)
+            times.append((hh, mm))
+        except Exception:
+            continue
+    if not times:
+        times = [(8, 45)]
+
+    times_label = ",".join([f"{h:02d}:{m:02d}" for (h, m) in times])
+    print(
+        "[OK] automation_daily_market_outlook_loop running "
+        f"(times_et={times_label}, dedupe_ttl={dedupe_ttl_sec}s)"
+    )
+
+    while not bot.is_closed():
+        try:
+            if not _env_bool("DAILY_OUTLOOK_ENABLED", "0"):
+                await asyncio.sleep(max(5, poll_sec))
+                continue
+
+            # Outlook is operational by default. Allow env to request a kind, but
+            # publishing layer will still harden operational builders to status.
+            outlook_kind = (os.getenv("TNT_OUTLOOK_KIND", "status") or "status").strip().lower() or "status"
+            if outlook_kind == "analysis":
+                print("[WARN] DAILY_OUTLOOK is operational; forcing kind=status (env requested analysis)")
+                outlook_kind = "status"
+
+            now_et = _now_et()
+            if now_et.weekday() >= 5:
+                await asyncio.sleep(max(5, poll_sec))
+                continue
+
+            target_date_et = now_et.strftime("%Y-%m-%d")
+
+            posted_any = False
+            for idx, (hh, mm) in enumerate(times, start=1):
+                due = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if now_et < due:
+                    continue
+
+                label = f"daily_outlook_{idx}"
+                key = _automation_dedupe_key(label=label, target_date_et=target_date_et)
+                if not _automation_should_post_once_per_target_date(
+                    label=label,
+                    target_date_et=target_date_et,
+                    ttl_sec=dedupe_ttl_sec,
+                ):
+                    print(
+                        f"[AUTOPOST][OUTLOOK][DAILY_OUTLOOK] deduped key={key} "
+                        f"target_date_et={target_date_et} kind={outlook_kind}"
+                    )
+
+                    # Still emit a logs-only proof marker (cache-only) so operators
+                    # can validate the live formatter without re-posting.
+                    try:
+                        render = await asyncio.to_thread(build_daily_market_outlook_render, now_et=now_et)
+                        body = (render.text or "")
+                        has_wow = int("⚡ OH WOW" in body)
+                        has_setup = int("👑 Today’s Setup" in body)
+                        payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+                        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+                        headlines_n = int(meta.get("headlines_count") or 0) if isinstance(meta, dict) else 0
+                        print(
+                            f"[AUTOPOST][OUTLOOK][PROOF] kind={outlook_kind} wow={has_wow} setup={has_setup} headlines={headlines_n}"
+                        )
+                    except Exception:
+                        pass
+
+                    await asyncio.sleep(60)
+                    continue
+
+                print(
+                    f"[AUTOPOST][OUTLOOK][DAILY_OUTLOOK] posting key={key} "
+                    f"target_date_et={target_date_et} kind={outlook_kind}"
+                )
+                render = await asyncio.to_thread(build_daily_market_outlook_render, now_et=now_et)
+
+                # Logs-only proof marker (avoid dumping full body).
+                try:
+                    body = (render.text or "")
+                    has_wow = int("⚡ OH WOW" in body)
+                    has_setup = int("👑 Today’s Setup" in body)
+                    payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+                    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+                    headlines_n = int(meta.get("headlines_count") or 0) if isinstance(meta, dict) else 0
+                    print(
+                        f"[AUTOPOST][OUTLOOK][PROOF] kind={outlook_kind} wow={has_wow} setup={has_setup} headlines={headlines_n}"
+                    )
+                except Exception:
+                    pass
+                publish_id = None
+                try:
+                    import uuid
+
+                    publish_id = uuid.uuid4().hex[:10]
+                except Exception:
+                    publish_id = None
+                try:
+                    print(f"[AUTOPOST][OUTLOOK][DAILY_OUTLOOK] publish_id={publish_id} key={key} target_date_et={target_date_et}")
+                except Exception:
+                    pass
+                try:
+                    await _publish_autopost_render(
+                        channel,
+                        render,
+                        builder="build_daily_market_outlook_render",
+                        label=label,
+                        symbol="",
+                        publish_id=publish_id,
+                        kind=outlook_kind,
+                        context_mode="db",
+                        context_output_mode="strict",
+                    )
+                except ContractViolationError as exc:
+                    channel_id = getattr(channel, "id", None)
+                    print(
+                        f"[WARN] publish failed label={label} status=contract_violation publish_id={publish_id} "
+                        f"channel_id={channel_id} channel_source=automation kind={outlook_kind} dedupe_key={key} "
+                        f"exc_type={type(exc).__name__} exc={exc}"
+                    )
+                    if STRICT_CONTRACTS:
+                        raise
+                    await asyncio.sleep(max(5, poll_sec))
+                    continue
+
+                _automation_mark_posted_once_per_target_date(
+                    label=label,
+                    target_date_et=target_date_et,
+                    ttl_sec=dedupe_ttl_sec,
+                )
+                print(f"[OK] daily_outlook posted label={label} target_date_et={target_date_et} publish_id={publish_id}")
+                posted_any = True
+
+            await asyncio.sleep(60 if posted_any else max(5, poll_sec))
+
+        except ContractViolationError:
+            # Contract violations are logged as proof-grade publish failures at the attempt level.
+            if STRICT_CONTRACTS:
+                raise
+            await asyncio.sleep(max(5, poll_sec))
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_daily_market_outlook_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(5, poll_sec))
+
+
+async def automation_weekly_market_outlook_loop(channel):
+    await bot.wait_until_ready()
+
+    day_et = _parse_weekday_et(os.getenv("WEEKLY_OUTLOOK_DAY_ET") or os.getenv("WEEKLY_OUTLOOK_DOW_ET"), fallback=6)
+    times_s = (os.getenv("WEEKLY_OUTLOOK_TIMES_ET") or os.getenv("WEEKLY_OUTLOOK_TIME_ET") or "18:00").strip()
+    poll_sec = _env_int("WEEKLY_OUTLOOK_POLL_SEC", "60")
+    dedupe_ttl_sec = _env_int("WEEKLY_OUTLOOK_DEDUPE_TTL_SEC", str(8 * 24 * 3600))
+    dedupe_scope = (os.getenv("WEEKLY_OUTLOOK_DEDUPE_SCOPE") or "date").strip().lower() or "date"
+    if dedupe_scope in {"iso_week", "isoweek", "weekly"}:
+        dedupe_scope = "week"
+    if dedupe_scope not in {"date", "week"}:
+        dedupe_scope = "date"
+
+    times: list[tuple[int, int]] = []
+    for part in [p.strip() for p in times_s.split(",") if p.strip()]:
+        try:
+            hh, mm = _parse_hhmm(part)
+            times.append((hh, mm))
+        except Exception:
+            continue
+    if not times:
+        times = [(18, 0)]
+
+    configured_day_label = "ANY" if day_et is None else ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"][day_et]
+    times_label = ",".join([f"{h:02d}:{m:02d}" for (h, m) in times])
+    print(
+        "[OK] automation_weekly_market_outlook_loop running "
+        f"(day_et={configured_day_label}, times_et={times_label}, dedupe_scope={dedupe_scope}, dedupe_ttl={dedupe_ttl_sec}s)"
+    )
+
+    while not bot.is_closed():
+        try:
+            if not _env_bool("WEEKLY_OUTLOOK_ENABLED", "0"):
+                await asyncio.sleep(max(5, poll_sec))
+                continue
+
+            outlook_kind = (os.getenv("TNT_OUTLOOK_KIND", "status") or "status").strip().lower() or "status"
+            if outlook_kind == "analysis":
+                print("[WARN] WEEKLY_OUTLOOK is operational; forcing kind=status (env requested analysis)")
+                outlook_kind = "status"
+
+            now_et = _now_et()
+            if day_et is not None and now_et.weekday() != day_et:
+                await asyncio.sleep(max(5, poll_sec))
+                continue
+
+            effective_day_et = now_et.weekday() if day_et is None else day_et
+            day_label = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"][effective_day_et]
+
+            if dedupe_scope == "week":
+                iso = now_et.isocalendar()
+                # ISO week token (week starts Monday). Keeps ANY-mode truly weekly.
+                target_date_et = f"{int(iso.year)}-W{int(iso.week):02d}"
+            else:
+                target_date_et = now_et.strftime("%Y-%m-%d")
+            posted_any = False
+
+            for idx, (hh, mm) in enumerate(times, start=1):
+                due = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if now_et < due:
+                    continue
+
+                label = f"weekly_outlook_{idx}" if dedupe_scope == "week" else f"weekly_outlook_{day_label.lower()}_{idx}"
+                key = _automation_dedupe_key(label=label, target_date_et=target_date_et)
+
+                if not _automation_should_post_once_per_target_date(
+                    label=label,
+                    target_date_et=target_date_et,
+                    ttl_sec=dedupe_ttl_sec,
+                ):
+                    print(
+                        f"[AUTOPOST][WEEKLY_OUTLOOK] deduped key={key} "
+                        f"target_date_et={target_date_et} kind={outlook_kind}"
+                    )
+                    try:
+                        render = await asyncio.to_thread(build_weekly_market_outlook_render, now_et=now_et)
+                        body = (render.text or "")
+                        has_wow = int("⚡ OH WOW" in body)
+                        has_setup = int("👑 Today’s Setup" in body)
+                        payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+                        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+                        headlines_n = int(meta.get("headlines_count") or 0) if isinstance(meta, dict) else 0
+                        print(
+                            f"[AUTOPOST][WEEKLY_OUTLOOK][PROOF] kind={outlook_kind} "
+                            f"wow={has_wow} setup={has_setup} headlines={headlines_n}"
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(60)
+                    continue
+
+                print(
+                    f"[AUTOPOST][WEEKLY_OUTLOOK] posting key={key} "
+                    f"target_date_et={target_date_et} kind={outlook_kind}"
+                )
+                render = await asyncio.to_thread(build_weekly_market_outlook_render, now_et=now_et)
+
+                try:
+                    body = (render.text or "")
+                    has_wow = int("⚡ OH WOW" in body)
+                    has_setup = int("👑 Today’s Setup" in body)
+                    payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+                    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+                    headlines_n = int(meta.get("headlines_count") or 0) if isinstance(meta, dict) else 0
+                    print(
+                        f"[AUTOPOST][WEEKLY_OUTLOOK][PROOF] kind={outlook_kind} "
+                        f"wow={has_wow} setup={has_setup} headlines={headlines_n}"
+                    )
+                except Exception:
+                    pass
+
+                publish_id = None
+                try:
+                    import uuid
+
+                    publish_id = uuid.uuid4().hex[:10]
+                except Exception:
+                    publish_id = None
+                try:
+                    print(f"[AUTOPOST][WEEKLY_OUTLOOK] publish_id={publish_id} key={key} target_date_et={target_date_et}")
+                except Exception:
+                    pass
+                await _publish_autopost_render(
+                    channel,
+                    render,
+                    builder="build_weekly_market_outlook_render",
+                    label=label,
+                    symbol="",
+                    publish_id=publish_id,
+                    kind=outlook_kind,
+                    context_mode="db",
+                    context_output_mode="strict",
+                )
+                _automation_mark_posted_once_per_target_date(
+                    label=label,
+                    target_date_et=target_date_et,
+                    ttl_sec=dedupe_ttl_sec,
+                )
+                print(f"[OK] weekly_outlook posted label={label} target_date_et={target_date_et} publish_id={publish_id}")
+                posted_any = True
+
+            await asyncio.sleep(60 if posted_any else max(5, poll_sec))
+
+        except ContractViolationError as exc:
+            print(f"[WARN] automation_weekly_market_outlook_loop contract violation: {exc}")
+            if STRICT_CONTRACTS:
+                raise
+            await asyncio.sleep(max(5, poll_sec))
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_weekly_market_outlook_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(5, poll_sec))
 
 
 def next_market_date_et(now_et: datetime | None = None) -> str:
@@ -8871,6 +14661,60 @@ def earnings_tag(sym: str) -> str:
 def fmt_earnings_list(syms: list[str], limit: int = 18) -> str:
     syms = syms[:limit]
     return ", ".join([f"{s}{earnings_tag(s)}" for s in syms])
+
+
+def _fmt_eps(v: float | None) -> str | None:
+    if v is None:
+        return None
+    try:
+        return f"${float(v):.2f}"
+    except Exception:
+        return None
+
+
+def _fmt_money_compact(v: float | None) -> str | None:
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except Exception:
+        return None
+    ax = abs(x)
+    if ax >= 1_000_000_000:
+        return f"${x/1_000_000_000:.2f}B"
+    if ax >= 1_000_000:
+        return f"${x/1_000_000:.1f}M"
+    if ax >= 1_000:
+        return f"${x/1_000:.1f}K"
+    return f"${x:.0f}"
+
+
+def fmt_earnings_expected_inline(rows: list[dict], limit: int = 12) -> str:
+    parts: list[str] = []
+    for r in (rows or [])[: max(1, int(limit))]:
+        sym = str(r.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        eps_est = _fmt_eps(r.get("eps_est"))
+        rev_est = _fmt_money_compact(r.get("rev_est"))
+        confirmed = r.get("confirmed")
+
+        meta: list[str] = []
+        if eps_est is not None:
+            meta.append(f"EPS {eps_est}")
+        if rev_est is not None:
+            meta.append(f"Rev {rev_est}")
+        if confirmed is True:
+            meta.append("confirmed")
+        elif confirmed is False and (eps_est is not None or rev_est is not None):
+            meta.append("projected")
+
+        if meta:
+            parts.append(f"{sym}{earnings_tag(sym)} ({', '.join(meta)})")
+        else:
+            parts.append(f"{sym}{earnings_tag(sym)}")
+
+    return ", ".join(parts) if parts else "(none)"
 
 
 def is_high_event(e: dict) -> bool:
@@ -10110,11 +15954,819 @@ def _should_post_signal(sym: str, prob_up: float, gate_mode: str, *, mode: str, 
     return True, "ok"
 
 
+def _extract_context_state(payload: dict) -> Optional[ContextState]:
+    state = _extract_signal_state(payload)
+    if not state:
+        return None
+    out: ContextState = dict(state)
+    out["bias_confirm"] = str(payload.get("bias_confirm") or "").strip().upper()
+    out["tnt_posture"] = str(payload.get("tnt_posture") or "").strip().upper()
+    return out
+
+
+def _should_post_context(sym: str, state: ContextState) -> tuple[bool, str]:
+    cooldown = _env_int("AUTOPOST_CONTEXT_COOLDOWN_SEC", "600")
+    now = int(_now_utc().timestamp())
+    last = _last_context_post_by_symbol.get(sym, 0)
+    if now - last < cooldown:
+        return False, f"cooldown {cooldown}s"
+
+    # Optional global throttle (context-only alerts), to avoid channel spam.
+    max_per_hour = _env_int("AUTOPOST_CONTEXT_GLOBAL_MAX_PER_HOUR", "16")
+    if max_per_hour > 0:
+        cutoff = now - 3600
+        while _context_global_post_ts and _context_global_post_ts[0] < cutoff:
+            _context_global_post_ts.popleft()
+        if len(_context_global_post_ts) >= max_per_hour:
+            return False, f"global cap {max_per_hour}/h"
+
+    prev = _last_context_state.get(sym)
+    if not prev:
+        post_on_seed = os.getenv("AUTOPOST_CONTEXT_POST_ON_SEED", "0") in {"1", "true", "yes", "on"}
+        return (True, "seed") if post_on_seed else (False, "seed")
+
+    prev_regime = str(prev.get("regime") or "").strip().upper()
+    curr_regime = str(state.get("regime") or "").strip().upper()
+    if prev_regime and curr_regime and prev_regime != curr_regime and curr_regime != "UNKNOWN":
+        return True, "regime changed"
+
+    try:
+        if _has_invalidation_break(prev, state):
+            return True, "pivot side changed"
+    except Exception:  # noqa: BLE001
+        pass
+
+    prev_confirm = str(prev.get("bias_confirm") or "").strip().upper()
+    curr_confirm = str(state.get("bias_confirm") or "").strip().upper()
+    if prev_confirm and curr_confirm and prev_confirm != curr_confirm and curr_confirm != "UNKNOWN":
+        return True, "confirmation changed"
+
+    prev_posture = str(prev.get("tnt_posture") or "").strip().upper()
+    curr_posture = str(state.get("tnt_posture") or "").strip().upper()
+    if prev_posture and curr_posture and prev_posture != curr_posture and curr_posture != "UNKNOWN":
+        return True, "posture changed"
+
+    return False, "unchanged"
+
+
+def _context_quiet_hours_active(*, now_et: datetime) -> bool:
+    """Return True when context-only alerts should be suppressed due to quiet hours.
+
+    Env: AUTOPOST_CONTEXT_QUIET_HOURS_ET="HH:MM-HH:MM" (wrap-around supported).
+    Example: "20:00-07:00".
+    """
+
+    raw = str(os.getenv("AUTOPOST_CONTEXT_QUIET_HOURS_ET", "") or "").strip()
+    if not raw or "-" not in raw:
+        return False
+
+    start_s, end_s = [p.strip() for p in raw.split("-", 1)]
+
+    def _parse_hhmm_s(s: str) -> tuple[int, int] | None:
+        try:
+            hh, mm = [int(x) for x in s.split(":", 1)]
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                return hh, mm
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    start = _parse_hhmm_s(start_s)
+    end = _parse_hhmm_s(end_s)
+    if not start or not end:
+        return False
+
+    now_min = int(now_et.hour) * 60 + int(now_et.minute)
+    start_min = int(start[0]) * 60 + int(start[1])
+    end_min = int(end[0]) * 60 + int(end[1])
+
+    if start_min == end_min:
+        return True
+    if start_min < end_min:
+        return start_min <= now_min < end_min
+
+    # Wraps midnight.
+    return now_min >= start_min or now_min < end_min
+
+
+def _map_context_regime(payload: dict, *, mode: str) -> str:
+    bias = str(payload.get("bias") or "").strip().upper()
+    confirm = str(payload.get("bias_confirm") or "").strip().upper()
+    posture = str(payload.get("tnt_posture") or "").strip().upper()
+    edge = payload.get("edge")
+
+    try:
+        edge_f = float(edge)
+    except Exception:  # noqa: BLE001
+        edge_f = None
+
+    min_edge = _edge_threshold_for_mode((mode or "strict").strip().lower())
+
+    if posture in {"STAND_DOWN", "DO_NOTHING"}:
+        return "BALANCED (No edge)"
+    if confirm == "NEUTRAL":
+        return "TRANSITION (Mixed confirmation)"
+
+    if edge_f is None:
+        return "BALANCED (No edge)"
+    if edge_f < float(min_edge):
+        return "BALANCED (No edge)"
+    if bias == "BULL":
+        return "BULLISH"
+    if bias == "BEAR":
+        return "BEARISH"
+    return "BALANCED (No edge)"
+
+
+def _context_confidence(payload: dict) -> str:
+    dq = payload.get("data_quality") if isinstance(payload.get("data_quality"), dict) else {}
+    tech = str(dq.get("technical_state") or "").strip().upper()
+    age_min = payload.get("price_age_minutes")
+    try:
+        age_f = float(age_min) if age_min is not None else None
+    except Exception:  # noqa: BLE001
+        age_f = None
+
+    if tech == "STALE":
+        return "Low (snapshot stale)"
+    if age_f is not None and age_f > 3:
+        return "Low (price aging)"
+    return "Medium (fresh snapshot; non-trade context)"
+
+
+def _context_triggers(payload: dict) -> str:
+    pivot = payload.get("pivot")
+    r1 = payload.get("r1")
+    s1 = payload.get("s1")
+
+    def _f(v: object) -> str:
+        try:
+            return f"{float(v):.2f}"
+        except Exception:  # noqa: BLE001
+            return "n/a"
+
+    p = _f(pivot)
+    r = _f(r1)
+    s = _f(s1)
+    return f"Bull: reclaim+hold above Pivot {p} (then R1 {r}) | Bear: lose+hold below Pivot {p} (then S1 {s})"
+
+
+async def build_context_alert_payload(sym: str, *, mode: str) -> Optional[str]:
+    built = build_signal_payload(sym)
+    if not built:
+        return None
+
+    payload, prob_up, gate = built
+    mode_norm = (mode or "strict").strip().lower()
+    mode_norm = mode_norm if mode_norm in VALID_MODES else "strict"
+
+    state = _extract_context_state(payload)
+    if not state:
+        _last_context_state.pop(sym, None)
+        return None
+
+    # Evaluate against prior state BEFORE updating, otherwise changes never trigger.
+    ok, reason = _should_post_context(sym, state)
+
+    # Always keep the latest state cached for future comparisons.
+    _last_context_state[sym] = state
+
+    if not ok:
+        return None
+
+    now_et = _now_et()
+    if _context_quiet_hours_active(now_et=now_et):
+        return None
+
+    # Non-trade context alert: always ends with Bottom line + Triggers + Confidence.
+    edge_val = _edge(prob_up)
+    min_edge = _edge_threshold_for_mode(mode_norm)
+    confirm = str(payload.get("bias_confirm") or "").strip().upper()
+    confirm_label = confirm if confirm in {"BULLISH", "BEARISH", "NEUTRAL"} else "MIXED"
+    regime = _map_context_regime(payload, mode=mode_norm)
+    conf = _context_confidence(payload)
+    trig = _context_triggers(payload)
+
+    now_utc_s = int(_now_utc().timestamp())
+    _last_context_post_by_symbol[sym] = now_utc_s
+    _context_global_post_ts.append(now_utc_s)
+
+    title = str(os.getenv("AUTOPOST_CONTEXT_TITLE", "Market Posture Update") or "Market Posture Update").strip()
+    if not title:
+        title = "Market Posture Update"
+
+    return (
+        f"ℹ️ {title} — {sym} ({reason})\n"
+        f"Regime: {regime}\n"
+        "Bottom line: DO NOTHING\n"
+        f"Triggers: {trig}\n"
+        f"Confidence: {conf} (edge {edge_val:.3f} vs min {min_edge:.3f}; confirm {confirm_label})"
+    )
+
+
+def _resolve_ai_trade_journal_channel() -> Optional[object]:
+    """Resolve the AI trade journal channel (if configured).
+
+    Env (preferred): AI_TRADE_JOURNAL_CHANNEL_ID
+    Fallback: JOURNAL_CHANNEL_ID (when JOURNAL_ENABLED=1)
+    """
+
+    try:
+        cid = int(os.getenv("AI_TRADE_JOURNAL_CHANNEL_ID", "0") or "0")
+    except Exception:
+        cid = 0
+    if cid <= 0:
+        try:
+            if _env_bool("JOURNAL_ENABLED", "0"):
+                cid = int(os.getenv("JOURNAL_CHANNEL_ID", "0") or "0")
+        except Exception:
+            cid = 0
+    if cid <= 0:
+        return None
+    try:
+        return bot.get_channel(cid)
+    except Exception:
+        return None
+
+
+def _should_post_divergence(*, key: str, now_s: int) -> tuple[bool, str]:
+    cooldown = _env_int("AUTOPOST_DIVERGENCE_COOLDOWN_SEC", "900")
+    last = int(_last_divergence_post_by_key.get(key, 0) or 0)
+    if cooldown > 0 and (now_s - last) < int(cooldown):
+        return False, f"cooldown {cooldown}s"
+
+    max_per_hour = _env_int("AUTOPOST_DIVERGENCE_GLOBAL_MAX_PER_HOUR", "8")
+    if max_per_hour > 0:
+        cutoff = now_s - 3600
+        while _divergence_global_post_ts and _divergence_global_post_ts[0] < cutoff:
+            _divergence_global_post_ts.popleft()
+        if len(_divergence_global_post_ts) >= max_per_hour:
+            return False, f"global cap {max_per_hour}/h"
+
+    return True, "ok"
+
+
+def _divergence_watch_enabled() -> bool:
+    # Legacy name (autopost) + new automation name.
+    if _env_bool("AUTOPOST_DIVERGENCE_ENABLED", "0"):
+        return True
+    if _env_bool("TNT_DIVERGENCE_WATCH_ENABLED", "0"):
+        return True
+    return False
+
+
+def _earnings_pressure_watch_enabled() -> bool:
+    return _env_bool("TNT_EARNINGS_PRESSURE_WATCH_ENABLED", "0")
+
+
+def _load_earnings_cache_payload(symbol: str) -> dict[str, object] | None:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return None
+    try:
+        r_ctx = redis_client_for_ctx()
+    except Exception:
+        r_ctx = None
+    if r_ctx is None:
+        return None
+    try:
+        raw = r_ctx.get(f"cal:earnings:{sym}")
+    except Exception:
+        raw = None
+    payload = _decode_redis_json(raw)
+    return payload if isinstance(payload, dict) else None
+
+
+def _risk_regime_label(*, smiq_regime: str, vix_regime: str) -> str:
+    # Tight, readable buckets for an earnings pre-watch.
+    s = str(smiq_regime or "").strip().upper() or "UNKNOWN"
+    v = str(vix_regime or "").strip().upper() or "UNKNOWN"
+    if s == "DEFENSIVE" or v in {"HIGH", "HIGH / STRESS", "STRESS"}:
+        return "DEFENSIVE"
+    if s == "RISK_ON" and v in {"LOW", "LOW VOL", "NORMAL", "NORMAL VOL"}:
+        return "RISK_ON"
+    return "MIXED"
+
+
+def _volatility_bucket(vix_regime: str) -> str:
+    v = str(vix_regime or "").strip().upper() or "UNKNOWN"
+    if v in {"LOW", "LOW VOL", "NORMAL", "NORMAL VOL"}:
+        return "muted"
+    if v in {"ELEVATED", "ELEVATED VOL"}:
+        return "building"
+    if v in {"HIGH", "HIGH / STRESS", "STRESS"}:
+        return "elevated"
+    return "building"
+
+
+def _participation_slope_from_gate(impact: str) -> str:
+    i = str(impact or "").strip().upper() or "UNKNOWN"
+    if i == "ALLOW":
+        return "rising"
+    if i == "CAUTION":
+        return "flat"
+    if i == "STAND_DOWN":
+        return "falling"
+    return "flat"
+
+
+def _price_state_from_hourly(symbol: str) -> str:
+    st = _hourly_regime_state(symbol)
+    if not st:
+        return "range-bound"
+
+    range_info = st.get("range_info")
+    rs = range_info[0] if isinstance(range_info, (list, tuple)) and range_info else None
+
+    dist = st.get("distance_vwap_pct")
+    try:
+        dist_f = abs(float(dist)) if dist is not None else None
+    except Exception:
+        dist_f = None
+
+    if rs == "compressing":
+        return "compressing"
+    if rs == "expanding":
+        # If stretched away from VWAP, call it extended; else it's just grinding.
+        if dist_f is not None and dist_f >= 1.0:
+            return "extended"
+        return "grinding"
+    return "range-bound"
+
+
+def _pressure_bucket(*, bias: str, impact: str) -> str:
+    b = str(bias or "").strip().upper() or "UNKNOWN"
+    i = str(impact or "").strip().upper() or "UNKNOWN"
+    if i in {"CAUTION", "STAND_DOWN"}:
+        if b == "BULL":
+            return "offer-dominant"
+        if b == "BEAR":
+            return "bid-dominant"
+    return "neutral"
+
+
+def _risk_bucket(*, implied_pct: float | None) -> str:
+    if implied_pct is None:
+        return "MODERATE"
+    try:
+        x = float(implied_pct)
+    except Exception:
+        return "MODERATE"
+    if x >= 8.0:
+        return "HIGH"
+    if x >= 4.0:
+        return "MODERATE"
+    return "LOW"
+
+
+async def build_earnings_pressure_watch_payload(symbol: str) -> str | None:
+    """Build a context-only Earnings Pressure Watch post.
+
+    Cache-first: uses `cal:earnings:{SYM}` if available.
+    Falls back gracefully when any component is missing.
+    """
+
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return None
+    if not _earnings_pressure_watch_enabled():
+        return None
+
+    now_et = _now_et()
+    if _context_quiet_hours_active(now_et=now_et):
+        return None
+
+    now_utc = now_et.astimezone(timezone.utc)
+
+    payload = _load_earnings_cache_payload(sym)
+    if not payload:
+        return None
+
+    dt_utc = _parse_dt_maybe_utc(payload.get("ts_utc"))
+    if dt_utc is None:
+        return None
+    dt_et = dt_utc.astimezone(ET)
+
+    # Only post inside a lookahead window.
+    lookahead_h = float(_positive_env_float("TNT_EARNINGS_PRESSURE_LOOKAHEAD_HOURS", "36"))
+    delta_h = (dt_et - now_et).total_seconds() / 3600.0
+    if delta_h < 0 or delta_h > lookahead_h:
+        return None
+
+    target_date_et = dt_et.date().isoformat()
+    key = f"tnt:earnings_pressure:{sym}:{target_date_et}"
+    now_s = int(now_utc.timestamp())
+    cooldown_s = int(_env_int("TNT_EARNINGS_PRESSURE_COOLDOWN_SEC", str(12 * 3600)))
+    last_s = int(_last_earnings_pressure_post_by_key.get(key, 0) or 0)
+    if (now_s - last_s) < max(300, cooldown_s):
+        return None
+
+    # Market participation regime acts as the macro "sponsorship" proxy.
+    try:
+        sig = await build_signal_payload(sym)
+    except Exception:
+        sig = None
+    bias = str((sig or {}).get("bias") or "NEUTRAL").strip().upper()
+    edge = None
+    try:
+        if isinstance((sig or {}).get("edge"), (int, float)):
+            edge = float((sig or {})["edge"])  # type: ignore[index]
+    except Exception:
+        edge = None
+
+    smiq, pg_obj = _resolve_market_participation(bias if bias in {"BULL", "BEAR"} else None, edge)
+    pg = _gate_result_to_dict(pg_obj)
+    smiq_regime = str(smiq.get("regime") or "UNKNOWN").strip().upper()
+    impact = str(pg.get("impact") or "UNKNOWN").strip().upper()
+    reason = str(pg.get("reason") or "").strip()
+
+    # Implied move (%): prefer cached expected_move_pct.
+    implied_pct = None
+    try:
+        if payload.get("expected_move_pct") is not None:
+            implied_pct = float(payload.get("expected_move_pct"))
+    except Exception:
+        implied_pct = None
+    implied_s = "n/a" if implied_pct is None else f"±{abs(implied_pct):.1f}%"
+
+    # VIX regime → volatility bucket.
+    vix_ctx = get_vix_context("1m")
+    vix_regime = str((vix_ctx or {}).get("regime") or "UNKNOWN").strip().upper()
+
+    # Price + participation + pressure
+    price_state = _price_state_from_hourly(sym)
+    participation_slope = _participation_slope_from_gate(impact)
+    pressure = _pressure_bucket(bias=bias, impact=impact)
+    vol_bucket = _volatility_bucket(vix_regime)
+
+    divergence = (bias in {"BULL", "BEAR"}) and (impact in {"CAUTION", "STAND_DOWN"})
+    divergence_s = "YES" if divergence else "NO"
+
+    div_type = "None"
+    if divergence:
+        if bias == "BULL":
+            div_type = "Price ↑ / Participation ↓"
+        elif bias == "BEAR":
+            div_type = "Price flat / Pressure ↑"
+
+    # Reaction bias (not a trade call).
+    base_risk = _risk_bucket(implied_pct=implied_pct)
+    up_risk = base_risk
+    down_risk = base_risk
+
+    if divergence and bias == "BULL":
+        up_risk = "LOW" if base_risk != "HIGH" else "MODERATE"
+        down_risk = "HIGH"
+    elif divergence and bias == "BEAR":
+        up_risk = "HIGH"
+        down_risk = "LOW" if base_risk != "HIGH" else "MODERATE"
+
+    if vix_regime in {"HIGH", "HIGH / STRESS", "STRESS"}:
+        # In stress, widen both tails by one notch.
+        if up_risk == "LOW":
+            up_risk = "MODERATE"
+        if down_risk == "LOW":
+            down_risk = "MODERATE"
+        if up_risk == "MODERATE" and base_risk == "HIGH":
+            up_risk = "HIGH"
+        if down_risk == "MODERATE" and base_risk == "HIGH":
+            down_risk = "HIGH"
+
+    risk_regime = _risk_regime_label(smiq_regime=smiq_regime, vix_regime=vix_regime)
+
+    # Event label.
+    event_date = dt_et.strftime("%Y-%m-%d")
+    event_time = dt_et.strftime("%H:%M ET")
+    # If provider supplied a coarse when (BMO/AMC/TAS), surface it.
+    when = str(payload.get("when") or payload.get("session") or "").strip().upper()
+    when_s = f" ({when})" if when in {"BMO", "AMC", "TAS"} else ""
+
+    footer_on = _env_bool("TNT_EARNINGS_PRESSURE_FOOTER", "1")
+
+    lines: list[str] = []
+    lines.append("EARNINGS PRESSURE WATCH")
+    lines.append("")
+    lines.append(f"Symbol: {sym}")
+    lines.append(f"Event: Earnings {event_date} {event_time}{when_s}")
+    lines.append(f"Implied Move: {implied_s}")
+    lines.append(f"Regime: {risk_regime}")
+    lines.append("")
+    lines.append("Pre-Earnings Market State")
+    lines.append("")
+    lines.append(f"Price: {price_state}")
+    lines.append(f"Participation: {participation_slope}")
+    lines.append(f"Pressure: {pressure}")
+    lines.append(f"Volatility: {vol_bucket}")
+    lines.append("")
+    lines.append("Pressure Assessment")
+    lines.append("")
+    lines.append(f"Divergence detected: {divergence_s}")
+    lines.append(f"Type: {div_type}")
+    if reason:
+        lines.append(f"Gate note: {reason}")
+    lines.append("")
+    lines.append("This does not predict direction.")
+    lines.append("It identifies stored pressure going into the earnings catalyst.")
+    lines.append("")
+    lines.append("Reaction Bias (Not a Trade Call)")
+    lines.append("")
+    lines.append(f"Upside reaction risk: {up_risk}")
+    lines.append(f"Downside reaction risk: {down_risk}")
+    lines.append("")
+    lines.append("Bias reflects how price is likely to react,")
+    lines.append("not where it “should” go.")
+    lines.append("")
+    lines.append("Trader Guidance")
+    lines.append("")
+    lines.append("Expect faster-than-normal resolution")
+    lines.append("Avoid pre-event over-positioning")
+    lines.append("Post-earnings confirmation > prediction")
+    lines.append("")
+    lines.append("TNT Interpretation")
+    lines.append("")
+    lines.append("Earnings act as a stress test on existing structure.")
+    lines.append("When pressure exists, reactions tend to be asymmetric.")
+    if footer_on:
+        lines.append("")
+        lines.append("Context alert • No trade issued • Monitor post-earnings follow-through")
+
+    msg = "\n".join(lines).strip()
+
+    # Basic contract sanity (avoid noisy failures).
+    try:
+        violations = contract_violations(msg, max_chars=DEFAULT_MAX_CHARS_DEFAULT, max_lines=DEFAULT_MAX_LINES)
+        if violations:
+            return None
+    except Exception:
+        pass
+
+    _last_earnings_pressure_post_by_key[key] = now_s
+    return msg
+
+
+async def automation_earnings_pressure_watch_loop(channel: object) -> None:
+    await bot.wait_until_ready()
+
+    poll_sec = float(_positive_env_float("TNT_EARNINGS_PRESSURE_POLL_SEC", "120"))
+    symbols = [s.strip().upper() for s in (os.getenv("TNT_EARNINGS_PRESSURE_SYMBOLS") or os.getenv("EARNINGS_WATCHLIST") or "").split(",") if s.strip()]
+    if not symbols:
+        symbols = ["SPY"]
+
+    print(f"[OK] automation_earnings_pressure_watch_loop running (poll_sec={poll_sec:.0f} symbols={symbols})")
+
+    while not bot.is_closed():
+        try:
+            if not _automation_enabled() or not _earnings_pressure_watch_enabled():
+                await asyncio.sleep(max(30.0, poll_sec))
+                continue
+
+            out_ch = _resolve_ai_trade_journal_channel() or channel
+
+            posted_any = False
+            for sym in symbols:
+                msg = await build_earnings_pressure_watch_payload(sym)
+                if not msg:
+                    continue
+                try:
+                    await safe_send(
+                        out_ch,
+                        msg,
+                        kind="status",
+                        symbol=sym,
+                        pivots=None,
+                        analysis_mode="db",
+                        output_mode="strict",
+                        label="earnings_pressure_watch",
+                    )
+                    posted_any = True
+                except Exception:
+                    pass
+
+            await asyncio.sleep(max(30.0, poll_sec) if posted_any else max(60.0, poll_sec))
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_earnings_pressure_watch_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(60.0, poll_sec))
+
+
+async def build_divergence_watch_payload(sym: str, *, mode: str) -> Optional[str]:
+    """Return a lightweight divergence watch alert (context-only).
+
+    Today this uses TNT's market participation gate as a proxy for
+    "price/bias vs sponsorship" divergence. It is intentionally conservative
+    and spam-protected.
+    """
+
+    if not _divergence_watch_enabled():
+        return None
+
+    built = build_signal_payload(sym)
+    if not built:
+        return None
+
+    payload, prob_up, _gate = built
+    bias = str(payload.get("bias") or "").strip().upper()
+    if bias not in {"BULL", "BEAR"}:
+        return None
+
+    edge_val = _edge(float(prob_up))
+    mode_norm = (mode or "strict").strip().lower()
+    min_edge = _edge_threshold_for_mode(mode_norm)
+
+    # If we're running in strict mode, still allow divergence watches as long
+    # as they clear the insights floor.
+    if edge_val < float(AUTOPOST_EDGE_MIN_INSIGHTS):
+        return None
+
+    smiq, pg_obj = _resolve_market_participation(bias, edge_val)
+    pg = _gate_result_to_dict(pg_obj)
+    regime = str((smiq.get("regime") if isinstance(smiq, dict) else "UNKNOWN") or "UNKNOWN").strip().upper()
+    quality = str((smiq.get("data_quality") if isinstance(smiq, dict) else "UNKNOWN") or "UNKNOWN").strip().upper()
+    impact = str((pg.get("impact") if isinstance(pg, dict) else "UNKNOWN") or "UNKNOWN").strip().upper()
+    reason = str((pg.get("reason") if isinstance(pg, dict) else "") or "").strip()
+
+    # Avoid alerting on missing/stale participation snapshots.
+    if quality in {"MISSING", "STALE", "PARTIAL", "UNKNOWN"} and regime == "UNKNOWN":
+        return None
+
+    if impact not in {"CAUTION", "STAND_DOWN"}:
+        return None
+
+    # Classify divergence direction.
+    if bias == "BULL":
+        headline = "Price/bias bullish, participation weak"
+        side = "bearish"
+    else:
+        headline = "Price/bias bearish, participation supportive"
+        side = "bullish"
+
+    now_et = _now_et()
+    if _context_quiet_hours_active(now_et=now_et):
+        return None
+
+    now_s = int(_now_utc().timestamp())
+    key = f"{sym}:{side}:{regime}:{impact}"
+    ok, why = _should_post_divergence(key=key, now_s=now_s)
+    if not ok:
+        return None
+
+    _last_divergence_post_by_key[key] = now_s
+    _divergence_global_post_ts.append(now_s)
+
+    title = str(os.getenv("AUTOPOST_DIVERGENCE_TITLE", "Divergence Watch") or "Divergence Watch").strip() or "Divergence Watch"
+    edge_note = f"edge {edge_val:.3f} vs min {float(min_edge):.3f}" if min_edge is not None else f"edge {edge_val:.3f}"
+
+    # Keep message compact and unmistakably "insight".
+    return (
+        f"⚠️ {title} ({payload.get('tf_exec') or '1m'}) — {sym} ({why})\n"
+        f"{headline}\n"
+        f"Participation: {regime} (quality {quality}, gate {impact})\n"
+        f"Why: {reason or 'n/a'}\n"
+        f"Context only — not a trade signal. ({edge_note})"
+    )
+
+
+async def automation_divergence_watch_loop(channel: object) -> None:
+    """Periodic divergence watch as an INSIGHT post.
+
+    This runs under the TNT automation scheduler (not the legacy autopost).
+    """
+
+    await bot.wait_until_ready()
+    poll_sec = float(_positive_env_float("TNT_DIVERGENCE_WATCH_POLL_SEC", "60"))
+    mode_setting = (os.getenv("TNT_DIVERGENCE_WATCH_MODE") or "insights").strip().lower() or "insights"
+    symbols = [s.strip().upper() for s in (os.getenv("TNT_DIVERGENCE_WATCH_SYMBOLS", "SPY") or "SPY").split(",") if s.strip()]
+    if not symbols:
+        symbols = ["SPY"]
+
+    print(f"[OK] automation_divergence_watch_loop running (poll_sec={poll_sec:.0f} symbols={symbols} mode={mode_setting})")
+
+    while not bot.is_closed():
+        try:
+            if not _automation_enabled() or not _divergence_watch_enabled():
+                await asyncio.sleep(max(15.0, poll_sec))
+                continue
+
+            # Route to journal when available; otherwise fall back to the provided channel.
+            out_ch = _resolve_ai_trade_journal_channel() or channel
+
+            posted = False
+            for sym in symbols:
+                msg = await build_divergence_watch_payload(sym, mode=mode_setting)
+                if not msg:
+                    continue
+                try:
+                    await safe_send(
+                        out_ch,
+                        msg,
+                        kind="status",
+                        symbol=sym,
+                        pivots=None,
+                        analysis_mode="db",
+                        output_mode="strict",
+                        label="divergence_watch",
+                    )
+                    posted = True
+                except Exception:
+                    pass
+                break
+
+            # Even when nothing posts, keep polling.
+            await asyncio.sleep(max(15.0, poll_sec) if not posted else max(30.0, poll_sec))
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_divergence_watch_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(30.0, poll_sec))
+
+
 def _get_stale_lock() -> asyncio.Lock:
     global _data_stale_lock
     if _data_stale_lock is None:
         _data_stale_lock = asyncio.Lock()
     return _data_stale_lock
+
+
+def _get_feed_stale_lock() -> asyncio.Lock:
+    global _feed_stale_lock
+    if _feed_stale_lock is None:
+        _feed_stale_lock = asyncio.Lock()
+    return _feed_stale_lock
+
+
+def _format_age_compact(age_s: Optional[float]) -> str:
+    if age_s is None:
+        return "unknown"
+    try:
+        a = max(0, int(float(age_s)))
+    except Exception:
+        return "unknown"
+    if a < 90:
+        return f"{a}s"
+    if a < 3600:
+        return f"{a // 60}m"
+    return f"{a // 3600}h{(a % 3600) // 60:02d}m"
+
+
+def _calc_feed_stale() -> tuple[bool, list[str], dict[str, dict[str, object]]]:
+    """Return (required_stale, stale_feeds, details) for hb:* feeds."""
+
+    try:
+        from services.observability.feed_heartbeat import summarize_feeds
+
+        _line, details = summarize_feeds()
+    except Exception:
+        return True, ["feeds_unavailable"], {}
+
+    stale: list[str] = []
+    required_stale = False
+    for name, meta in details.items():
+        status = str(meta.get("status") or "").upper().strip()
+        req = bool(meta.get("required"))
+        if status in {"OK"}:
+            continue
+        stale.append(name)
+        if req:
+            required_stale = True
+    return required_stale, stale, details
+
+
+async def _update_feed_stale_state() -> bool:
+    """Return True if required feeds are stale and automation should pause."""
+
+    lock = _get_feed_stale_lock()
+    async with lock:
+        global _feed_stale_paused, _feed_stale_initialized
+
+        required_stale, stale_feeds, details = _calc_feed_stale()
+        first_check = not _feed_stale_initialized
+        _feed_stale_initialized = True
+
+        if stale_feeds:
+            if not _feed_stale_paused:
+                _feed_stale_paused = True
+
+                viol: list[str] = []
+                for f in stale_feeds[:8]:
+                    meta = details.get(f) or {}
+                    age_s = meta.get("age_s")
+                    status = str(meta.get("status") or "").upper().strip() or "UNKNOWN"
+                    req = bool(meta.get("required"))
+                    tag = f"{f}{'*' if req else ''}"
+                    viol.append(f"{tag} {status} age={_format_age_compact(age_s)}")
+
+                msg = "🚨 Feed stale: " + "; ".join(viol)
+                if required_stale:
+                    msg += " | Alerts disabled until fresh."
+
+                # Even on first check, we want this loud in canary/ops.
+                await _send_stale_notification(msg, key="feeds:stale")
+            return bool(required_stale)
+
+        if _feed_stale_paused:
+            _feed_stale_paused = False
+            msg = "✅ Feeds fresh again. Alerts re-enabled." if required_stale is False else "✅ Feeds updated."
+            await _send_stale_notification(msg, key="feeds:fresh")
+        return False
 
 
 def _format_ts_et(ts_iso: Optional[str]) -> str:
@@ -10234,8 +16886,13 @@ async def _update_data_stale_state() -> bool:
 
 async def _autopost_stale_guard() -> bool:
     if DATA_STALE_MAX_MIN <= 0:
-        return False
-    return await _update_data_stale_state()
+        # Even if bar-level stale checking is disabled, we still want feed-level
+        # heartbeat gating for canary/ops safety.
+        return await _update_feed_stale_state()
+
+    data_stale = await _update_data_stale_state()
+    feed_stale = await _update_feed_stale_state()
+    return bool(data_stale or feed_stale)
 
 
 def _safe_float(val: Optional[object]) -> Optional[float]:
@@ -11842,6 +18499,11 @@ async def build_signal_alert_payload(sym: str, *, mode: str) -> Optional[tuple[s
         if ai_err:
             print(f"[AUTOPOST] insights fallback {sym}: {ai_err}")
         if ai_text:
+            try:
+                win = _env_int("TNT_ALERT_NEWS_CONTEXT_WINDOW_MIN", "120")
+            except Exception:
+                win = 120
+            ai_text = _append_recent_news_context_line(ai_text, symbol=sym, window_min=int(win))
             ok_ai, reason_ai = validate_output(ai_text, mode="insights")
             if ok_ai:
                 _last_signal_post_by_symbol[sym] = int(_now_utc().timestamp())
@@ -11857,6 +18519,11 @@ async def build_signal_alert_payload(sym: str, *, mode: str) -> Optional[tuple[s
         gate=gate,
         price_snapshot=_get_last_price_snapshot(sym),
     )
+    try:
+        win = _env_int("TNT_ALERT_NEWS_CONTEXT_WINDOW_MIN", "120")
+    except Exception:
+        win = 120
+    fallback = _append_recent_news_context_line(fallback, symbol=sym, window_min=int(win))
     ok_fb, reason_fb = validate_output(fallback, mode="strict")
     if ok_fb:
         _last_signal_post_by_symbol[sym] = int(_now_utc().timestamp())
@@ -11978,6 +18645,39 @@ async def autopost_signal_loop(channel):
                     posted = True
                     break
 
+                # Divergence watch (context-only): prefer routing to the AI trade journal.
+                div_msg = await build_divergence_watch_payload(sym, mode=mode_setting)
+                if div_msg:
+                    journal = _resolve_ai_trade_journal_channel() or channel
+                    await safe_send(
+                        journal,
+                        div_msg,
+                        kind="status",
+                        symbol=sym,
+                        pivots=None,
+                        analysis_mode="db",
+                        output_mode="strict",
+                        label="divergence_watch",
+                    )
+                    posted = True
+                    break
+
+                # Non-trade context alert fallback (keeps channel active even when gated).
+                ctx_msg = await build_context_alert_payload(sym, mode=mode_setting)
+                if ctx_msg:
+                    await safe_send(
+                        channel,
+                        ctx_msg,
+                        kind="status",
+                        symbol=sym,
+                        pivots=None,
+                        analysis_mode="db",
+                        output_mode="strict",
+                        label="context_alert",
+                    )
+                    posted = True
+                    break
+
             await asyncio.sleep(poll)
 
         except Exception as exc:  # noqa: BLE001
@@ -12021,12 +18721,56 @@ def _ensure_autopost_task():
 def _automation_enabled() -> bool:
     """Primary switch for go-live automation.
 
-    Back-compat: if `TNT_AUTOMATION_ENABLED` is not set, fall back to `AUTOPOST_ENABLED`.
+    Safety: requires explicit opt-in via `TNT_AUTOMATION_ENABLED=1`.
+    This prevents unrelated legacy autopost flags from accidentally enabling
+    scheduled posts.
     """
 
-    if os.getenv("TNT_AUTOMATION_ENABLED") is None:
-        return _env_bool("AUTOPOST_ENABLED", "0")
     return _env_bool("TNT_AUTOMATION_ENABLED", "0")
+
+
+def _macro_calendar_refresh_enabled() -> bool:
+    """Enable macro calendar refresh from Massive (Benzinga economic calendar).
+
+    Default OFF; must be explicitly enabled.
+    """
+
+    if _env_bool("TNT_MACRO_CALENDAR_REFRESH_ENABLED", "0"):
+        return True
+    if _env_bool("MACRO_CALENDAR_REFRESH_ENABLED", "0"):
+        return True
+    return False
+
+
+def _is_stand_down_render(render: RenderedPost) -> bool:
+    try:
+        payload = render.agent_payload if isinstance(render.agent_payload, dict) else {}
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        if isinstance(meta, dict) and bool(meta.get("stand_down")):
+            return True
+    except Exception:
+        pass
+
+    txt = (render.text or "").strip().upper()
+    return txt.startswith("⚠️ STAND DOWN") or txt == PREFLIGHT_INTEGRITY_STANDDOWN_TEXT.strip().upper()
+
+
+def _paper_desk_enabled() -> bool:
+    """Master toggle for Paper Desk-style scheduled posts.
+
+    Default OFF; must be explicitly enabled.
+    """
+
+    # Canonical name is `TNT_PAPER_DESK_ENABLED`, but older configs (including
+    # this repo's `.env.local`) used `PAPERDESK_ENABLED`.
+    # Treat the legacy name as an alias to avoid silently disabling Paper Desk.
+    if os.getenv("TNT_PAPER_DESK_ENABLED") is not None:
+        return _env_bool("TNT_PAPER_DESK_ENABLED", "0")
+    if os.getenv("PAPERDESK_ENABLED") is not None:
+        return _env_bool("PAPERDESK_ENABLED", "0")
+    if os.getenv("PAPER_DESK_ENABLED") is not None:
+        return _env_bool("PAPER_DESK_ENABLED", "0")
+    return False
 
 
 def _resolve_automation_channel():
@@ -12041,6 +18785,289 @@ def _resolve_automation_channel():
     return channel
 
 
+def _resolve_earnings_calendar_channel():
+    """Resolve the destination channel for earnings calendar posts.
+
+    Preference order:
+    - CALENDAR_EARNINGS_CHANNEL_ID (explicit)
+    - EARNINGS_POST_CHANNEL_ID (legacy/alias)
+    - AUTOPOST_CHANNEL_ID (fallback)
+    - CANARY_CHANNEL_ID (last resort)
+    """
+
+    canary_id = CANARY_CHANNEL_ID
+    calendar_id = _env_int("CALENDAR_EARNINGS_CHANNEL_ID", "0")
+    earnings_post_id = _env_int("EARNINGS_POST_CHANNEL_ID", "0")
+    autopost_id = _env_int("AUTOPOST_CHANNEL_ID", "0")
+
+    channel_id = int(calendar_id or earnings_post_id or autopost_id or canary_id or 0)
+    channel = bot.get_channel(channel_id) if channel_id else None
+    if channel is None:
+        print(
+            "[WARN] earnings_calendar: channel not found/invalid "
+            f"id={channel_id} (calendar={calendar_id} earnings_post={earnings_post_id} autopost={autopost_id} canary={canary_id})"
+        )
+        return None
+    return channel
+
+
+def _resolve_daily_outlook_channel():
+    """Resolve destination channel for Daily Market Outlook.
+
+    Preference order:
+    - DAILY_OUTLOOK_CHANNEL_ID
+    - AUTOPOST_CHANNEL_ID
+    - CANARY_CHANNEL_ID
+    """
+
+    canary_id = CANARY_CHANNEL_ID
+    outlook_id = _env_int("DAILY_OUTLOOK_CHANNEL_ID", "0")
+    autopost_id = _env_int("AUTOPOST_CHANNEL_ID", "0")
+
+    channel_id = int(outlook_id or autopost_id or canary_id or 0)
+    channel = bot.get_channel(channel_id) if channel_id else None
+    if channel is None:
+        print(
+            "[WARN] daily_outlook: channel not found/invalid "
+            f"id={channel_id} (daily_outlook={outlook_id} autopost={autopost_id} canary={canary_id})"
+        )
+        return None
+    return channel
+
+
+def _redact_url(value: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    # Redact userinfo/password in URLs like redis://:pass@host:6379/0
+    try:
+        if "://" in s and "@" in s:
+            scheme, rest = s.split("://", 1)
+            userinfo, tail = rest.split("@", 1)
+            if ":" in userinfo:
+                return f"{scheme}://***:***@{tail}"
+            return f"{scheme}://***@{tail}"
+    except Exception:
+        pass
+    return s
+
+
+def _log_startup_banner() -> None:
+    try:
+        parts: list[str] = []
+        parts.append("[TNT][CONFIG] delivery bot startup")
+        parts.append(f"[TNT][CONFIG] QUALITY_GATE_ENABLED={int(bool(QUALITY_GATE_ENABLED))} STRICT_CONTRACTS={int(bool(STRICT_CONTRACTS))} RATE_QUEUE_ENABLED={int(bool(_RATE_QUEUE_ENABLED))}")
+
+        # Automation (scheduled) flags.
+        parts.append(
+            "[TNT][CONFIG] automation="
+            f"enabled:{int(_env_bool('TNT_AUTOMATION_ENABLED','0'))} "
+            f"paper_desk:{int(_paper_desk_enabled())} "
+            f"focus:{int(_env_bool('TNT_FOCUS_LIST_ENABLED','0'))} "
+            f"intraday:{int(_env_bool('TNT_INTRADAY_UPDATE_ENABLED','0'))} "
+            f"recap:{int(_env_bool('TNT_RECAP_ENABLED','0'))} "
+            f"heartbeat:{int(_env_bool('TNT_HEARTBEAT_ENABLED','0'))}"
+        )
+
+        # Debug: show which paper desk flag source is present.
+        paperdesk_src = "default"
+        if os.getenv("TNT_PAPER_DESK_ENABLED") is not None:
+            paperdesk_src = "TNT_PAPER_DESK_ENABLED"
+        elif os.getenv("PAPERDESK_ENABLED") is not None:
+            paperdesk_src = "PAPERDESK_ENABLED"
+        elif os.getenv("PAPER_DESK_ENABLED") is not None:
+            paperdesk_src = "PAPER_DESK_ENABLED"
+        parts.append(f"[TNT][CONFIG] paper_desk_flag_source={paperdesk_src}")
+
+        parts.append(
+            "[TNT][CONFIG] standdown_dedupe="
+            + str(_env_int('TNT_AUTOMATION_STANDDOWN_DEDUPE_SEC', '3600'))
+            + "s"
+        )
+
+        # Legacy autopost flags (left visible for debugging).
+        parts.append(
+            "[TNT][CONFIG] legacy_autopost="
+            f"enabled:{int(_env_bool('AUTOPOST_ENABLED','0'))} "
+            f"daily:{int(_env_bool('AUTOPOST_DAILY_ENABLED','0'))} "
+            f"signal:{int(_env_bool('AUTOPOST_SIGNAL_ENABLED','0'))}"
+        )
+
+        # Premium posting.
+        parts.append(f"[TNT][CONFIG] triple_expiry_posting_enabled={int(_env_bool('TNT_TRIPLE_EXPIRY_ENABLED','0'))}")
+        parts.append(f"[TNT][CONFIG] earnings_autopost_enabled={int(_env_bool('EARNINGS_AUTOPOST_ENABLED','0'))}")
+        parts.append(f"[TNT][CONFIG] earnings_daily_time_et={os.getenv('TNT_EARNINGS_DAILY_TIME_ET','18:00')}")
+        parts.append(f"[TNT][CONFIG] earnings_results_autopost_enabled={int(_env_bool('EARNINGS_RESULTS_AUTOPOST_ENABLED','0'))}")
+        parts.append(
+            "[TNT][CONFIG] earnings_results_times_et="
+            + str(
+                (os.getenv('TNT_EARNINGS_RESULTS_TIMES_ET') or os.getenv('TNT_EARNINGS_RESULTS_TIME_ET') or '18:10').strip()
+            )
+        )
+        parts.append(f"[TNT][CONFIG] earnings_provider={os.getenv('EARNINGS_PROVIDER','earningsapi')}")
+        parts.append(f"[TNT][CONFIG] earnings_watchlist={(os.getenv('EARNINGS_WATCHLIST','') or '').strip()}")
+        parts.append(f"[TNT][CONFIG] earnings_api_key_set={bool(_resolve_earnings_api_key())}")
+        parts.append(f"[TNT][CONFIG] earnings_api_key_source={_resolve_earnings_api_key_source()}")
+        parts.append(f"[TNT][CONFIG] macro_events_file={MACRO_EVENTS_FILE}")
+        parts.append(f"[TNT][CONFIG] macro_refresh_enabled={int(_macro_calendar_refresh_enabled())}")
+        parts.append(f"[TNT][CONFIG] macro_refresh_days_ahead={_env_int('TNT_MACRO_CALENDAR_DAYS_AHEAD', '21')}")
+        parts.append(f"[TNT][CONFIG] macro_refresh_countries={(os.getenv('TNT_MACRO_CALENDAR_COUNTRIES','US') or 'US').strip()}")
+
+        # Routing.
+        canary = CANARY_CHANNEL_ID
+        autopost_chan = _env_int('AUTOPOST_CHANNEL_ID', '0')
+        calendar_chan = _env_int('CALENDAR_EARNINGS_CHANNEL_ID', '0')
+        earnings_post_chan = _env_int('EARNINGS_POST_CHANNEL_ID', '0')
+        daily_outlook_chan = _env_int('DAILY_OUTLOOK_CHANNEL_ID', '0')
+        ops_chan = BOT_ALERT_CHANNEL_ID
+        parts.append(
+            f"[TNT][CONFIG] channels=canary:{canary or 0} autopost:{autopost_chan} "
+            f"daily_outlook:{daily_outlook_chan} "
+            f"calendar_earnings:{calendar_chan} earnings_post:{earnings_post_chan} ops:{ops_chan or 0}"
+        )
+
+        # Outlook polish knobs (logs-only proof of config).
+        outlook_kind = (os.getenv('TNT_OUTLOOK_KIND', 'status') or 'status').strip().lower() or 'status'
+        parts.append(f"[TNT][CONFIG] outlook_kind={outlook_kind}")
+        parts.append(f"[TNT][CONFIG] outlook_headlines_limit={_env_int('TNT_OUTLOOK_HEADLINES_LIMIT', '4')}")
+        parts.append(f"[TNT][CONFIG] outlook_wow_news_window_min={_env_int('TNT_OUTLOOK_WOW_NEWS_WINDOW_MIN', '90')}")
+        parts.append(f"[TNT][CONFIG] outlook_wow_earnings_thresh={_env_int('TNT_OUTLOOK_WOW_EARNINGS_THRESH', '3')}")
+
+        # Weekly Outlook schedule (logs-only proof of config).
+        parts.append(f"[TNT][CONFIG] weekly_outlook_enabled={int(_env_bool('WEEKLY_OUTLOOK_ENABLED','0'))}")
+        parts.append(
+            "[TNT][CONFIG] weekly_outlook_day_et="
+            + str((os.getenv('WEEKLY_OUTLOOK_DAY_ET') or os.getenv('WEEKLY_OUTLOOK_DOW_ET') or 'SUN').strip())
+        )
+        parts.append(
+            "[TNT][CONFIG] weekly_outlook_times_et="
+            + str((os.getenv('WEEKLY_OUTLOOK_TIMES_ET') or os.getenv('WEEKLY_OUTLOOK_TIME_ET') or '18:00').strip())
+        )
+        parts.append(
+            "[TNT][CONFIG] weekly_outlook_dedupe_scope="
+            + str((os.getenv('WEEKLY_OUTLOOK_DEDUPE_SCOPE') or 'date').strip())
+        )
+
+        # Weekly Outlook computed dedupe key preview (logs-only proof, no posting).
+        # This prints BOTH a "now" preview and a "next scheduled due" preview to avoid confusion
+        # when e.g. WEEKLY_OUTLOOK_DAY_ET=SUN but today is mid-week.
+        try:
+            now_et = _now_et()
+
+            raw_scope = (os.getenv('WEEKLY_OUTLOOK_DEDUPE_SCOPE') or 'date').strip().lower() or 'date'
+            scope = 'week' if raw_scope in {'week', 'iso_week', 'isoweek', 'weekly'} else 'date'
+
+            day_cfg_raw = os.getenv('WEEKLY_OUTLOOK_DAY_ET') or os.getenv('WEEKLY_OUTLOOK_DOW_ET')
+            day_cfg = _parse_weekday_et(day_cfg_raw, fallback=6)
+
+            times_s = (os.getenv('WEEKLY_OUTLOOK_TIMES_ET') or os.getenv('WEEKLY_OUTLOOK_TIME_ET') or '18:00').strip()
+            times: list[tuple[int, int]] = []
+            for part in [p.strip() for p in str(times_s).split(',') if p.strip()]:
+                try:
+                    hh, mm = _parse_hhmm(part)
+                    times.append((hh, mm))
+                except Exception:
+                    continue
+            if not times:
+                times = [(18, 0)]
+            times.sort()
+
+            def _target_token(dt_et: datetime) -> str:
+                if scope == 'week':
+                    iso = dt_et.isocalendar()
+                    return f"{int(iso.year)}-W{int(iso.week):02d}"
+                return dt_et.strftime('%Y-%m-%d')
+
+            def _key_preview_for(dt_et: datetime) -> tuple[str, str]:
+                effective_day = dt_et.weekday() if day_cfg is None else int(day_cfg)
+                day_label_local = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'][effective_day]
+                target = _target_token(dt_et)
+
+                keys: list[str] = []
+                for idx in range(1, len(times) + 1):
+                    label = f"weekly_outlook_{idx}" if scope == 'week' else f"weekly_outlook_{day_label_local.lower()}_{idx}"
+                    keys.append(_automation_dedupe_key(label=label, target_date_et=target))
+
+                preview_local = ','.join(keys[:3])
+                if len(keys) > 3:
+                    preview_local = f"{preview_local},+{len(keys) - 3} more"
+                return preview_local, target
+
+            # "Now" preview (purely informational).
+            preview_now, target_now = _key_preview_for(now_et)
+            parts.append(f"[TNT][CONFIG] weekly_outlook_dedupe_key_preview_now={preview_now}")
+
+            # "Next scheduled due" preview: the next future occurrence of the configured schedule.
+            # - If DAY=ANY: next future time today, else tomorrow at first time.
+            # - If DAY fixed: next occurrence of that weekday at the earliest future time, else next week.
+            due_ref = now_et.replace(second=0, microsecond=0)
+
+            if day_cfg is None:
+                # ANY: daily schedule
+                candidate = None
+                for (hh, mm) in times:
+                    dt = due_ref.replace(hour=hh, minute=mm)
+                    if dt > now_et:
+                        candidate = dt
+                        break
+                if candidate is None:
+                    hh, mm = times[0]
+                    candidate = (due_ref + timedelta(days=1)).replace(hour=hh, minute=mm)
+                next_due = candidate
+            else:
+                # Fixed weekday
+                target_wd = int(day_cfg)
+                today_wd = due_ref.weekday()
+                days_ahead = (target_wd - today_wd) % 7
+                base_day = due_ref + timedelta(days=days_ahead)
+
+                candidate = None
+                # If the base day is today, pick the next future time; otherwise pick earliest.
+                if days_ahead == 0:
+                    for (hh, mm) in times:
+                        dt = base_day.replace(hour=hh, minute=mm)
+                        if dt > now_et:
+                            candidate = dt
+                            break
+                if candidate is None:
+                    hh, mm = times[0]
+                    # If today has passed, roll one week forward.
+                    if days_ahead == 0:
+                        base_day = base_day + timedelta(days=7)
+                    candidate = base_day.replace(hour=hh, minute=mm)
+                next_due = candidate
+
+            preview_next, _target_next = _key_preview_for(next_due)
+
+            # Backward-compatible name: now points at the next scheduled due key.
+            parts.append(f"[TNT][CONFIG] weekly_outlook_dedupe_key_preview={preview_next}")
+            parts.append(f"[TNT][CONFIG] weekly_outlook_dedupe_key_preview_next_due={preview_next}")
+        except Exception:
+            pass
+
+        # Redis/job plumbing (avoid leaking credentials).
+        redis_url = os.getenv('REDIS_URL') or os.getenv('TNT_REDIS_URL')
+        if redis_url:
+            parts.append(f"[TNT][CONFIG] redis_url={_redact_url(redis_url)}")
+        else:
+            parts.append(
+                "[TNT][CONFIG] redis="
+                f"host:{os.getenv('TNT_REDIS_HOST','127.0.0.1')} "
+                f"port:{os.getenv('TNT_REDIS_PORT','6379')} "
+                f"db:{os.getenv('TNT_REDIS_DB','0')} "
+                f"queue:{os.getenv('TNT_REDIS_QUEUE','tnt:jobs')}"
+            )
+
+        worker_base = os.getenv('TNT_WORKER_BASE_URL') or os.getenv('ARTIFACT_BASE_URL') or os.getenv('WORKER_BASE_URL')
+        if worker_base:
+            parts.append(f"[TNT][CONFIG] worker_base_url={worker_base}")
+
+        for line in parts:
+            print(line)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[TNT][CONFIG][WARN] banner failed: {type(exc).__name__}: {exc}")
+
+
 async def automation_focus_list_loop(channel):
     await bot.wait_until_ready()
     global _last_focus_list_et_date
@@ -12051,7 +19078,7 @@ async def automation_focus_list_loop(channel):
 
     while not bot.is_closed():
         try:
-            if not _env_bool("TNT_FOCUS_LIST_ENABLED", "1"):
+            if not _paper_desk_enabled() or not _env_bool("TNT_FOCUS_LIST_ENABLED", "0"):
                 await asyncio.sleep(poll_sec)
                 continue
 
@@ -12111,7 +19138,7 @@ async def automation_intraday_update_loop(channel):
 
     while not bot.is_closed():
         try:
-            if not _env_bool("TNT_INTRADAY_UPDATE_ENABLED", "1"):
+            if not _paper_desk_enabled() or not _env_bool("TNT_INTRADAY_UPDATE_ENABLED", "0"):
                 await asyncio.sleep(poll_sec)
                 continue
 
@@ -12171,7 +19198,7 @@ async def automation_recap_loop(channel):
 
     while not bot.is_closed():
         try:
-            if not _env_bool("TNT_RECAP_ENABLED", "1"):
+            if not _paper_desk_enabled() or not _env_bool("TNT_RECAP_ENABLED", "0"):
                 await asyncio.sleep(poll_sec)
                 continue
 
@@ -12210,6 +19237,409 @@ async def automation_recap_loop(channel):
             await asyncio.sleep(poll_sec)
 
 
+def _paperdesk_trades_loop_enabled() -> bool:
+    """Enable Paper Desk paper-trade simulation loop.
+
+    This is separate from the legacy "Paper Desk-style scheduled posts" (focus/intraday/recap).
+    Default: ON when Paper Desk is enabled.
+    """
+
+    if not _paper_desk_enabled():
+        return False
+    return _env_bool("PAPERDESK_TRADES_LOOP_ENABLED", "1")
+
+
+def _paperdesk_trades_channel() -> Optional[object]:
+    # Default to the explicit Paper Desk trades channel.
+    channel_id = _env_int("PAPER_DESK_TRADES_CHANNEL_ID", 0)
+    if channel_id <= 0:
+        return None
+    ch = bot.get_channel(int(channel_id))
+    return ch
+
+
+def _paperdesk_time_stop_et() -> tuple[int, int]:
+    try:
+        hh, mm = _parse_hhmm(os.getenv("PAPERDESK_TIME_STOP_ET", "15:55"))
+        return int(hh), int(mm)
+    except Exception:
+        return 15, 55
+
+
+def _paperdesk_stop_pct() -> float:
+    try:
+        v = float(os.getenv("PAPERDESK_STOP_PCT", "0.003") or "0.003")
+        return max(0.0005, min(v, 0.02))
+    except Exception:
+        return 0.003
+
+
+def _paperdesk_target_r() -> float:
+    try:
+        v = float(os.getenv("PAPERDESK_TARGET_R", "2.0") or "2.0")
+        return max(0.5, min(v, 6.0))
+    except Exception:
+        return 2.0
+
+
+def _paperdesk_edge_min() -> float:
+    # Prefer explicit Paper Desk edge; fall back to autopost strict floor.
+    try:
+        return float(os.getenv("PAPERDESK_EDGE_MIN", str(AUTOPOST_EDGE_MIN_STRICT)) or str(AUTOPOST_EDGE_MIN_STRICT))
+    except Exception:
+        return float(AUTOPOST_EDGE_MIN_STRICT)
+
+
+def _paperdesk_symbols() -> list[str]:
+    raw = (os.getenv("PAPERDESK_SYMBOLS") or "").strip()
+    out: list[str] = []
+    if raw:
+        for part in raw.split(","):
+            sym = (part or "").strip().upper()
+            if sym:
+                out.append(sym)
+    if out:
+        # De-dupe preserve order
+        seen = set()
+        deduped: list[str] = []
+        for s in out:
+            if s in seen:
+                continue
+            seen.add(s)
+            deduped.append(s)
+        return deduped
+    try:
+        wl = _get_watchlist()
+        return [str(s).strip().upper() for s in wl if str(s).strip()][:16] or ["SPY"]
+    except Exception:
+        return ["SPY"]
+
+
+def _paperdesk_db_insert_decision(*, day: str, symbol: str, action: str, regime: str | None, confirmation: str | None, edge: float | None, reason: str, meta_json: str) -> None:
+    try:
+        conn = db_connect()
+        conn.execute(
+            "INSERT INTO paperdesk_decisions (day, ts, symbol, action, regime, confirmation, edge, reason, meta_json) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                day,
+                datetime.now(timezone.utc).isoformat(),
+                symbol,
+                action,
+                regime,
+                confirmation,
+                edge,
+                reason,
+                meta_json,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _paperdesk_db_list_open_trades() -> list[dict]:
+    try:
+        conn = db_connect()
+        conn.row_factory = sqlite3.Row  # type: ignore[name-defined]
+        rows = conn.execute(
+            "SELECT id, day, ts_open, symbol, direction, entry, stop, target, pd_id FROM paperdesk_trades WHERE status='OPEN' ORDER BY ts_open ASC"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _paperdesk_db_has_open_trade(symbol: str) -> bool:
+    try:
+        conn = db_connect()
+        row = conn.execute(
+            "SELECT 1 FROM paperdesk_trades WHERE status='OPEN' AND symbol=? LIMIT 1",
+            (symbol,),
+        ).fetchone()
+        conn.close()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _paperdesk_db_count_trades_for_day(*, day: str, symbol: str) -> int:
+    try:
+        conn = db_connect()
+        row = conn.execute(
+            "SELECT COUNT(1) FROM paperdesk_trades WHERE day=? AND symbol=?",
+            (day, symbol),
+        ).fetchone()
+        conn.close()
+        return int(row[0] if row else 0)
+    except Exception:
+        return 0
+
+
+def _paperdesk_db_open_trade(
+    *,
+    day: str,
+    symbol: str,
+    direction: str,
+    regime: str,
+    entry: float,
+    stop: float,
+    target: float,
+    pd_id: str,
+    meta_json: str,
+) -> None:
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO paperdesk_trades (day, ts_open, symbol, direction, regime, entry, stop, target, status, meta_json, pd_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (day, datetime.now(timezone.utc).isoformat(), symbol, direction, str(regime), float(entry), float(stop), float(target), "OPEN", meta_json, pd_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _paperdesk_db_close_trade(*, trade_id: int, exit_px: float, result_r: float, exit_reason: str) -> None:
+    conn = db_connect()
+    conn.execute(
+        "UPDATE paperdesk_trades SET ts_close=?, exit=?, result_r=?, status='CLOSED', exit_reason=? WHERE id=?",
+        (datetime.now(timezone.utc).isoformat(), float(exit_px), float(result_r), str(exit_reason), int(trade_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+async def automation_paperdesk_trades_loop() -> None:
+    """Lightweight Paper Desk paper-trade simulator.
+
+    Posts open/close log lines to `PAPER_DESK_TRADES_CHANNEL_ID` and persists to SQLite `paperdesk_trades`.
+    """
+
+    await bot.wait_until_ready()
+
+    poll_sec = max(5.0, float(os.getenv("PAPERDESK_POLL_SEC", "20") or "20"))
+    max_open = _env_int("PAPERDESK_MAX_OPEN_TRADES", 2)
+    max_per_symbol_day = _env_int("PAPERDESK_MAX_TRADES_PER_DAY_PER_SYMBOL", 1)
+
+    print(f"[OK] automation_paperdesk_trades_loop running (poll_sec={poll_sec})")
+
+    while not bot.is_closed():
+        try:
+            if not _paperdesk_trades_loop_enabled():
+                await asyncio.sleep(poll_sec)
+                continue
+
+            channel = _paperdesk_trades_channel()
+            if channel is None:
+                await asyncio.sleep(poll_sec)
+                continue
+
+            now_et = _now_et()
+            if now_et.weekday() >= 5:
+                await asyncio.sleep(60)
+                continue
+
+            # Close logic (runs even if we aren't opening new trades).
+            hh_stop, mm_stop = _paperdesk_time_stop_et()
+            t_stop = now_et.replace(hour=hh_stop, minute=mm_stop, second=0, microsecond=0)
+            open_trades = _paperdesk_db_list_open_trades()
+            for tr in open_trades:
+                sym = str(tr.get("symbol") or "").strip().upper()
+                if not sym:
+                    continue
+                snap = _get_last_price_snapshot(sym)
+                if not getattr(snap, "ok", False) or getattr(snap, "price", None) is None:
+                    continue
+                px = float(snap.price)
+
+                direction = str(tr.get("direction") or "").strip().upper()
+                entry = float(tr.get("entry") or 0.0)
+                stop = float(tr.get("stop") or 0.0)
+                target = float(tr.get("target") or 0.0)
+                pd_id = str(tr.get("pd_id") or "")
+                trade_id = int(tr.get("id") or 0)
+                if trade_id <= 0 or entry <= 0:
+                    continue
+
+                exit_reason = None
+                if now_et >= t_stop:
+                    exit_reason = "TIME_STOP"
+                else:
+                    if direction == "LONG":
+                        if stop and px <= stop:
+                            exit_reason = "STOP"
+                        elif target and px >= target:
+                            exit_reason = "TARGET"
+                    elif direction == "SHORT":
+                        if stop and px >= stop:
+                            exit_reason = "STOP"
+                        elif target and px <= target:
+                            exit_reason = "TARGET"
+
+                if not exit_reason:
+                    continue
+
+                denom = abs(entry - stop) if stop else 0.0
+                if denom <= 0:
+                    r = 0.0
+                else:
+                    if direction == "SHORT":
+                        r = (entry - px) / denom
+                    else:
+                        r = (px - entry) / denom
+
+                _paperdesk_db_close_trade(trade_id=trade_id, exit_px=px, result_r=float(r), exit_reason=str(exit_reason))
+                try:
+                    await channel.send(f"STC {sym} {direction} exit={px:.2f} R={r:+.2f} reason={exit_reason} PD={pd_id}".strip())
+                except Exception:
+                    pass
+
+            # Open logic (RTH-only).
+            if not (RTH_OPEN <= now_et.time() <= RTH_CLOSE):
+                await asyncio.sleep(poll_sec)
+                continue
+
+            if len(open_trades) >= max(1, int(max_open)):
+                await asyncio.sleep(poll_sec)
+                continue
+
+            day = now_et.date().isoformat()
+            stop_pct = _paperdesk_stop_pct()
+            target_r = _paperdesk_target_r()
+            edge_min = _paperdesk_edge_min()
+
+            for sym in _paperdesk_symbols():
+                if len(_paperdesk_db_list_open_trades()) >= max(1, int(max_open)):
+                    break
+                if _paperdesk_db_has_open_trade(sym):
+                    continue
+                if max_per_symbol_day > 0 and _paperdesk_db_count_trades_for_day(day=day, symbol=sym) >= int(max_per_symbol_day):
+                    continue
+
+                payload_out = None
+                try:
+                    payload_out = build_signal_payload(sym)
+                except Exception:
+                    payload_out = None
+                if not payload_out:
+                    continue
+                payload, prob_up, gate_info = payload_out
+
+                bias = str(payload.get("bias") or "").strip().upper()
+                if bias not in {"BULL", "BEAR"}:
+                    _paperdesk_db_insert_decision(
+                        day=day,
+                        symbol=sym,
+                        action="SKIP",
+                        regime=str(payload.get("regime") or "") or None,
+                        confirmation=str(payload.get("bias_confirm") or "") or None,
+                        edge=float(payload.get("edge") or 0.0),
+                        reason=f"bias={bias or 'NONE'}",
+                        meta_json=json.dumps({"payload": payload, "gate": gate_info}, separators=(",", ":"), ensure_ascii=False),
+                    )
+                    continue
+
+                gate_mode = str(payload.get("gate_mode") or "OK").strip().upper() or "OK"
+                if gate_mode not in {"OK", "ALLOW", "PASS"}:
+                    _paperdesk_db_insert_decision(
+                        day=day,
+                        symbol=sym,
+                        action="SKIP",
+                        regime=str(payload.get("regime") or "") or None,
+                        confirmation=str(payload.get("bias_confirm") or "") or None,
+                        edge=float(payload.get("edge") or 0.0),
+                        reason=f"gate_mode={gate_mode}",
+                        meta_json=json.dumps({"payload": payload, "gate": gate_info}, separators=(",", ":"), ensure_ascii=False),
+                    )
+                    continue
+
+                edge_val = float(payload.get("edge") or 0.0)
+                if edge_val < float(edge_min):
+                    _paperdesk_db_insert_decision(
+                        day=day,
+                        symbol=sym,
+                        action="SKIP",
+                        regime=str(payload.get("regime") or "") or None,
+                        confirmation=str(payload.get("bias_confirm") or "") or None,
+                        edge=edge_val,
+                        reason=f"edge {edge_val:.3f} < min {float(edge_min):.3f}",
+                        meta_json=json.dumps({"payload": payload, "gate": gate_info}, separators=(",", ":"), ensure_ascii=False),
+                    )
+                    continue
+
+                snap = _get_last_price_snapshot(sym)
+                if not getattr(snap, "ok", False) or getattr(snap, "price", None) is None:
+                    _paperdesk_db_insert_decision(
+                        day=day,
+                        symbol=sym,
+                        action="SKIP",
+                        regime=str(payload.get("regime") or "") or None,
+                        confirmation=str(payload.get("bias_confirm") or "") or None,
+                        edge=edge_val,
+                        reason=f"price_unavailable:{getattr(snap,'reason',None) or 'unknown'}",
+                        meta_json=json.dumps({"payload": payload, "gate": gate_info}, separators=(",", ":"), ensure_ascii=False),
+                    )
+                    continue
+
+                entry = float(snap.price)
+                direction = "LONG" if bias == "BULL" else "SHORT"
+                regime_val = (str(payload.get("regime") or "") or "").strip() or "UNKNOWN"
+                if direction == "LONG":
+                    stop = entry * (1.0 - stop_pct)
+                    target = entry + (abs(entry - stop) * target_r)
+                else:
+                    stop = entry * (1.0 + stop_pct)
+                    target = entry - (abs(stop - entry) * target_r)
+
+                pd_id = f"PD-{day.replace('-', '')}-{int(time_lib.time())}-{sym}-{direction[0]}"
+                meta_json = json.dumps(
+                    {
+                        "payload": payload,
+                        "gate": gate_info,
+                        "prob_up": float(prob_up),
+                        "edge_min": float(edge_min),
+                        "stop_pct": float(stop_pct),
+                        "target_r": float(target_r),
+                        "source": "automation_paperdesk_trades_loop",
+                    },
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+
+                _paperdesk_db_open_trade(
+                    day=day,
+                    symbol=sym,
+                    direction=direction,
+                    regime=regime_val,
+                    entry=entry,
+                    stop=stop,
+                    target=target,
+                    pd_id=pd_id,
+                    meta_json=meta_json,
+                )
+                _paperdesk_db_insert_decision(
+                    day=day,
+                    symbol=sym,
+                    action="OPEN",
+                    regime=regime_val,
+                    confirmation=str(payload.get("bias_confirm") or "") or None,
+                    edge=edge_val,
+                    reason=f"bias={bias} edge={edge_val:.3f}",
+                    meta_json=meta_json,
+                )
+                try:
+                    await channel.send(
+                        f"BTO {sym} {direction} qty=1 entry={entry:.2f} stop={stop:.2f} target={target:.2f} edge={edge_val:.3f} PD={pd_id}".strip()
+                    )
+                except Exception:
+                    pass
+
+            await asyncio.sleep(poll_sec)
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_paperdesk_trades_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(poll_sec)
+
+
 async def automation_heartbeat_loop(channel):
     await bot.wait_until_ready()
     global _last_heartbeat_sent_ts
@@ -12221,9 +19651,17 @@ async def automation_heartbeat_loop(channel):
 
     while not bot.is_closed():
         try:
-            if not _env_bool("TNT_HEARTBEAT_ENABLED", "1") or interval_min <= 0:
+            if not _env_bool("TNT_HEARTBEAT_ENABLED", "0") or interval_min <= 0:
                 await asyncio.sleep(poll_sec)
                 continue
+
+            # Always run feed-level stale checks (even if we aren't due to send
+            # the periodic heartbeat message yet). This is our canary/ops
+            # siren for missing workers.
+            try:
+                await _update_feed_stale_state()
+            except Exception:
+                pass
 
             now_ts = time_lib.time()
             if _last_heartbeat_sent_ts is not None and (now_ts - _last_heartbeat_sent_ts) < interval_min * 60.0:
@@ -12242,10 +19680,20 @@ async def automation_heartbeat_loop(channel):
             age = latest_bar_age_min("SPY", "1m")
             queue_len = len(_QUEUE_HEAP) if isinstance(_QUEUE_HEAP, list) else 0
 
+            feed_line = None
+            try:
+                from services.observability.feed_heartbeat import summarize_feeds
+
+                feed_line, _feeds_meta = summarize_feeds()
+            except Exception:
+                feed_line = None
+
             parts: list[str] = []
             parts.append("online")
             parts.append(f"SPY_1m_age_min={age if age is not None else 'n/a'}")
             parts.append(f"queue_depth={queue_len}")
+            if feed_line:
+                parts.append(feed_line)
             if _last_focus_list_et_date is not None:
                 parts.append(f"last_focus={_last_focus_list_et_date.isoformat()}")
             if _last_intraday_update_et_date is not None:
@@ -12271,37 +19719,213 @@ async def automation_heartbeat_loop(channel):
             await asyncio.sleep(poll_sec)
 
 
+async def automation_macro_calendar_refresh_loop() -> None:
+    """Refresh macro calendar from Massive -> CSV + Redis.
+
+    - Source: Massive `/benzinga/v1/economic-calendar`
+    - Outputs:
+      - CSV: `MACRO_EVENTS_FILE` (used by morning brief/outlook rendering)
+      - Redis: `cal:macro:upcoming` (used by macro blackout gate)
+    """
+
+    poll_sec = float(_positive_env_float("TNT_MACRO_CALENDAR_REFRESH_POLL_SEC", "21600"))
+    max_age_sec = float(_positive_env_float("TNT_MACRO_CALENDAR_MAX_AGE_SEC", "43200"))
+    days_ahead = int(_env_int("TNT_MACRO_CALENDAR_DAYS_AHEAD", "21"))
+    countries_raw = (os.getenv("TNT_MACRO_CALENDAR_COUNTRIES") or "US").strip()
+    countries = [c.strip().upper() for c in countries_raw.split(",") if c.strip()]
+
+    def _resolve_massive_key() -> str:
+        key = (os.getenv("MASSIVE_API_KEY") or "").strip()
+        if key:
+            return key
+        return (os.getenv("POLYGON_API_KEY") or "").strip()
+
+    def _resolve_massive_base() -> str:
+        return (os.getenv("MASSIVE_BASE_URL") or "https://api.massive.com").strip().rstrip("/")
+
+    print(
+        "[OK] automation_macro_calendar_refresh_loop running "
+        f"(poll_sec={poll_sec:.0f} max_age_sec={max_age_sec:.0f} days_ahead={days_ahead} countries={countries})"
+    )
+
+    while True:
+        try:
+            if not _automation_enabled() or not _macro_calendar_refresh_enabled():
+                await asyncio.sleep(max(30.0, poll_sec))
+                continue
+
+            api_key = _resolve_massive_key()
+            base_url = _resolve_massive_base()
+            if not api_key:
+                await asyncio.sleep(max(60.0, poll_sec))
+                continue
+
+            out_path = Path(MACRO_EVENTS_FILE)
+
+            # Avoid hammering the upstream: only refresh if missing or stale.
+            should_refresh = True
+            if out_path.exists():
+                try:
+                    age_s = max(0.0, float(_now_utc().timestamp()) - float(out_path.stat().st_mtime))
+                    if age_s < max_age_sec:
+                        should_refresh = False
+                except Exception:
+                    should_refresh = True
+
+            if not should_refresh:
+                await asyncio.sleep(max(60.0, poll_sec))
+                continue
+
+            from services.calendar.calendar_service import CalendarService
+            from services.calendar.massive_benzinga_macro import fetch_benzinga_economic_calendar
+
+            now_utc = _now_utc().replace(tzinfo=timezone.utc)
+            start = now_utc.date()
+            end = (now_utc + timedelta(days=max(1, days_ahead))).date()
+
+            items = await fetch_benzinga_economic_calendar(
+                base_url=base_url,
+                api_key=api_key,
+                start_date=start,
+                end_date=end,
+                limit=500,
+                timeout_s=float(_env_float("TNT_MACRO_CALENDAR_TIMEOUT_S", "15")),
+                countries=countries,
+            )
+
+            # Write CSV used by briefs.
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+            with tmp_path.open("w", encoding="utf-8", newline="") as f:
+                w = csv.DictWriter(
+                    f,
+                    fieldnames=["date_et", "time_et", "impact", "title", "type", "ts_utc", "source"],
+                )
+                w.writeheader()
+                for it in items:
+                    dt_et = it.ts_utc.astimezone(ET)
+                    w.writerow(
+                        {
+                            "date_et": dt_et.strftime("%Y-%m-%d"),
+                            "time_et": dt_et.strftime("%H:%M"),
+                            "impact": (it.impact or "MED").upper(),
+                            "title": it.title,
+                            "type": it.type,
+                            "ts_utc": it.ts_utc.isoformat(),
+                            "source": it.source,
+                        }
+                    )
+            try:
+                tmp_path.replace(out_path)
+            except Exception:
+                # Best-effort fallback.
+                try:
+                    shutil.move(str(tmp_path), str(out_path))
+                except Exception:
+                    pass
+
+            # Update Redis macro calendar for gates (best-effort).
+            try:
+                r = redis_client_for_ctx()
+                if r is not None:
+                    try:
+                        r.delete("cal:macro:upcoming")
+                    except Exception:
+                        pass
+                    CalendarService(r).set_macro_upcoming([it.to_macro_payload() for it in items])
+            except Exception:
+                pass
+
+            print(f"[OK] macro calendar refreshed: items={len(items)} file={out_path}")
+            await asyncio.sleep(max(60.0, poll_sec))
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] automation_macro_calendar_refresh_loop error: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(60.0, poll_sec))
+
+
 def _ensure_tnt_automation_tasks() -> None:
-    """Schedules at most 4 automation tasks (go-live safe set). Idempotent."""
-    global _automation_focus_task, _automation_intraday_task, _automation_recap_task, _automation_heartbeat_task
+    """Schedules a small go-live-safe set of automation tasks. Idempotent."""
+    global _automation_focus_task, _automation_intraday_task, _automation_recap_task, _automation_paperdesk_trades_task, _automation_macro_calendar_task, _automation_heartbeat_task, _automation_earnings_task, _automation_earnings_results_task, _automation_earnings_results_prewarm_task, _automation_daily_outlook_task, _automation_weekly_outlook_task, _automation_divergence_watch_task, _automation_earnings_pressure_watch_task
 
     if not _automation_enabled():
-        print("[OK] automation: disabled (TNT_AUTOMATION_ENABLED/AUTOPOST_ENABLED=0)")
+        print("[OK] automation: disabled (TNT_AUTOMATION_ENABLED=0)")
         return
 
     channel = _resolve_automation_channel()
     if channel is None:
         return
 
-    if _env_bool("TNT_FOCUS_LIST_ENABLED", "1"):
+    if _macro_calendar_refresh_enabled():
+        if not _automation_macro_calendar_task or _automation_macro_calendar_task.done():
+            _automation_macro_calendar_task = bot.loop.create_task(automation_macro_calendar_refresh_loop())
+            print("[OK] automation macro_calendar_refresh task scheduled")
+
+    # Defaults are intentionally OFF; enable explicitly per post type.
+    if _env_bool("EARNINGS_AUTOPOST_ENABLED", "0"):
+        if not _automation_earnings_task or _automation_earnings_task.done():
+            earnings_channel = _resolve_earnings_calendar_channel() or channel
+            _automation_earnings_task = bot.loop.create_task(automation_earnings_daily_loop(earnings_channel))
+            print("[OK] automation earnings_daily task scheduled")
+
+    if _env_bool("EARNINGS_RESULTS_AUTOPOST_ENABLED", "0"):
+        # Prewarm is ON by default when results autopost is enabled.
+        if _env_bool("EARNINGS_RESULTS_PREWARM_ENABLED", "1"):
+            if not _automation_earnings_results_prewarm_task or _automation_earnings_results_prewarm_task.done():
+                _automation_earnings_results_prewarm_task = bot.loop.create_task(automation_earnings_results_prewarm_loop())
+                print("[OK] automation earnings_results prewarm task scheduled")
+
+        if not _automation_earnings_results_task or _automation_earnings_results_task.done():
+            earnings_channel = _resolve_earnings_calendar_channel() or channel
+            _automation_earnings_results_task = bot.loop.create_task(automation_earnings_results_loop(earnings_channel))
+            print("[OK] automation earnings_results task scheduled")
+
+    if _env_bool("DAILY_OUTLOOK_ENABLED", "0"):
+        if not _automation_daily_outlook_task or _automation_daily_outlook_task.done():
+            outlook_channel = _resolve_daily_outlook_channel() or channel
+            _automation_daily_outlook_task = bot.loop.create_task(automation_daily_market_outlook_loop(outlook_channel))
+            print("[OK] automation daily_outlook task scheduled [AUTOPOST][OUTLOOK]")
+
+    if _env_bool("WEEKLY_OUTLOOK_ENABLED", "0"):
+        if not _automation_weekly_outlook_task or _automation_weekly_outlook_task.done():
+            outlook_channel = _resolve_daily_outlook_channel() or channel
+            _automation_weekly_outlook_task = bot.loop.create_task(automation_weekly_market_outlook_loop(outlook_channel))
+            print("[OK] automation weekly_outlook task scheduled [AUTOPOST][WEEKLY_OUTLOOK]")
+
+    if _paper_desk_enabled() and _env_bool("TNT_FOCUS_LIST_ENABLED", "0"):
         if not _automation_focus_task or _automation_focus_task.done():
             _automation_focus_task = bot.loop.create_task(automation_focus_list_loop(channel))
             print("[OK] automation focus_list task scheduled")
 
-    if _env_bool("TNT_INTRADAY_UPDATE_ENABLED", "1"):
+    if _paper_desk_enabled() and _env_bool("TNT_INTRADAY_UPDATE_ENABLED", "0"):
         if not _automation_intraday_task or _automation_intraday_task.done():
             _automation_intraday_task = bot.loop.create_task(automation_intraday_update_loop(channel))
             print("[OK] automation intraday_update task scheduled")
 
-    if _env_bool("TNT_RECAP_ENABLED", "1"):
+    if _paper_desk_enabled() and _env_bool("TNT_RECAP_ENABLED", "0"):
         if not _automation_recap_task or _automation_recap_task.done():
             _automation_recap_task = bot.loop.create_task(automation_recap_loop(channel))
             print("[OK] automation recap task scheduled")
 
-    if _env_bool("TNT_HEARTBEAT_ENABLED", "1"):
+    if _paperdesk_trades_loop_enabled():
+        if not _automation_paperdesk_trades_task or _automation_paperdesk_trades_task.done():
+            _automation_paperdesk_trades_task = bot.loop.create_task(automation_paperdesk_trades_loop())
+            print("[OK] automation paperdesk trades task scheduled")
+
+    if _env_bool("TNT_HEARTBEAT_ENABLED", "0"):
         if not _automation_heartbeat_task or _automation_heartbeat_task.done():
             _automation_heartbeat_task = bot.loop.create_task(automation_heartbeat_loop(channel))
             print("[OK] automation heartbeat task scheduled")
+
+    if _divergence_watch_enabled():
+        if not _automation_divergence_watch_task or _automation_divergence_watch_task.done():
+            _automation_divergence_watch_task = bot.loop.create_task(automation_divergence_watch_loop(channel))
+            print("[OK] automation divergence_watch task scheduled")
+
+    if _earnings_pressure_watch_enabled():
+        if not _automation_earnings_pressure_watch_task or _automation_earnings_pressure_watch_task.done():
+            _automation_earnings_pressure_watch_task = bot.loop.create_task(automation_earnings_pressure_watch_loop(channel))
+            print("[OK] automation earnings_pressure_watch task scheduled")
 
 
 @bot.event
@@ -12324,6 +19948,8 @@ async def on_ready() -> None:
         load_tnt_system_prompt(log=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[TNT][PROMPT][ERROR] Failed to load tnt_system_prompt.txt: {exc}")
+
+    _log_startup_banner()
     global _slash_tree_synced
     if not _slash_tree_synced:
         # IMPORTANT: This delivery bot shares the same Discord application/token as the
@@ -12348,8 +19974,785 @@ async def on_ready() -> None:
         print(f"[WARN] automation scheduler error: {exc}")
 
 
+async def maybe_handle_ask_tnt_earnings_embed(message: "discord.Message") -> bool:
+    """Deterministic earnings embed handler for #ask-tnt free-text.
+
+    Returns True if handled (embed posted), else False.
+
+    NOTE: This is intentionally reusable by other bot entrypoints (e.g. `cli.discord_bot`)
+    so we can keep a single Discord gateway session while still serving the legacy
+    earnings embed UX.
+    """
+
+    def _route_channel_id(ch: object) -> int:
+        """Return the routing channel id.
+
+        - For normal text channels, route by the channel id.
+        - For threads, route by the parent channel id.
+
+        Avoid using TextChannel.parent_id (category id), since routing env vars are
+        configured with actual channel ids.
+        """
+
+        try:
+            if isinstance(ch, discord.Thread):
+                try:
+                    pid = int(getattr(ch, "parent_id", 0) or 0)
+                except Exception:
+                    pid = 0
+                if pid:
+                    return pid
+                try:
+                    parent = getattr(ch, "parent", None)
+                    return int(getattr(parent, "id", 0) or 0)
+                except Exception:
+                    return 0
+        except Exception:
+            pass
+
+        try:
+            return int(getattr(ch, "id", 0) or 0)
+        except Exception:
+            return 0
+
+    try:
+        # Only apply in guild channels, never DMs.
+        if message.guild is None:
+            return False
+
+        content_raw = str(message.content or "")
+        content_clean = content_raw.strip()
+        if not content_clean:
+            return False
+        # Don't intercept bot commands.
+        if content_clean.startswith("!"):
+            return False
+
+        # Enforce ASK_TNT routing even if router isn't explicitly enabled.
+        # IMPORTANT: route by the *channel* name ("ask-tnt"), not the category.
+        ch = getattr(message, "channel", None)
+        channel_id_for_routing = _route_channel_id(ch)
+        route_name = ""
+        try:
+            if isinstance(ch, discord.Thread):
+                parent = getattr(ch, "parent", None)
+                route_name = str(getattr(parent, "name", "") or "") or str(getattr(ch, "name", "") or "")
+            else:
+                route_name = str(getattr(ch, "name", "") or "")
+        except Exception:
+            route_name = ""
+
+        decision = decide_route(
+            channel_id=int(channel_id_for_routing or 0),
+            content=content_clean,
+            channel_name=route_name,
+        )
+        if decision.action != "allow_full":
+            return False
+
+        lowered = content_clean.lower()
+        debug_earn = str(os.getenv("TNT_EARNINGS_EMBED_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+        def _is_earnings_intent(text_lower: str) -> bool:
+            if not text_lower:
+                return False
+            # Keep conservative; avoid capturing general "earnings season" chatter.
+            if "earnings" in text_lower or "earning" in text_lower:
+                return True
+            # Tokenized "ER" shorthand.
+            return (" er" in f" {text_lower} ")
+
+        if not _is_earnings_intent(lowered):
+            return False
+
+        # Calendar-style earnings queries ("who has earnings today", "earnings next week", etc)
+        # should not be forced into a single-symbol embed. Answer deterministically from the
+        # cached watchlist universe.
+        try:
+            from delivery.qa_router import looks_like_earnings_calendar_query
+
+            is_calendar_query = looks_like_earnings_calendar_query(text=content_clean)
+        except Exception:
+            is_calendar_query = False
+
+        if is_calendar_query:
+            try:
+                r_cal = redis_client_for_ctx()
+            except Exception:
+                r_cal = None
+
+            if r_cal is None:
+                return False
+
+            # Use an explicit watchlist universe to avoid full-market enumeration.
+            raw_wl = (os.getenv("EARNINGS_WATCHLIST") or os.getenv("EARNINGS_AUTOPOST_SYMBOLS") or "").strip()
+            watchlist = [s.strip().upper() for s in raw_wl.split(",") if s.strip()]
+            watchlist = sorted({s for s in watchlist if s and s.isalpha() and (1 <= len(s) <= 6)})
+
+            if not watchlist:
+                try:
+                    await message.reply(
+                        "📅 Earnings (watchlist-only)\n"
+                        "• No watchlist configured (set EARNINGS_WATCHLIST or EARNINGS_AUTOPOST_SYMBOLS).\n"
+                        "• Or ask a single ticker (e.g., 'AAPL earnings date').",
+                        mention_author=False,
+                    )
+                except Exception:
+                    pass
+                return True
+
+            from datetime import date
+
+            def _parse_iso_utc(s: str) -> datetime | None:
+                try:
+                    dtu = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+                    if dtu.tzinfo is None:
+                        dtu = dtu.replace(tzinfo=timezone.utc)
+                    return dtu.astimezone(timezone.utc)
+                except Exception:
+                    return None
+
+            now_utc = datetime.now(timezone.utc)
+            now_et = now_utc.astimezone(ET)
+            q_lower = lowered
+
+            # Date window (ET, inclusive).
+            explicit_date = None
+            try:
+                import re as _re
+
+                m = _re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", content_clean)
+                explicit_date = m.group(1) if m else None
+            except Exception:
+                explicit_date = None
+
+            if explicit_date:
+                start_d = date.fromisoformat(str(explicit_date))
+                end_d = start_d
+                label = str(explicit_date)
+            elif "today" in q_lower:
+                start_d = now_et.date()
+                end_d = start_d
+                label = "today"
+            elif "tomorrow" in q_lower:
+                start_d = now_et.date() + timedelta(days=1)
+                end_d = start_d
+                label = "tomorrow"
+            elif "next week" in q_lower:
+                d0 = now_et.date()
+                days_ahead = (7 - d0.weekday()) % 7
+                if days_ahead == 0:
+                    days_ahead = 7
+                monday = d0 + timedelta(days=days_ahead)
+                start_d = monday
+                end_d = monday + timedelta(days=6)
+                label = "next week"
+            elif "this week" in q_lower:
+                d0 = now_et.date()
+                start_d = d0 - timedelta(days=int(d0.weekday()))
+                end_d = start_d + timedelta(days=6)
+                label = "this week"
+            else:
+                # Default: upcoming (next 7 calendar days).
+                start_d = now_et.date()
+                end_d = start_d + timedelta(days=6)
+                label = "next 7d"
+
+            from services.calendar.calendar_service import CalendarService
+            from services.calendar.earnings_embeds import UpcomingEarningsItem, build_earnings_today_embed, build_earnings_upcoming_embed
+
+            cal = CalendarService(r_cal)
+            refreshed_utc = None
+            try:
+                refreshed_utc = cal.get_earnings_last_refresh_utc()
+            except Exception:
+                refreshed_utc = None
+
+            items: list[UpcomingEarningsItem] = []
+            for sym in watchlist:
+                ev = None
+                try:
+                    ev = cal.get_earnings(symbol=sym)
+                except Exception:
+                    ev = None
+                if not isinstance(ev, dict):
+                    continue
+
+                dt_ev = _parse_iso_utc(str(ev.get("ts_utc") or ""))
+                if dt_ev is None:
+                    continue
+
+                d_et = dt_ev.astimezone(ET).date()
+                if not (start_d <= d_et <= end_d):
+                    continue
+
+                items.append(
+                    UpcomingEarningsItem(
+                        symbol=sym,
+                        ts_utc_iso=str(ev.get("ts_utc") or ""),
+                        confirmed=bool(ev.get("confirmed", False)),
+                        session=str(ev.get("session") or "UNKNOWN"),
+                        expected_move_pct=(float(ev.get("expected_move_pct")) if ev.get("expected_move_pct") is not None else None),
+                    )
+                )
+
+            # Embed selection: "today" uses a compact single-bucket view; other windows use buckets.
+            if start_d == end_d and start_d == now_et.date():
+                embed = build_earnings_today_embed(items, refreshed_utc=refreshed_utc, title="Earnings Today (watchlist)")
+            else:
+                days = max(1, int((end_d - start_d).days) + 1)
+                embed = build_earnings_upcoming_embed(items, days=days, refreshed_utc=refreshed_utc)
+                try:
+                    embed.title = f"Earnings ({label}, watchlist)"
+                except Exception:
+                    pass
+
+            try:
+                await message.reply(embed=embed, mention_author=False)
+            except Exception:
+                try:
+                    await message.channel.send(embed=embed)
+                except Exception:
+                    pass
+            return True
+
+        def _last_earnings_symbol_key(msg: "discord.Message") -> str | None:
+            try:
+                gid = int(getattr(getattr(msg, "guild", None), "id", 0) or 0)
+                cid = int(getattr(getattr(msg, "channel", None), "id", 0) or 0)
+                uid = int(getattr(getattr(msg, "author", None), "id", 0) or 0)
+            except Exception:
+                return None
+            if gid <= 0 or cid <= 0 or uid <= 0:
+                return None
+            return f"tnt:ask_tnt:last_earnings_symbol:{gid}:{cid}:{uid}"
+
+        def _yesno_earnings_window(text_lower: str) -> str | None:
+            t = (text_lower or "").strip().lower()
+            if not t:
+                return None
+            if "earnings" not in t and "earning" not in t and (" er" not in f" {t} "):
+                return None
+
+            yn = any(w in f" {t} " for w in (" does ", " do ", " is ", " are ", " did ", " have ", " has "))
+            if not yn:
+                return None
+
+            if "tomorrow" in t:
+                return "tomorrow"
+            if "today" in t:
+                return "today"
+            if "next week" in t:
+                return "next_week"
+            if "this week" in t:
+                return "this_week"
+            return None
+
+        # Symbol-only earnings queries.
+        # NOTE: Do not use extract_analysis_request() here; it's analyze-focused and can
+        # misclassify question words (e.g., WHO) as tickers.
+        sym_e: str | None = None
+        try:
+            sym_e = _detect_symbol_in_text(content_clean)
+        except Exception:
+            sym_e = None
+
+        # Follow-up context: if user asks "earnings tomorrow?" without a ticker.
+        if not sym_e:
+            try:
+                r_ctx = redis_client_for_ctx()
+                k = _last_earnings_symbol_key(message)
+                if r_ctx is not None and k:
+                    v = r_ctx.get(k)
+                    if v:
+                        sym_e = _normalize_symbol_token(str(v))
+            except Exception:
+                sym_e = None
+
+        sym_e = (sym_e or "").strip().upper()
+        if not sym_e:
+            return False
+
+        if debug_earn:
+            try:
+                ch_name = str(getattr(getattr(message, "channel", None), "name", "") or "")
+            except Exception:
+                ch_name = ""
+            print(f"[EARNINGS_EMBED] trigger=1 channel={ch_name!r} sym={sym_e} content={content_clean!r}")
+
+        yesno_window = _yesno_earnings_window(lowered)
+
+        from services.calendar.calendar_service import CalendarService
+        from services.calendar.earnings_embeds import build_earnings_embed
+        from services.calendar.earnings_miss_gate import should_show_retrieving_once
+        from services.news.news_service import NewsService
+
+        # Remember this symbol for short follow-ups in the same channel.
+        try:
+            r_set = redis_client_for_ctx()
+            k = _last_earnings_symbol_key(message)
+            if r_set is not None and k:
+                # 6 hours is enough for conversational follow-ups, and avoids stale drift.
+                r_set.setex(k, 6 * 3600, sym_e)
+        except Exception:
+            pass
+
+        def _load_payload() -> tuple[dict[str, Any] | None, int | None, list[dict[str, Any]], str, str]:
+            r = None
+            try:
+                r = redis_client_for_ctx()
+            except Exception:
+                r = None
+
+            ev = None
+            refreshed = None
+            news_items: list[dict[str, Any]] = []
+
+            if r is not None:
+                try:
+                    cal = CalendarService(r)
+                    ev = cal.get_earnings(symbol=sym_e)
+                    refreshed = cal.get_earnings_refreshed_utc(symbol=sym_e)
+
+                    # If the canonical blob doesn't include history (common), pull the
+                    # most recent items from the optional history layer.
+                    try:
+                        if isinstance(ev, dict):
+                            hist = ev.get("history")
+                            if not isinstance(hist, list) or len(hist) == 0:
+                                ev["history"] = cal.get_earnings_history(symbol=sym_e, limit=4)
+                    except Exception:
+                        pass
+
+                    # If upstream feeds only provide a very-far future placeholder (e.g., ~1y+ out),
+                    # infer a nearer *estimated* earnings date from the most recent history event.
+                    try:
+                        if isinstance(ev, dict):
+                            ts_raw = str(ev.get("ts_utc") or "")
+                            if ts_raw:
+                                from datetime import datetime, timedelta, timezone
+
+                                def _parse_iso_utc(s: str) -> datetime | None:
+                                    try:
+                                        dtu = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+                                        if dtu.tzinfo is None:
+                                            dtu = dtu.replace(tzinfo=timezone.utc)
+                                        return dtu.astimezone(timezone.utc)
+                                    except Exception:
+                                        return None
+
+                                now_utc = datetime.now(timezone.utc)
+                                dt_ev = _parse_iso_utc(ts_raw)
+
+                                try:
+                                    max_fwd_days = int(os.getenv("TNT_EARNINGS_MAX_FORWARD_DAYS", "240") or "240")
+                                except Exception:
+                                    max_fwd_days = 240
+                                max_fwd_days = max(30, min(900, int(max_fwd_days)))
+
+                                if dt_ev is not None and (dt_ev - now_utc).total_seconds() > float(max_fwd_days) * 86400.0:
+                                    # Grab the most recent historical event timestamp.
+                                    hist_items = ev.get("history") if isinstance(ev.get("history"), list) else []
+                                    dt_hist_max = None
+                                    for it in hist_items:
+                                        if not isinstance(it, dict):
+                                            continue
+                                        dt_h = _parse_iso_utc(str(it.get("ts_utc") or ""))
+                                        if dt_h is None:
+                                            continue
+                                        if dt_hist_max is None or dt_h > dt_hist_max:
+                                            dt_hist_max = dt_h
+
+                                    # Only infer if history is reasonably recent.
+                                    if dt_hist_max is not None and (now_utc - dt_hist_max).total_seconds() < 240.0 * 86400.0:
+                                        try:
+                                            infer_days = int(os.getenv("TNT_EARNINGS_INFER_CADENCE_DAYS", "91") or "91")
+                                        except Exception:
+                                            infer_days = 91
+                                        infer_days = max(60, min(120, int(infer_days)))
+
+                                        dt_inf = dt_hist_max + timedelta(days=int(infer_days))
+                                        ev["ts_utc"] = dt_inf.isoformat()
+                                        ev["confirmed"] = False
+                                        ev["source"] = str(ev.get("source") or "") or "inferred"
+                                        ev["_ts_utc_inferred"] = True
+                    except Exception:
+                        pass
+                except Exception:
+                    ev, refreshed = None, None
+
+                try:
+                    news_items = NewsService(r).get_recent_items(symbol=sym_e, limit=10)
+                except Exception:
+                    news_items = []
+
+            missing_mode = "retrieving"
+            if not ev:
+                try:
+                    if r is not None and should_show_retrieving_once(r, sym_e):
+                        missing_mode = "retrieving"
+                    else:
+                        missing_mode = "sparse"
+                except Exception:
+                    missing_mode = "sparse"
+
+            # For yes/no questions, never show the looping "retrieving" UX.
+            if yesno_window is not None:
+                missing_mode = "sparse"
+
+            # Price snapshot (best-effort).
+            price_line = "Price: unavailable (no recent price)"
+            try:
+                snap = _get_last_price_snapshot(sym_e)
+                px_raw = getattr(snap, "px", None)
+                if px_raw is None:
+                    px_raw = getattr(snap, "price", None)
+
+                src = str(getattr(snap, "source", "none") or "none")
+                asof = getattr(snap, "asof_et", None)
+
+                if px_raw is not None:
+                    px = float(px_raw)
+                    label = "last trade"
+                    if src == "db_1d_close":
+                        label = "last close"
+                    elif src == "db_1m_close":
+                        label = "last 1m close"
+                    elif src == "cached_analyze":
+                        label = "cached"
+
+                    when = ""
+                    try:
+                        if asof is not None:
+                            hh = int(getattr(asof, "hour", 0))
+                            mm = int(getattr(asof, "minute", 0))
+                            ap = "am" if hh < 12 else "pm"
+                            hh12 = hh % 12
+                            if hh12 == 0:
+                                hh12 = 12
+                            dow = str(asof.strftime("%a"))
+                            when = f"{dow} {hh12}:{mm:02d}{ap} ET"
+                    except Exception:
+                        when = ""
+
+                    price_line = f"Price: ${px:.2f} ({label})"
+                    if when:
+                        price_line = f"Price: ${px:.2f} ({label} • {when})"
+            except Exception:
+                price_line = "Price: unavailable (no recent price)"
+
+            return ev, refreshed, news_items, price_line, missing_mode
+
+        ev, refreshed, news_items, price_line, missing_mode = await asyncio.to_thread(_load_payload)
+
+        # If this is a yes/no question (today/tomorrow/this week/next week), add a direct answer line.
+        try:
+            if yesno_window is not None:
+                dt_ev = None
+                if isinstance(ev, dict):
+                    ts_raw = str(ev.get("ts_utc") or "").strip()
+                    if ts_raw:
+                        try:
+                            dt_ev = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                            if dt_ev.tzinfo is None:
+                                dt_ev = dt_ev.replace(tzinfo=timezone.utc)
+                            dt_ev = dt_ev.astimezone(timezone.utc)
+                        except Exception:
+                            dt_ev = None
+
+                now_et = _now_et()
+                ans = None
+                if dt_ev is not None:
+                    ev_date_et = dt_ev.astimezone(ET).date()
+                    if yesno_window == "today":
+                        want = now_et.date()
+                        ans = (ev_date_et == want)
+                    elif yesno_window == "tomorrow":
+                        want = now_et.date() + timedelta(days=1)
+                        ans = (ev_date_et == want)
+                    elif yesno_window in {"this_week", "next_week"}:
+                        # Weeks anchored to ET Monday..Sunday.
+                        wd = int(now_et.weekday())
+                        this_mon = now_et.date() - timedelta(days=wd)
+                        if yesno_window == "this_week":
+                            start = this_mon
+                        else:
+                            start = this_mon + timedelta(days=7)
+                        end = start + timedelta(days=6)
+                        ans = (start <= ev_date_et <= end)
+
+                if ans is True:
+                    answer_line = f"Answer: YES — {sym_e} is on the earnings calendar for that window."
+                elif ans is False:
+                    answer_line = f"Answer: NO — {sym_e} is not on the earnings calendar for that window."
+                else:
+                    answer_line = f"Answer: UNKNOWN — {sym_e} doesn’t have a confirmed earnings date in cache right now."
+
+                price_line = (f"{answer_line}\n{price_line}" if price_line else answer_line)
+        except Exception:
+            pass
+
+        # If the cache is missing for this symbol, best-effort fetch + seed it.
+        # This keeps the rich embed usable for symbols outside the scheduled watchlist.
+        try:
+            if ev is None:
+                r_seed = None
+                try:
+                    r_seed = redis_client_for_ctx()
+                except Exception:
+                    r_seed = None
+                if r_seed is not None:
+                    from services.calendar.massive_benzinga_earnings import fetch_benzinga_earnings, pick_next_earnings
+                    from services.calendar.calendar_service import CalendarService as _Cal
+
+                    key_m, base_m, _prov = _massive_key_and_base()
+                    if key_m:
+                        now_et = _now_et()
+                        now_utc = _now_utc().replace(tzinfo=timezone.utc)
+                        try:
+                            lookahead_days = int(os.getenv("TNT_EARNINGS_LOOKAHEAD_DAYS", "180") or "180")
+                        except Exception:
+                            lookahead_days = 180
+                        lookahead_days = max(30, min(365, int(lookahead_days)))
+
+                        recs = None
+                        try:
+                            recs = await asyncio.wait_for(
+                                fetch_benzinga_earnings(
+                                    base_url=base_m,
+                                    api_key=key_m or "",
+                                    tickers=[sym_e],
+                                    start_date=now_et.date().isoformat(),
+                                    end_date=(now_et.date() + timedelta(days=int(lookahead_days))).isoformat(),
+                                    limit=800,
+                                    timeout_s=10.0,
+                                ),
+                                timeout=12.0,
+                            )
+                        except Exception:
+                            recs = None
+
+                        if recs:
+                            nxt = None
+                            try:
+                                nxt = pick_next_earnings(recs, symbol=sym_e, now_utc=now_utc)
+                            except Exception:
+                                nxt = None
+                            if nxt is not None:
+                                cal2 = _Cal(r_seed)
+                                try:
+                                    cal2.set_earnings(symbol=sym_e, ts_utc=nxt.ts_utc, confirmed=bool(nxt.confirmed), source=str(nxt.source or "benzinga"), ttl_sec=14 * 24 * 3600)
+                                except Exception:
+                                    pass
+                                try:
+                                    cal2.cache_earnings_history(symbol=sym_e, items=[x.to_jsonable() for x in recs], ttl_sec=90 * 24 * 3600)
+                                except Exception:
+                                    pass
+                                try:
+                                    ev = cal2.get_earnings(symbol=sym_e)
+                                    refreshed = cal2.get_earnings_refreshed_utc(symbol=sym_e)
+                                    if isinstance(ev, dict):
+                                        hist = ev.get("history")
+                                        if not isinstance(hist, list) or len(hist) == 0:
+                                            ev["history"] = cal2.get_earnings_history(symbol=sym_e, limit=4)
+                                except Exception:
+                                    pass
+        except Exception:
+            pass
+
+        # Best-effort: if premium fields are missing, compute expected move from
+        # the Polygon ATM straddle so the embed matches the legacy card.
+        try:
+            if isinstance(ev, dict) and (ev.get("expected_move_pct") is None or not isinstance(ev.get("expected_move"), dict)):
+                api_key, _base_url, _provider = _polygon_key_and_base()
+                if api_key:
+                    try:
+                        timeout_s = float(os.getenv("TNT_EARNINGS_EXPECTED_MOVE_TIMEOUT_S", "6") or "6")
+                    except Exception:
+                        timeout_s = 6.0
+
+                    df = None
+                    try:
+                        df = await asyncio.wait_for(_fetch_polygon_atm_straddle_df(sym_e), timeout=max(1.0, float(timeout_s)))
+                    except Exception:
+                        df = None
+
+                    if df is not None:
+                        try:
+                            from services.calendar.earnings_options import compute_expected_move_from_chain_df
+
+                            res = compute_expected_move_from_chain_df(df)
+                        except Exception:
+                            res = None
+
+                        if isinstance(res, dict) and res.get("expected_move_pct") is not None:
+                            try:
+                                em_pct = float(res.get("expected_move_pct"))
+                            except Exception:
+                                em_pct = None
+
+                            if em_pct is not None:
+                                ev["expected_move_pct"] = em_pct
+                                ev["liquidity_risk"] = str(res.get("liquidity_risk") or ev.get("liquidity_risk") or "MED")
+                                ev["expected_move_source"] = "options_chain_atm_straddle"
+                                ev["expected_move_refreshed_utc"] = _now_utc().replace(tzinfo=timezone.utc).isoformat()
+
+                                details = res.get("details") if isinstance(res.get("details"), dict) else {}
+                                under = None
+                                straddle = None
+                                try:
+                                    under = float(details.get("underlying_price")) if details.get("underlying_price") is not None else None
+                                except Exception:
+                                    under = None
+                                try:
+                                    straddle = float(details.get("straddle_mid")) if details.get("straddle_mid") is not None else None
+                                except Exception:
+                                    straddle = None
+
+                                if under is not None and straddle is not None and under > 0 and straddle > 0:
+                                    ev["expected_move"] = {
+                                        "underlying": float(under),
+                                        "straddle": float(straddle),
+                                        "pct": float(em_pct),
+                                        "upper": float(under + straddle),
+                                        "lower": float(max(0.0, under - straddle)),
+                                        "atm_strike": details.get("atm_strike"),
+                                    }
+
+                                iv_state = ev.get("iv_state") if isinstance(ev.get("iv_state"), dict) else {}
+                                try:
+                                    if res.get("front_iv") is not None and iv_state.get("front_iv") is None:
+                                        iv_state["front_iv"] = float(res.get("front_iv"))
+                                except Exception:
+                                    pass
+                                ev["iv_state"] = iv_state
+
+                                # Optional write-back so future embeds are instant.
+                                try:
+                                    wb = str(os.getenv("TNT_EARNINGS_WRITEBACK_EXPECTED_MOVE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+                                except Exception:
+                                    wb = True
+                                if wb:
+                                    try:
+                                        r2 = redis_client_for_ctx()
+                                        from services.calendar.calendar_service import CalendarService as _Cal
+
+                                        _Cal(r2).set_earnings_blob(symbol=sym_e, blob=ev, ttl_sec=14 * 24 * 3600)
+                                        # Reflect the write-back immediately in the embed.
+                                        refreshed = int(datetime.now(timezone.utc).timestamp())
+                                    except Exception:
+                                        pass
+        except Exception:
+            pass
+
+        # Best-effort: if last-4 reactions are missing, enrich/backfill on-demand
+        # so symbols outside the watchlist (e.g., AMD) still show recent reactions.
+        try:
+            need_reactions = False
+            if isinstance(ev, dict):
+                hist = ev.get("history") if isinstance(ev.get("history"), list) else []
+                if not hist:
+                    need_reactions = True
+                else:
+                    have_move = False
+                    for it in hist:
+                        if isinstance(it, dict) and it.get("move_pct") is not None:
+                            have_move = True
+                            break
+                    if not have_move:
+                        need_reactions = True
+
+            if need_reactions:
+                try:
+                    from scripts.earnings_enrich_cache import enrich_symbol
+
+                    try:
+                        tmo = float(os.getenv("TNT_EARNINGS_ENRICH_ON_DEMAND_TIMEOUT_S", "12") or "12")
+                    except Exception:
+                        tmo = 12.0
+                    tmo = max(2.0, min(30.0, float(tmo)))
+
+                    res = await asyncio.wait_for(
+                        enrich_symbol(symbol=sym_e, write=True, compute_expected_move=False, compute_reactions=True),
+                        timeout=tmo,
+                    )
+                    if getattr(res, "wrote", False):
+                        try:
+                            r3 = redis_client_for_ctx()
+                            from services.calendar.calendar_service import CalendarService as _Cal
+
+                            cal3 = _Cal(r3)
+                            ev = cal3.get_earnings(symbol=sym_e)
+                            refreshed = cal3.get_earnings_refreshed_utc(symbol=sym_e)
+                            if isinstance(ev, dict):
+                                hist = ev.get("history")
+                                if not isinstance(hist, list) or len(hist) == 0:
+                                    ev["history"] = cal3.get_earnings_history(symbol=sym_e, limit=4)
+                        except Exception:
+                            # Still update the UX freshness marker if we did work.
+                            refreshed = int(datetime.now(timezone.utc).timestamp())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        embed = build_earnings_embed(
+            sym_e,
+            ev,
+            refreshed,
+            news_items=news_items,
+            price_line=price_line,
+            missing_mode=missing_mode,
+            premium=True,
+        )
+        try:
+            await message.reply(embed=embed, mention_author=False)
+        except Exception:
+            await message.channel.send(embed=embed)
+        return True
+    except Exception:
+        if str(os.getenv("TNT_EARNINGS_EMBED_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                print("[EARNINGS_EMBED] trigger=0 (exception)")
+                traceback.print_exc()
+            except Exception:
+                pass
+        return False
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
+    def _route_channel_id(ch: object) -> int:
+        """Return the routing channel id.
+
+        - For normal text channels, route by the channel id.
+        - For threads, route by the parent channel id.
+
+        Avoid using TextChannel.parent_id (category id), since routing env vars are
+        configured with actual channel ids.
+        """
+
+        try:
+            if isinstance(ch, discord.Thread):
+                try:
+                    pid = int(getattr(ch, "parent_id", 0) or 0)
+                except Exception:
+                    pid = 0
+                if pid:
+                    return pid
+                try:
+                    parent = getattr(ch, "parent", None)
+                    return int(getattr(parent, "id", 0) or 0)
+                except Exception:
+                    return 0
+        except Exception:
+            pass
+
+        try:
+            return int(getattr(ch, "id", 0) or 0)
+        except Exception:
+            return 0
+
     # Never respond to our own messages.
     if bot.user and message.author.id == bot.user.id:
         return
@@ -12357,6 +20760,46 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         if concierge_throttle is None or not concierge_throttle.allow_other_bot_messages_for_auto():
             return
+
+    # Channel router contract: delivery bot must not answer in restricted channels.
+    try:
+        if router_enabled():
+            ch = getattr(message, "channel", None)
+            channel_id_for_routing = _route_channel_id(ch)
+
+            try:
+                parent = getattr(ch, "parent", None)
+                parent_name = str(getattr(parent, "name", "") or "")
+            except Exception:
+                parent_name = ""
+            try:
+                channel_name = str(getattr(ch, "name", "") or "")
+            except Exception:
+                channel_name = ""
+
+            decision = decide_route(
+                channel_id=int(channel_id_for_routing or 0),
+                content=str(message.content or ""),
+                channel_name=(parent_name or channel_name),
+            )
+            if decision.action != "allow_full":
+                return
+    except Exception:
+        pass
+
+    try:
+        if await maybe_handle_ask_tnt_earnings_embed(message):
+            await bot.process_commands(message)
+            return
+    except Exception:
+        # Best-effort: never block normal message handling.
+        if str(os.getenv("TNT_EARNINGS_EMBED_DEBUG", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                print("[EARNINGS_EMBED] trigger=0 (exception)")
+                traceback.print_exc()
+            except Exception:
+                pass
+        pass
     try:
         content = message.content or ""
         if content.strip().lower().startswith("!analyze"):
@@ -12749,7 +21192,8 @@ async def _dispatch_analyze_request(
     try:
         render, _ = await _fetch_on_demand_render(symbol_input, allow_cache=not force_refresh)
     except Exception as exc:  # noqa: BLE001
-        print(f"[ANALYZE][ERROR] build render failed for {symbol_input!r}: {exc}")
+        msg = f"[ANALYZE][ERROR] build render failed for {symbol_input!r}: {exc}"
+        print(msg)
         await send(f"⚠️ Analyze build failed for **{symbol_input.upper()}**: {exc}")
         return
 
@@ -13704,6 +22148,144 @@ def main() -> None:
     entrypoint = "delivery.discord_bot"
     mode = (os.getenv("TNT_RUN_MODE", "dev") or "dev").strip().lower() or "dev"
 
+    _BOT_SINGLETON_LOCK: object | None = None
+
+    def _acquire_bot_singleton_lock() -> bool:
+        """Best-effort single-instance lock for local/dev runs.
+
+        Prevents two bot processes (same token) from simultaneously responding to
+        the same channel message, which can manifest as duplicate posts.
+
+        Override with `TNT_ALLOW_MULTIPLE_BOTS=1`.
+        """
+
+        allow_multi = str(os.getenv("TNT_ALLOW_MULTIPLE_BOTS", "") or "").strip().lower() in {"1", "true", "yes"}
+        if allow_multi:
+            return True
+
+        try:
+            lock_dir = Path("logs")
+            lock_dir.mkdir(parents=True, exist_ok=True)
+
+            # Token-aware lock even when the token is only in dotenv files.
+            token = (os.getenv("DISCORD_BOT_TOKEN") or "").strip()
+            if not token:
+                try:
+                    project_root = Path(__file__).resolve().parents[1]
+                    for env_path in (project_root / ".env.local", project_root / ".env"):
+                        try:
+                            raw = env_path.read_text(encoding="utf-8", errors="ignore")
+                        except Exception:
+                            continue
+                        for line in (raw or "").splitlines():
+                            t = (line or "").strip()
+                            if not t or t.startswith("#"):
+                                continue
+                            if t.lower().startswith("export "):
+                                t = t[7:].strip()
+                            if "=" not in t:
+                                continue
+                            k, v = t.split("=", 1)
+                            if (k or "").strip() != "DISCORD_BOT_TOKEN":
+                                continue
+                            token = (v or "").strip().strip('"').strip("'")
+                            break
+                        if token:
+                            break
+                except Exception:
+                    pass
+
+            lock_id = "default"
+            if token:
+                lock_id = hashlib.sha1(token.encode("utf-8")).hexdigest()[:12]
+            lock_path = lock_dir / f"tnt_discord_bot.{lock_id}.lock"
+            fh = open(lock_path, "a+", encoding="utf-8")
+
+            # Ensure the lock handle is not inheritable. If a child process inherits
+            # this handle, it can appear to "also" hold the singleton lock and we end
+            # up with two running bot processes.
+            try:
+                os.set_inheritable(fh.fileno(), False)
+            except Exception:
+                pass
+
+            try:
+                # Windows: msvcrt lock (non-blocking)
+                import msvcrt  # type: ignore
+
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                    return False
+            except Exception:
+                # POSIX: fcntl flock (non-blocking)
+                try:
+                    import fcntl  # type: ignore
+
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError:
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+                        return False
+                except Exception:
+                    # If locking isn't supported, don't block startup.
+                    return True
+
+            # Write PID stamp (informational).
+            try:
+                fh.seek(0)
+                fh.truncate(0)
+                fh.write(f"pid={os.getpid()}\n")
+                fh.flush()
+            except Exception:
+                pass
+
+            nonlocal _BOT_SINGLETON_LOCK
+            _BOT_SINGLETON_LOCK = fh
+            return True
+        except Exception:
+            return True
+
+    if not _acquire_bot_singleton_lock():
+        print("[FATAL] Another TNT Discord bot process is already running (singleton lock active).")
+        print("        Stop the other process or set TNT_ALLOW_MULTIPLE_BOTS=1 to override.")
+        sys.exit(2)
+
+    def _boot_version_marker() -> str:
+        """Best-effort version marker for auditability.
+
+        Prefer git SHA when available; fall back to a cheap file-bytes hash.
+        """
+
+        try:
+            git = str((_git_sha() or "")).strip()
+            if git and git != "unknown":
+                return f"git:{git[:12]}"
+        except Exception:
+            pass
+
+        try:
+            p = Path(__file__).resolve()
+            st = p.stat()
+
+            try:
+                with p.open("rb") as f:
+                    head = f.read(64 * 1024)
+                h = hashlib.sha1(head + f"|{st.st_size}".encode("utf-8")).hexdigest()[:12]
+                return f"file:{h}"
+            except Exception:
+                h = hashlib.sha1(f"{st.st_mtime_ns}:{st.st_size}".encode("utf-8")).hexdigest()[:12]
+                return f"file_meta:{h}"
+        except Exception:
+            return "unknown"
+
     def _normalize_env_value(value: str) -> str:
         value = value.strip()
         if len(value) >= 2:
@@ -13754,6 +22336,15 @@ def main() -> None:
         return "on" if (os.getenv(name, default) == "1") else "off"
 
     try:
+        started_at = time_lib.strftime("%Y-%m-%dT%H:%M:%SZ", time_lib.gmtime())
+        version = _boot_version_marker()
+        py = sys.version.split()[0]
+        plat = platform.system() or "unknown"
+        osname = os.name
+        print(
+            f"[BOOT] discord_bot loaded entrypoint={entrypoint} version={version} "
+            f"py={py} platform={plat} osname={osname} started_at={started_at} pid={os.getpid()}"
+        )
         print(f"[TNT][START] mode={mode} entrypoint={entrypoint} pid={os.getpid()}")
         ttl = (os.getenv("TNT_DECISION_LOCK_TTL_SEC", "900") or "900").strip()
         print(

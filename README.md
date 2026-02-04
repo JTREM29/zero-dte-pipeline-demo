@@ -1,10 +1,10 @@
 # Zero DTE Pipeline
 
-A comprehensive 0DTE options trading pipeline integrating multiple data sources (IQFeed, Polygon.io, Alpha Vantage) with market analysis, candidate generation, and automated parameter optimization.
+A comprehensive 0DTE options trading pipeline integrating multiple market data sources with market analysis, candidate generation, and automated parameter optimization.
 
 ## Features
 
-- **Multi-source Data Connectivity**: IQFeed, Polygon.io with automatic fallback
+- **Multi-source Data Connectivity**: Primary/secondary feeds with automatic fallback
 - **Market Condition Profiler**: Analyzes volatility, momentum, and breadth to select optimal strategies
 - **Candidate Generation**: Generates trading candidates for SPX, SPY, QQQ, IWM
 - **Intelligent Scoring**: Aligns direction, regime, IV signals, and order flow
@@ -43,7 +43,7 @@ IQFEED_LOGIN=your_login
 IQFEED_PASSWORD=your_password
 IQFEED_PRODUCT_ID=your_product_id
 
-# Polygon.io API
+# Market data API
 POLYGON_API_KEY=your_polygon_key
 
 # Pipeline Settings
@@ -124,7 +124,7 @@ zero_dte_pipeline/
 ├── data_connectors/       # Data source connectors
 │   ├── base.py           # Base connector class
 │   ├── iqfeed.py         # IQFeed connector
-│   ├── polygon.py        # Polygon.io connector
+│   ├── polygon.py        # Secondary REST connector
 │   └── unified.py        # Unified connector with fallback
 ├── candidates/            # Candidate generation and scoring
 │   ├── scoring.py        # Scoring logic

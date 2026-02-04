@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from pydantic import field_validator
+
+from .direction import Direction, coerce_direction
+
 from pydantic import BaseModel, Field
 
 # --- Enums / canonical strings ------------------------------------------------
@@ -19,6 +23,7 @@ class AlertSource(BaseModel):
     user_id: str
     channel_id: str
     request_text: str
+    created_at_utc: str | None = None
 
 
 class AlertTargets(BaseModel):
@@ -155,7 +160,7 @@ class Gates(BaseModel):
     confidence_min: float | None = None
     market_hours: MarketHoursGate | None = None
     cooldown: CooldownGate | None = None
-    max_triggers: int = 3
+    max_triggers: int | None = None
     data_freshness: DataFreshnessGate | None = None
 
 
@@ -208,11 +213,17 @@ class AlertIntentV1(BaseModel):
     version: Literal["1.0"] = "1.0"
     source: AlertSource
     targets: AlertTargets
+    direction: Direction = Direction.AUTO
     condition: Condition
     gates: Gates = Field(default_factory=Gates)
     lifecycle: Lifecycle
     actions: list[Action] = Field(default_factory=lambda: [ActionNotify()])
     risk: RiskSpec = Field(default_factory=RiskSpec)
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def _coerce_direction(cls, v: Any):
+        return coerce_direction(v)
 
 
 class StoredAlertState(BaseModel):

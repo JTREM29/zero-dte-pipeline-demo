@@ -536,7 +536,7 @@ if __name__ == "__main__":
 
 
 async def _fetch_polygon_news(symbol: str, limit: int = 8) -> List[Dict[str, Any]]:
-    """Fetch latest headlines from Polygon's REST API."""
+    """Fetch latest headlines from the primary news REST API."""
     api_key = config.polygon_api_key
     if not api_key:
         return []

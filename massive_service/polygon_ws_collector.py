@@ -27,9 +27,102 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+import socket
 from typing import Any, Iterable, Optional
 
 import websockets
+
+from services.observability.feed_heartbeat import write_feed_heartbeat
+
+
+_WS_LOCK: object | None = None
+
+
+def _acquire_singleton_lock() -> bool:
+    """Best-effort single-instance lock.
+
+    Prevents accidentally running multiple WS collectors that write concurrently
+    to the same SQLite DB.
+
+    Override with POLYGON_WS_ALLOW_MULTI=1.
+    """
+
+    allow_multi = str(os.getenv("POLYGON_WS_ALLOW_MULTI", "0") or "0").strip().lower() in {"1", "true", "yes"}
+    if allow_multi:
+        return True
+
+    try:
+        lock_dir = Path("logs")
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / "tnt_polygon_ws.lock"
+        fh = open(lock_path, "a+", encoding="utf-8")
+
+        # IMPORTANT (Windows): msvcrt.locking() locks from the current file
+        # position. Files opened with a+ start at EOF, so two processes can
+        # accidentally lock different regions and both "succeed". Always lock
+        # from the start of the file.
+        try:
+            fh.seek(0)
+        except Exception:
+            pass
+
+        # Windows: msvcrt lock (non-blocking)
+        try:
+            import msvcrt  # type: ignore
+
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                return False
+        except Exception:
+            # POSIX: fcntl flock (non-blocking)
+            try:
+                import fcntl  # type: ignore
+
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                    return False
+            except Exception:
+                return True
+
+        started_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            fh.seek(0)
+            fh.truncate(0)
+            fh.write(f"pid={os.getpid()}\n")
+            fh.write(f"host={socket.gethostname()}\n")
+            fh.write(f"started_utc={started_iso}\n")
+            fh.flush()
+        except Exception:
+            pass
+
+        global _WS_LOCK
+        _WS_LOCK = fh
+        print(f"[polygon_ws_collector] singleton lock acquired pid={os.getpid()} started_utc={started_iso}")
+        return True
+    except Exception:
+        return True
+
+
+def _read_lock_owner() -> str | None:
+    try:
+        p = Path("logs") / "tnt_polygon_ws.lock"
+        if not p.exists() or not p.is_file():
+            return None
+        txt = p.read_text(encoding="utf-8", errors="ignore").strip()
+        return txt or None
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True)
@@ -184,6 +277,15 @@ async def _run_once() -> None:
     channels = _channels()
     sub = _subscribe_params(symbols, channels)
 
+    write_feed_heartbeat(
+        "polygon_ws",
+        extra={
+            "market": (os.getenv("POLYGON_WS_MARKET") or "stocks").strip().lower(),
+            "symbols": len(list(symbols)),
+        },
+    )
+    last_hb = 0.0
+
     with sqlite3.connect(_db_path(), timeout=30) as conn:
         _ensure_db(conn)
 
@@ -193,6 +295,10 @@ async def _run_once() -> None:
 
             # Main loop.
             async for message in ws:
+                now = time.time()
+                if (now - last_hb) >= 10.0:
+                    write_feed_heartbeat("polygon_ws")
+                    last_hb = now
                 try:
                     payload = json.loads(message)
                 except Exception:
@@ -221,6 +327,12 @@ async def main_async() -> None:
         print("[polygon_ws_collector] POLYGON_ENABLED=0, exiting")
         return
 
+    if not _acquire_singleton_lock():
+        owner = _read_lock_owner() or "unknown"
+        print("[FATAL] Another polygon WS collector process is already running (singleton lock active).")
+        print(f"[FATAL] lock_owner:\n{owner}")
+        raise SystemExit(2)
+
     backoff = 1.0
     while True:
         try:
@@ -231,6 +343,7 @@ async def main_async() -> None:
             return
         except Exception as exc:
             print(f"[polygon_ws_collector] ERROR: {exc}")
+            write_feed_heartbeat("polygon_ws", last_error=f"{type(exc).__name__}: {exc}")
             time.sleep(backoff)
             backoff = min(backoff * 2.0, 30.0)
 

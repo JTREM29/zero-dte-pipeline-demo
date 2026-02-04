@@ -4,6 +4,7 @@ Routes data requests through multiple providers with automatic
 fallback when primary sources fail.
 """
 import asyncio
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Type
 
@@ -15,7 +16,6 @@ from zero_dte_pipeline.data_connectors.base import (
     DataConnectorError,
     TimeoutError,
 )
-from data import iqfeed_client
 from zero_dte_pipeline.data_connectors.polygon import PolygonConnector
 from zero_dte_pipeline.utils.logging import get_logger
 
@@ -36,11 +36,14 @@ class UnifiedDataConnector:
         "polygon": PolygonConnector,
     }
 
-    if iqfeed_client.IQFEED_ENABLED:
+    # IQFeed is opt-in: do not import/register unless explicitly enabled.
+    if (os.getenv("TNT_ENABLE_IQFEED", "0") or "0").strip() == "1":
         try:
-            PROVIDERS["iqfeed"] = iqfeed_client.get_connector_class()
-        except RuntimeError:
-            logger.info("IQFeed disabled via configuration; provider not registered")
+            from zero_dte_pipeline.data_connectors.iqfeed import IQFeedConnector
+
+            PROVIDERS["iqfeed"] = IQFeedConnector
+        except Exception as exc:
+            logger.info("IQFeed not available; provider not registered (%s)", exc)
     
     def __init__(
         self,
@@ -223,6 +226,11 @@ class UnifiedDataConnector:
         """
         errors = []
         provider_order = providers or self.priority
+
+        # Fail fast if a caller explicitly requests IQFeed while it's disabled.
+        if providers and any(str(p).strip().lower() == "iqfeed" for p in providers):
+            if (os.getenv("TNT_ENABLE_IQFEED", "0") or "0").strip() != "1":
+                raise RuntimeError("IQFeed disabled (set TNT_ENABLE_IQFEED=1 to enable)")
         
         for provider_name in provider_order:
             if not await self._ensure_provider_connected(provider_name):

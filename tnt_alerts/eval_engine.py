@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional, Sequence
+from datetime import datetime, time, timezone
+from typing import Any, Optional, Sequence
 
 from .alert_intent import (
     AlertIntent,
@@ -12,6 +12,7 @@ from .alert_intent import (
     ConfirmMode,
     CrossCondition,
     CrossOp,
+    MarketHoursGate,
     Level,
     LevelRefName,
     LevelType,
@@ -26,16 +27,31 @@ from .alert_intent import (
 )
 from .reasons import (
     NO_TRIGGER_CONDITION_FALSE,
+    SKIP_EARNINGS_WINDOW,
+    SKIP_CTX_MISSING_EARNINGS,
+    SKIP_CTX_MISSING_NEWS,
+    SKIP_MACRO_WINDOW,
+    SKIP_MARKET_NEWS_RECENT,
+    SKIP_NEWS_RECENT,
     SUPPRESS_COOLDOWN,
     SUPPRESS_CONFIDENCE,
     SUPPRESS_DATA_MISSING,
     SUPPRESS_DATA_STALE,
     SUPPRESS_INDICATOR_UNAVAILABLE,
     SUPPRESS_MAX_TRIGGERS_REACHED,
+    SUPPRESS_FUTURES_CONFLICT_BULLISH,
+    SUPPRESS_FUTURES_CONFLICT_BEARISH,
     SUPPRESS_REGIME,
     SUPPRESS_SESSION_MISMATCH,
     TRIGGERED_CONDITION_TRUE,
+    TRIGGERED_DEBUG_FORCE,
 )
+
+from .direction import infer_direction
+
+from .gates.earnings_blackout import earnings_blackout
+from .gates.macro_blackout import macro_blackout
+from .gates.news_blackout import news_blackout
 
 
 # NOTE:
@@ -90,7 +106,42 @@ def compute_vwap(bars: Sequence[Bar]) -> Optional[float]:
     return pv / vv
 
 
-def resolve_series(series: Series, snap: MarketDataSnapshot, *, use_close: bool) -> Optional[float]:
+def _filter_bars_for_vwap(bars: Sequence[Bar], *, anchor: str) -> Sequence[Bar]:
+    """Optionally filter bars for VWAP calculation.
+
+    Anchors:
+    - "DAY": bars from the current ET trading date
+    - "RTH": bars from current ET date with t >= 09:30 ET
+    """
+
+    if not bars:
+        return bars
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        et_tz = ZoneInfo("America/New_York")
+    except Exception:
+        return bars
+
+    last_et = bars[-1].ts_utc.astimezone(et_tz)
+    session_date = last_et.date()
+
+    anchor_norm = str(anchor or "").strip().upper() or "DAY"
+    rth_open = time(9, 30)
+
+    out: list[Bar] = []
+    for b in bars:
+        bet = b.ts_utc.astimezone(et_tz)
+        if bet.date() != session_date:
+            continue
+        if anchor_norm == "RTH" and bet.time() < rth_open:
+            continue
+        out.append(b)
+    return out
+
+
+def resolve_series(series: Series, snap: MarketDataSnapshot, context: dict | None = None, *, use_close: bool) -> Optional[float]:
     if series.type == SeriesType.price:
         if use_close:
             return snap.bars[-1].c if snap.bars else None
@@ -102,6 +153,11 @@ def resolve_series(series: Series, snap: MarketDataSnapshot, *, use_close: bool)
         return None
 
     if name.value == "vwap":
+        anchor = None
+        if isinstance(context, dict):
+            anchor = context.get("vwap_anchor") or context.get("vwap_session")
+        if anchor:
+            return compute_vwap(_filter_bars_for_vwap(snap.bars, anchor=str(anchor)))
         return compute_vwap(snap.bars)
     if name.value == "sma":
         n = int(series.params.get("n", 200))
@@ -153,10 +209,10 @@ def eval_cross(cond: CrossCondition, snap: MarketDataSnapshot, context: dict) ->
         price_ts_utc=prev_bar.ts_utc,
     )
 
-    prev_left = resolve_series(cond.left, prev_snap, use_close=True)
-    prev_right = resolve_series(cond.right, prev_snap, use_close=True)
-    curr_left = resolve_series(cond.left, snap, use_close=True)
-    curr_right = resolve_series(cond.right, snap, use_close=True)
+    prev_left = resolve_series(cond.left, prev_snap, context, use_close=True)
+    prev_right = resolve_series(cond.right, prev_snap, context, use_close=True)
+    curr_left = resolve_series(cond.left, snap, context, use_close=True)
+    curr_right = resolve_series(cond.right, snap, context, use_close=True)
 
     if prev_left is None or prev_right is None or curr_left is None or curr_right is None:
         return False, {"reason": SUPPRESS_INDICATOR_UNAVAILABLE}
@@ -256,10 +312,107 @@ class GateContext:
     now_utc: datetime
     regime: Optional[Regime] = None
     regime_confidence: Optional[float] = None
+    # Optional services injected by the scheduler.
+    calendar: Any | None = None
+    news: Any | None = None
+    futures: Any | None = None
 
 
 def gates_pass(intent: AlertIntent, snap: MarketDataSnapshot, gctx: GateContext, state: dict) -> tuple[bool, list[dict]]:
     reasons: list[dict] = []
+
+    def _earnings_near_note_if_fresh(symbol: str) -> str | None:
+        """Return a compact earnings note (today/tomorrow only) if cache is fresh.
+
+        This is for secondary notes (e.g., futures conflict) and must not call external APIs.
+        """
+
+        if gctx.calendar is None:
+            return None
+
+        # Preferred: canonical ctx snapshot (aligns wording across preview/gates).
+        try:
+            if hasattr(gctx.calendar, "get_symbol_context_snapshot"):
+                ctx = gctx.calendar.get_symbol_context_snapshot(symbol)
+                if isinstance(ctx, dict):
+                    e = ctx.get("earnings")
+                    if isinstance(e, dict) and bool(e.get("fresh")):
+                        note = str(e.get("note") or "").strip()
+                        return note or None
+        except Exception:
+            pass
+
+        # Strict cutover behavior.
+        try:
+            from services.context.ctx_mode import ctx_enabled, ctx_strict_mode
+            from services.context.context_miss import record_ctx_miss
+
+            if ctx_enabled():
+                mode = ctx_strict_mode()
+                r = getattr(gctx.calendar, "r", None)
+                record_ctx_miss(r, "futures_conflict_gate", sym=str(symbol or "").strip().upper(), why="ctx_missing")
+                if mode == "on":
+                    # Strict: do not attach secondary earnings notes if ctx is missing.
+                    return None
+        except Exception:
+            pass
+
+        # Fallback (temporary): legacy cached earnings blob.
+        try:
+            ev = gctx.calendar.get_cached_earnings(symbol)
+        except Exception:
+            return None
+        if not isinstance(ev, dict):
+            return None
+
+        refreshed_utc = str(ev.get("refreshed_utc") or "").strip()
+        if not refreshed_utc:
+            return None
+        try:
+            dt_ref = datetime.fromisoformat(refreshed_utc.replace("Z", "+00:00"))
+            if dt_ref.tzinfo is None:
+                dt_ref = dt_ref.replace(tzinfo=timezone.utc)
+            dt_ref = dt_ref.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+        try:
+            stale_hours = int(__import__("os").getenv("EARNINGS_PREVIEW_STALE_HOURS", "48"))
+        except Exception:
+            stale_hours = 48
+        stale_hours = max(1, min(168, int(stale_hours)))
+
+        age_s = int((datetime.now(timezone.utc) - dt_ref).total_seconds())
+        if age_s < 0:
+            age_s = 0
+        if age_s > (stale_hours * 3600):
+            return None
+
+        try:
+            from services.calendar.earnings_overlay import build_earnings_near_note
+
+            return build_earnings_near_note(ev)
+        except Exception:
+            return None
+
+    def _parse_state_dt(x: object) -> datetime | None:
+        if x is None:
+            return None
+        if isinstance(x, datetime):
+            return x
+        if isinstance(x, str):
+            s = x.strip()
+            if not s:
+                return None
+            try:
+                raw = s.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(raw)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except Exception:
+                return None
+        return None
 
     if intent.gates.data_freshness:
         max_age = intent.gates.data_freshness.price_age_seconds
@@ -268,11 +421,22 @@ def gates_pass(intent: AlertIntent, snap: MarketDataSnapshot, gctx: GateContext,
             reasons.append({"code": SUPPRESS_DATA_STALE, "age_sec": age, "max_age_sec": max_age})
             return False, reasons
 
-    if intent.gates.market_hours:
-        mh = intent.gates.market_hours
+    # RTH-default: if market_hours gate is missing, treat it as RTH.
+    mh = intent.gates.market_hours if intent.gates is not None else None
+    if mh is None:
+        try:
+            mh = MarketHoursGate(session=Session.RTH, time_window_et=None)
+        except Exception:
+            mh = None
+
+    if mh is not None:
         if mh.session == Session.RTH:
             if not is_in_rth(gctx.now_utc):
                 reasons.append({"code": SUPPRESS_SESSION_MISMATCH, "session": "RTH"})
+                return False, reasons
+        elif mh.session == Session.ETH:
+            if not is_in_eth(gctx.now_utc):
+                reasons.append({"code": SUPPRESS_SESSION_MISMATCH, "session": "ETH"})
                 return False, reasons
         elif mh.session == Session.CUSTOM:
             if not mh.time_window_et or not is_in_custom_window_et(gctx.now_utc, mh.time_window_et):
@@ -292,8 +456,93 @@ def gates_pass(intent: AlertIntent, snap: MarketDataSnapshot, gctx: GateContext,
                 reasons.append({"code": SUPPRESS_CONFIDENCE, "conf": gctx.regime_confidence, "min": rg.min_confidence})
                 return False, reasons
 
+    # Calendar/news blackout gates (optional; injected via GateContext).
+    if intent.gates.macro_blackout and gctx.calendar is not None:
+        mg = intent.gates.macro_blackout
+        res = macro_blackout(
+            gctx.calendar,
+            now_utc=gctx.now_utc,
+            event_types=mg.event_types,
+            pre_minutes=mg.pre_minutes,
+            post_minutes=mg.post_minutes,
+        )
+        if not res.ok:
+            reasons.append({"code": res.code or SKIP_MACRO_WINDOW, "note": res.note, **(res.details or {})})
+            return False, reasons
+
+    if intent.gates.earnings_blackout and gctx.calendar is not None:
+        eg = intent.gates.earnings_blackout
+        res = earnings_blackout(
+            snap.symbol,
+            gctx.calendar,
+            now_utc=gctx.now_utc,
+            pre_minutes=eg.pre_minutes,
+            post_minutes=eg.post_minutes,
+            confirmed_only=bool(eg.confirmed_only),
+        )
+        if not res.ok:
+            reasons.append({"code": res.code or SKIP_EARNINGS_WINDOW, "note": res.note, **(res.details or {})})
+            return False, reasons
+
+    if intent.gates.news_blackout and gctx.news is not None:
+        ng = intent.gates.news_blackout
+        res = news_blackout(
+            snap.symbol,
+            gctx.news,
+            now_utc=gctx.now_utc,
+            symbol_minutes=ng.minutes,
+            market_minutes=ng.market_minutes,
+        )
+        if not res.ok:
+            # Preserve explicit code choice from gate.
+            fallback = SKIP_NEWS_RECENT
+            if (res.code or "") == SKIP_MARKET_NEWS_RECENT:
+                fallback = SKIP_MARKET_NEWS_RECENT
+            reasons.append({"code": res.code or fallback, "note": res.note, **(res.details or {})})
+            return False, reasons
+
+    # Futures direction-aware suppression (opt-in; does not break existing alerts).
+    # Enable globally via TNT_ALERTS_FUTURES_GATE=1 or per-alert via tags.futures_gate.
+    try:
+        tag_val = intent.tags.get("futures_gate") if isinstance(intent.tags, dict) else None
+        tag_s = str(tag_val).strip().lower() if tag_val is not None else ""
+        tag_enabled = tag_s in {"1", "true", "yes", "on", "enabled"}
+        tag_disabled = tag_s in {"0", "false", "no", "off", "disabled"}
+    except Exception:
+        tag_enabled = False
+        tag_disabled = False
+
+    env_enabled = (str(__import__("os").getenv("TNT_ALERTS_FUTURES_GATE", "0") or "0").strip() == "1")
+    enabled = (tag_enabled or env_enabled) and not tag_disabled
+
+    fut = gctx.futures if enabled else None
+    if enabled and isinstance(fut, dict):
+        es_bias = str(fut.get("es_bias") or "").strip().upper()
+        if es_bias in {"BULL", "BEAR"}:
+            d = infer_direction(intent)
+            if d == "BULLISH" and es_bias == "BEAR":
+                r = {"code": SUPPRESS_FUTURES_CONFLICT_BULLISH, "es_bias": es_bias, "note": "Futures bearish vs BULLISH intent"}
+                try:
+                    en = _earnings_near_note_if_fresh(snap.symbol)
+                    if en:
+                        r["earnings_note"] = en
+                except Exception:
+                    pass
+                reasons.append(r)
+                return False, reasons
+            if d == "BEARISH" and es_bias == "BULL":
+                r = {"code": SUPPRESS_FUTURES_CONFLICT_BEARISH, "es_bias": es_bias, "note": "Futures bullish vs BEARISH intent"}
+                try:
+                    en = _earnings_near_note_if_fresh(snap.symbol)
+                    if en:
+                        r["earnings_note"] = en
+                except Exception:
+                    pass
+                reasons.append(r)
+                return False, reasons
+
     if intent.gates.cooldown and intent.gates.cooldown.seconds > 0:
-        last_ts = state.get("last_trigger_ts_utc")
+        last_ts = _parse_state_dt(state.get("last_trigger_ts_utc"))
         if last_ts is not None:
             dt = (gctx.now_utc - last_ts).total_seconds()
             if dt < intent.gates.cooldown.seconds:
@@ -335,26 +584,89 @@ def evaluate_alert(intent: AlertIntent, snap: MarketDataSnapshot, context: dict,
         "data_age_sec": (gctx.now_utc - snap.price_ts_utc).total_seconds(),
     }
 
+    def _record_last_eval(*, ok: bool, skipped: bool, reasons: list[dict] | None = None) -> None:
+        try:
+            state["last_eval"] = {
+                "ts_utc": str(event.get("ts_utc") or ""),
+                "ok": bool(ok),
+                "skipped": bool(skipped),
+                "decision": str(event.get("decision") or ""),
+                "reasons": list(reasons or []),
+            }
+        except Exception:
+            return
+
     ok, gate_reasons = gates_pass(intent, snap, gctx, state)
     if not ok:
         event["decision"] = "SUPPRESSED"
         event["reason_codes"] = [r["code"] for r in gate_reasons]
         event["eval"]["gates"] = gate_reasons
+        _record_last_eval(ok=False, skipped=True, reasons=gate_reasons)
         return event
 
     triggered, eval_details = eval_condition(intent, snap, context)
     event["eval"]["condition"] = eval_details
 
+    # Dev-only: deterministic trigger mode to validate trigger -> queue -> Discord.
+    # When enabled, VWAP-cross intents act like "price vs VWAP" so we don't have
+    # to wait for a true crossing. All gates (session/cooldown/max_triggers/etc)
+    # are still enforced by gates_pass() above.
+    try:
+        import os
+
+        debug_force = (str(os.getenv("TNT_ALERTS_DEBUG_FORCE_TRIGGER", "0") or "0").strip().lower() in {"1", "true", "yes", "on"})
+    except Exception:
+        debug_force = False
+
+    if debug_force and not triggered:
+        try:
+            if isinstance(intent.condition, CrossCondition):
+                op = getattr(intent.condition, "op", None)
+                curr_left = eval_details.get("curr_left") if isinstance(eval_details, dict) else None
+                curr_right = eval_details.get("curr_right") if isinstance(eval_details, dict) else None
+
+                if curr_left is not None and curr_right is not None:
+                    # "price vs VWAP" proxy.
+                    if op == CrossOp.crosses_above and float(curr_left) > float(curr_right):
+                        triggered = True
+                    elif op == CrossOp.crosses_below and float(curr_left) < float(curr_right):
+                        triggered = True
+                else:
+                    # If VWAP is missing, still allow a single forced trigger to
+                    # validate the delivery plumbing.
+                    if not bool(state.get("debug_force_triggered")):
+                        triggered = True
+
+                if triggered:
+                    try:
+                        state["debug_force_triggered"] = True
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(eval_details, dict):
+                            eval_details["debug_forced"] = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     if not triggered:
         event["decision"] = "NO_TRIGGER"
         event["reason_codes"] = [NO_TRIGGER_CONDITION_FALSE]
+        _record_last_eval(ok=True, skipped=False, reasons=[{"code": NO_TRIGGER_CONDITION_FALSE}])
         return event
 
-    state["last_trigger_ts_utc"] = gctx.now_utc
+    # Persist as ISO-8601 string so Redis JSON state remains serializable.
+    state["last_trigger_ts_utc"] = gctx.now_utc.isoformat()
     state["trigger_count"] = int(state.get("trigger_count", 0)) + 1
 
     event["decision"] = "TRIGGERED"
-    event["reason_codes"] = [TRIGGERED_CONDITION_TRUE]
+    if bool((event.get("eval") or {}).get("condition", {}).get("debug_forced")):
+        event["reason_codes"] = [TRIGGERED_DEBUG_FORCE]
+        _record_last_eval(ok=True, skipped=False, reasons=[{"code": TRIGGERED_DEBUG_FORCE}])
+    else:
+        event["reason_codes"] = [TRIGGERED_CONDITION_TRUE]
+        _record_last_eval(ok=True, skipped=False, reasons=[{"code": TRIGGERED_CONDITION_TRUE}])
     return event
 
 
@@ -362,8 +674,90 @@ def evaluate_alert(intent: AlertIntent, snap: MarketDataSnapshot, context: dict,
 
 
 def is_in_rth(now_utc: datetime) -> bool:
+    try:
+        from zoneinfo import ZoneInfo
+
+        et = now_utc.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        # Conservative fallback: if we can't convert, do not allow triggers.
+        return False
+
+    # Mon-Fri only (holiday calendar handled by separate macro/earnings gates).
+    if et.weekday() >= 5:
+        return False
+
+    # RTH = 09:30:00 <= t < 16:00:00 ET
+    mins = et.hour * 60 + et.minute
+    start = 9 * 60 + 30
+    end = 16 * 60
+    if mins < start:
+        return False
+    if mins > end:
+        return False
+    if mins == end:
+        # If exactly 16:00, treat as out of session.
+        return False
     return True
+
+
+def is_in_eth(now_utc: datetime) -> bool:
+    try:
+        from zoneinfo import ZoneInfo
+
+        et = now_utc.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        return False
+
+    # Mon-Fri only (holiday calendar handled elsewhere).
+    if et.weekday() >= 5:
+        return False
+
+    # ETH (stocks) ~ 04:00 <= t < 20:00 ET
+    mins = et.hour * 60 + et.minute
+    start = 4 * 60
+    end = 20 * 60
+    return start <= mins < end
 
 
 def is_in_custom_window_et(now_utc: datetime, window_et: list[str]) -> bool:
-    return True
+    if not window_et or len(window_et) != 2:
+        return False
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        et = now_utc.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        return False
+
+    # Only allow on weekdays by default.
+    if et.weekday() >= 5:
+        return False
+
+    def _parse_hhmm(s: str) -> int | None:
+        try:
+            raw = (s or "").strip()
+            if not raw:
+                return None
+            hh, mm = raw.split(":", 1)
+            h = int(hh)
+            m = int(mm)
+            if h < 0 or h > 23 or m < 0 or m > 59:
+                return None
+            return h * 60 + m
+        except Exception:
+            return None
+
+    start = _parse_hhmm(str(window_et[0]))
+    end = _parse_hhmm(str(window_et[1]))
+    if start is None or end is None:
+        return False
+
+    now_mins = et.hour * 60 + et.minute
+
+    # Treat end as exclusive (matches RTH behavior).
+    if start <= end:
+        return start <= now_mins < end
+
+    # Overnight window (e.g., 15:30-09:45)
+    return (now_mins >= start) or (now_mins < end)

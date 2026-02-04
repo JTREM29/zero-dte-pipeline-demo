@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .direction import Direction, coerce_direction
+
 
 # -------------------------
 # Enums
@@ -329,9 +331,61 @@ class DataFreshnessGate(BaseModel):
         return v
 
 
+class MacroBlackoutGate(BaseModel):
+    event_types: Optional[list[str]] = None
+    pre_minutes: int = 10
+    post_minutes: int = 10
+
+    @field_validator("pre_minutes", "post_minutes")
+    @classmethod
+    def _mins_ok(cls, v: int) -> int:
+        if v < 0 or v > 24 * 60:
+            raise ValueError("minutes must be 0..1440")
+        return v
+
+
+class EarningsBlackoutGate(BaseModel):
+    pre_minutes: int = 60
+    post_minutes: int = 60
+    confirmed_only: bool = True
+
+    @field_validator("pre_minutes", "post_minutes")
+    @classmethod
+    def _mins_ok(cls, v: int) -> int:
+        if v < 0 or v > 7 * 24 * 60:
+            raise ValueError("minutes must be 0..10080")
+        return v
+
+
+class NewsBlackoutGate(BaseModel):
+    # Default policy: Symbol MED/HIGH broadcasts suppress for 3 minutes;
+    # marketwide HIGH broadcasts suppress for 5 minutes.
+    minutes: int = 3
+    market_minutes: Optional[int] = 5
+
+    @field_validator("minutes")
+    @classmethod
+    def _mins_ok(cls, v: int) -> int:
+        if v < 0 or v > 24 * 60:
+            raise ValueError("minutes must be 0..1440")
+        return v
+
+    @field_validator("market_minutes")
+    @classmethod
+    def _mins2_ok(cls, v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
+        if v < 0 or v > 24 * 60:
+            raise ValueError("market_minutes must be 0..1440")
+        return v
+
+
 class Gates(BaseModel):
     regime: Optional[RegimeGate] = None
     market_hours: Optional[MarketHoursGate] = None
+    macro_blackout: Optional[MacroBlackoutGate] = None
+    earnings_blackout: Optional[EarningsBlackoutGate] = None
+    news_blackout: Optional[NewsBlackoutGate] = None
     cooldown: Optional[CooldownGate] = None
     max_triggers: Optional[MaxTriggersGate] = None
     data_freshness: Optional[DataFreshnessGate] = None
@@ -395,6 +449,7 @@ class AlertIntent(BaseModel):
     version: str = "1.0"
     source: SourceMeta
     targets: Targets
+    direction: Direction = Direction.AUTO
     condition: Condition
     gates: Gates = Field(default_factory=Gates)
     lifecycle: Lifecycle = Field(default_factory=Lifecycle)
@@ -406,3 +461,8 @@ class AlertIntent(BaseModel):
         if self.targets.type == TargetsType.symbols and len(self.targets.symbols) > self.targets.max_symbols:
             raise ValueError(f"Too many symbols: {len(self.targets.symbols)} > {self.targets.max_symbols}")
         return self
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def _coerce_direction(cls, v: object):
+        return coerce_direction(v)

@@ -31,6 +31,12 @@
       }
     },
 
+    "direction": {
+      "type": "string",
+      "enum": ["AUTO", "BULLISH", "BEARISH", "NEUTRAL"],
+      "default": "AUTO"
+    },
+
     "condition": {
       "type": "object",
       "required": ["type", "timeframe", "confirm"],
@@ -106,6 +112,29 @@
               "type": ["array", "null"],
               "items": { "type": "string" }
             }
+          }
+        },
+        "macro_blackout": {
+          "type": "object",
+          "properties": {
+            "event_types": { "type": ["array", "null"], "items": { "type": "string" } },
+            "pre_minutes": { "type": "integer", "minimum": 0 },
+            "post_minutes": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "earnings_blackout": {
+          "type": "object",
+          "properties": {
+            "pre_minutes": { "type": "integer", "minimum": 0 },
+            "post_minutes": { "type": "integer", "minimum": 0 },
+            "confirmed_only": { "type": "boolean" }
+          }
+        },
+        "news_blackout": {
+          "type": "object",
+          "properties": {
+            "minutes": { "type": "integer", "minimum": 0 },
+            "market_minutes": { "type": ["integer", "null"], "minimum": 0 }
           }
         },
         "cooldown": { "type": "object", "properties": { "seconds": { "type": "integer" } } },

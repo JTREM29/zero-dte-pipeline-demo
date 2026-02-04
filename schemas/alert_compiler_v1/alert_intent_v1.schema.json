@@ -31,6 +31,12 @@
       }
     },
 
+    "direction": {
+      "type": "string",
+      "enum": ["AUTO", "BULLISH", "BEARISH", "NEUTRAL"],
+      "default": "AUTO"
+    },
+
     "condition": {
       "type": "object",
       "required": ["type", "timeframe", "confirm"],

@@ -12,7 +12,10 @@ def test_market_session_question_classifier():
 def test_market_session_answer_format():
     txt = bot._answer_market_session_question()
     assert isinstance(txt, str)
-    assert txt.startswith("Answer:")
+    assert "A) State" in txt
+    assert "B) Why" in txt
+    assert "C) Action" in txt
+    assert "D) Risk + invalidation" in txt
 
 
 def test_watchlist_question_classifier():
@@ -31,7 +34,7 @@ def test_watchlist_answer_reads_db(tmp_path, monkeypatch):
         conn.commit()
 
     txt = bot._answer_watchlist_question()
-    assert txt.startswith("Answer:")
+    assert "A) State" in txt
     assert "SPY" in txt
 
 
@@ -55,8 +58,7 @@ def test_key_levels_answer_happy_path():
     }
     txt = bot._answer_key_levels_question("SPY", tnt_state)
     assert isinstance(txt, str)
-    assert txt.startswith("Answer:")
-    assert "Bullish only if:" in txt
-    assert "Bearish if:" in txt
-    assert "Invalidation:" in txt
-    assert "Do nothing if:" in txt
+    assert "A) State" in txt
+    assert "B) Why" in txt
+    assert "C) Action" in txt
+    assert "D) Risk + invalidation" in txt

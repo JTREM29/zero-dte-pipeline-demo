@@ -1,0 +1,42 @@
+# REST API
+
+## Aggregates
+
+- [Custom Bars (OHLC)](https://massive.com/docs/rest/options/aggregates/custom-bars.md): Retrieve aggregated historical OHLC (Open, High, Low, Close) and volume data for a specified options contract over a custom date range and time interval in Eastern Time (ET)
+- [Daily Ticker Summary (OHLC)](https://massive.com/docs/rest/options/aggregates/daily-ticker-summary.md): Retrieve the opening and closing prices for a specific options contract on a given date, along with any pre-market and after-hours trade prices
+- [Previous Day Bar (OHLC)](https://massive.com/docs/rest/options/aggregates/previous-day-bar.md): Retrieve the previous trading day's open, high, low, and close (OHLC) data for a specified option contract
+
+## Contracts
+
+- [All Contracts](https://massive.com/docs/rest/options/contracts/all-contracts.md): Retrieve a comprehensive index of options contracts, encompassing both active and expired listings
+- [Contract Overview](https://massive.com/docs/rest/options/contracts/contract-overview.md): Retrieve detailed information about a specific options contract, including its contract type (call or put), exercise style, expiration date, strike price, shares per contract, underlying ticker, and primary exchange
+
+## Market Operations
+
+- [Condition Codes](https://massive.com/docs/rest/options/market-operations/condition-codes.md): Retrieve a unified and comprehensive list of trade and quote conditions from various upstream market data providers (e.g., CTA, UTP, OPRA, FINRA)
+- [Exchanges](https://massive.com/docs/rest/options/market-operations/exchanges.md): Retrieve a list of known exchanges, including their identifiers, names, market types, and other relevant attributes
+- [Market Holidays](https://massive.com/docs/rest/options/market-operations/market-holidays.md): Retrieve upcoming market holidays and their corresponding open/close times
+- [Market Status](https://massive.com/docs/rest/options/market-operations/market-status.md): Retrieve the current trading status for various exchanges and overall financial markets
+
+## Quotes
+
+- [Quotes](https://massive.com/docs/rest/options/quotes.md): Retrieve historical quotes for a specified options contract over a defined time range
+
+## Snapshots
+
+- [Option Chain Snapshot](https://massive.com/docs/rest/options/snapshots/option-chain-snapshot.md): Retrieve a comprehensive snapshot of all options contracts associated with a specified underlying ticker
+- [Option Contract Snapshot](https://massive.com/docs/rest/options/snapshots/option-contract-snapshot.md): Retrieve a comprehensive snapshot of a specified options contract, consolidating vital metrics and market data into a single response
+- [Unified Snapshot](https://massive.com/docs/rest/options/snapshots/unified-snapshot.md): Retrieve unified snapshots of market data for multiple asset classes including stocks, options, forex, and cryptocurrencies in a single request
+
+## Technical Indicators
+
+- [Exponential Moving Average (EMA)](https://massive.com/docs/rest/options/technical-indicators/exponential-moving-average.md): Retrieve the Exponential Moving Average (EMA) for a specified ticker over a defined time range
+- [Moving Average Convergence/Divergence (MACD)](https://massive.com/docs/rest/options/technical-indicators/moving-average-convergence-divergence.md): Retrieve the Moving Average Convergence/Divergence (MACD) for a specified ticker over a defined time range
+- [Relative Strength Index (RSI)](https://massive.com/docs/rest/options/technical-indicators/relative-strength-index.md): Retrieve the Relative Strength Index (RSI) for a specified ticker over a defined time range
+- [Simple Moving Average (SMA)](https://massive.com/docs/rest/options/technical-indicators/simple-moving-average.md): Retrieve the Simple Moving Average (SMA) for a specified ticker over a defined time range
+
+## Trades Quotes
+
+- [Last Trade](https://massive.com/docs/rest/options/trades-quotes/last-trade.md): Retrieve the latest available trade for a specified options contact, including details such as price, size, exchange, and timestamp
+- [Quotes](https://massive.com/docs/rest/options/trades-quotes/quotes.md): Retrieve historical quotes for a specified options contract over a defined time range
+- [Trades](https://massive.com/docs/rest/options/trades-quotes/trades.md): Retrieve comprehensive, tick-level trade data for a specified options ticker within a defined time range

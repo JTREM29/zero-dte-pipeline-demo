@@ -166,6 +166,17 @@ def main(argv: list[str] | None = None) -> int:
     tf = str(args.tf).strip()
     lookback = int(args.lookback)
 
+    futures_store = None
+    if (os.getenv("FUTURES_ENABLED", "0") or "0").strip() == "1":
+        try:
+            from services.futures.futures_store import FuturesStore  # type: ignore
+
+            futures_store = FuturesStore()
+            print("[TNT][ALERTS][SCHED] futures context enabled")
+        except Exception as exc:
+            futures_store = None
+            print(f"[TNT][ALERTS][SCHED] futures context unavailable: {type(exc).__name__}: {exc}")
+
     queue = (os.getenv("TNT_REDIS_QUEUE", "tnt:jobs") or "tnt:jobs").strip()
     print(f"[TNT][ALERTS][SCHED] tf={tf} lookback={lookback} redis_queue={queue}")
 
@@ -179,7 +190,27 @@ def main(argv: list[str] | None = None) -> int:
             return _fetch_snaps(symbols, tf2, lookback=lookback)
 
         def _gate(_sym: str):
-            return GateContext(now_utc=datetime.now(timezone.utc), regime=None, regime_confidence=None)
+            futures_ctx = None
+            if futures_store is not None:
+                try:
+                    scores = futures_store.get_scores()
+                    if scores is not None:
+                        reg = str(scores.regime or "").strip().upper()
+                        if "BEAR" in reg:
+                            es_bias = "BEAR"
+                        elif "BULL" in reg:
+                            es_bias = "BULL"
+                        else:
+                            es_bias = "NEUTRAL"
+                        futures_ctx = {
+                            "es_bias": es_bias,
+                            "regime": reg,
+                            "vol_mult": float(scores.vol_mult),
+                            "updated_utc": int(scores.updated_utc),
+                        }
+                except Exception:
+                    futures_ctx = None
+            return GateContext(now_utc=datetime.now(timezone.utc), regime=None, regime_confidence=None, futures=futures_ctx)
 
         def _levels(sym: str):
             return _build_levels_context(sym)

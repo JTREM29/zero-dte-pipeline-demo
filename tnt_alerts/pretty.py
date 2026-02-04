@@ -108,7 +108,13 @@ def intent_to_dsl(intent: AlertIntentV1) -> str:
     if g.confidence_min is not None:
         gates.append(f"confidence >= {float(g.confidence_min):.2f}")
     if g.cooldown is not None:
-        gates.append(f"cooldown {int(g.cooldown.seconds)}s")
+        sec = int(g.cooldown.seconds)
+        if sec % 3600 == 0 and sec >= 3600:
+            gates.append(f"cooldown {int(sec / 3600)}h")
+        elif sec % 60 == 0 and sec >= 60:
+            gates.append(f"cooldown {int(sec / 60)}m")
+        else:
+            gates.append(f"cooldown {sec}s")
     if g.max_triggers:
         gates.append(f"max_triggers {int(g.max_triggers)}")
     if g.data_freshness is not None:

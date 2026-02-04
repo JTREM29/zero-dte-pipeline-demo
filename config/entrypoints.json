@@ -1,0 +1,5 @@
+{
+  "discord_entrypoints": [
+    "cli/discord_bot.py"
+  ]
+}

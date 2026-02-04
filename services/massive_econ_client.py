@@ -47,16 +47,18 @@ def build_massive_client_from_env() -> MassiveEconClient:
     )
 
 
-def normalize_massive_payload(series: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_massive_payload(series: str, payload: Dict[str, Any], *, history_n: int = 1) -> Dict[str, Any]:
     """Normalize Massive series responses to a consistent record for Redis + embeds.
 
-    Uses the newest item in results (assuming sort=date.desc).
+    Uses the newest item in results (assuming sort=date.desc). Optionally retains a
+    short history (latest N items) for trend/shock detection.
     """
 
     results = payload.get("results") or []
     latest = results[0] if isinstance(results, list) and results else {}
     now_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    return {
+
+    out: Dict[str, Any] = {
         "source": "massive",
         "series": str(series or ""),
         "asof_date": (latest or {}).get("date"),
@@ -66,3 +68,14 @@ def normalize_massive_payload(series: str, payload: Dict[str, Any]) -> Dict[str,
         "status": payload.get("status"),
         "updated_utc": now_utc,
     }
+
+    try:
+        n = int(history_n)
+    except Exception:
+        n = 1
+    if n and n > 1 and isinstance(results, list):
+        hist = [x for x in results[:n] if isinstance(x, dict)]
+        if hist:
+            out["history"] = hist
+
+    return out

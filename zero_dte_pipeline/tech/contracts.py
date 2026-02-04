@@ -35,6 +35,20 @@ _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _TRAILING_WS_RE = re.compile(r"[ \t]+$", re.MULTILINE)
 _DISCLAIMER_LINE = "_Not financial advice._"
 
+
+EMA_MENTION_RE = re.compile(
+    r"""
+    (?:
+                \bema\b                            # EMA token
+            |
+                \bema\s*[-_()]?\s*\d+\b           # EMA20, EMA 20, EMA-20, EMA(20), EMA_20
+      |
+        \b\d+\s*[-_()]?\s*ema\b           # 20 EMA, 20EMA, 20-EMA, 20(EMA)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 _OPTIONAL_SECTION_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("extra_notes", ("educational", "extra note", "extra notes")),
     ("secondary_setup", ("secondary setup", "secondary play", "secondary plan")),
@@ -327,7 +341,7 @@ def contract_violations(
 
     lower = raw_text.lower()
 
-    mention_ema = "ema" in lower
+    mention_ema = bool(EMA_MENTION_RE.search(raw_text))
     ema_supported = _context_has_indicator(context, "ema")
     if mention_ema and not ema_supported:
         violations.append("references 'ema' without technical_state ema data")

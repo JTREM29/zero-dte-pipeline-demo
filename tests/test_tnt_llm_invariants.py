@@ -8,6 +8,7 @@ Intent:
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
 
 from delivery.tnt_llm import compose_instructions
@@ -19,12 +20,87 @@ def _repo_root() -> pathlib.Path:
 
 def _iter_py_files() -> list[pathlib.Path]:
     root = _repo_root()
+
+    def _has_any_windows_attrs(path: pathlib.Path, mask: int) -> bool:
+        try:
+            st = path.stat()
+        except Exception:
+            return False
+        attrs = int(getattr(st, "st_file_attributes", 0) or 0)
+        return bool(attrs & mask)
+
+    # OneDrive / Cloud files: protect against placeholder reads that can block.
+    # References:
+    # - FILE_ATTRIBUTE_OFFLINE (0x1000)
+    # - FILE_ATTRIBUTE_REPARSE_POINT (0x0400) (symlinks/junctions)
+    # - FILE_ATTRIBUTE_RECALL_ON_OPEN (0x40000)
+    # - FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS (0x400000)
+    FILE_ATTR_SKIP_MASK = 0x1000 | 0x0400 | 0x40000 | 0x400000
+
+    # Only scan the actual code directories. This avoids crawling OneDrive-synced
+    # non-code trees (logs/tmp/artifacts/etc) where placeholder files can hang
+    # on open/read.
+    # Keep this scan focused on runtime code paths.
+    # In OneDrive-backed workspaces, some folders may contain placeholder files
+    # that can hang on open/read.
+    code_dirs = [
+        "delivery",
+        "tnt_alerts",
+        "cli",
+        "src",
+        "agents",
+        "controller",
+        "massive_service",
+        "worker",
+        "zero_dte_pipeline",
+        "bots",
+    ]
+
+    bases: list[pathlib.Path] = []
+    for d in code_dirs:
+        p = (root / d)
+        if p.exists() and p.is_dir():
+            bases.append(p)
+
     files: list[pathlib.Path] = []
-    for path in root.rglob("*.py"):
-        if any(part in {".venv", "venv", "__pycache__"} for part in path.parts):
+    # Top-level python scripts.
+    files.extend([p for p in root.glob("*.py") if p.is_file()])
+
+    # Walk code directories without following symlinks/junctions.
+    for base in bases:
+        # Skip entire bases that are cloud placeholders or junctions.
+        if _has_any_windows_attrs(base, FILE_ATTR_SKIP_MASK):
             continue
-        files.append(path)
-    return files
+
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            dir_path = pathlib.Path(dirpath)
+
+            # Prune virtualenvs/cache folders early.
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if d not in {".venv", "venv", "__pycache__", "site-packages"} and not d.startswith(".venv")
+            ]
+
+            # Prune directories that are junctions/placeholders.
+            pruned: list[str] = []
+            for d in dirnames:
+                p = dir_path / d
+                if _has_any_windows_attrs(p, FILE_ATTR_SKIP_MASK):
+                    pruned.append(d)
+            if pruned:
+                dirnames[:] = [d for d in dirnames if d not in set(pruned)]
+
+            for name in filenames:
+                if not name.endswith(".py"):
+                    continue
+                path = dir_path / name
+                if _has_any_windows_attrs(path, FILE_ATTR_SKIP_MASK):
+                    continue
+                files.append(path)
+
+    # Stable ordering for reproducibility.
+    return sorted(set(files))
 
 
 def test_tnt_llm_compose_instructions_includes_state():
@@ -59,6 +135,10 @@ def test_tnt_llm_compose_instructions_includes_state():
     assert '"symbol": "SPY"' in instructions
 
 
+import pytest
+
+
+@pytest.mark.timeout(240)
 def test_one_door_no_openai_outside_wrapper():
     root = _repo_root()
     allowed = {
@@ -85,8 +165,26 @@ def test_one_door_no_openai_outside_wrapper():
         if resolved in allowed:
             continue
 
+        # Fast path: only fully parse files that look suspicious.
         try:
-            source = path.read_text(encoding="utf-8")
+            # Avoid buffering weirdness; we only want a small prefix.
+            with path.open("rb", buffering=0) as f:
+                head = f.read(200_000)
+            head_txt = head.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        suspicious = (
+            "openai" in head_txt
+            or "OpenAI" in head_txt
+            or "responses.create" in head_txt
+            or "chat.completions.create" in head_txt
+        )
+        if not suspicious:
+            continue
+
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
 

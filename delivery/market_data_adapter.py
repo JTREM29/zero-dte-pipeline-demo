@@ -202,16 +202,20 @@ def get_ohlc(
     tf_clean = (tf or "1m").strip()
     n = int(limit) if isinstance(limit, int) and limit > 0 else 120
 
-    rows: List[Tuple[Any, Any, Any, Any, Any]] = []
+    rows: List[Tuple[Any, ...]] = []
     try:
         from delivery.discord_bot_head import get_last_n_bars  # local import
 
-        rows = get_last_n_bars(sym, tf=tf_clean, n=n)
+        rows = get_last_n_bars(sym, tf=tf_clean, n=n, with_volume=True)
     except Exception:  # noqa: BLE001
         rows = []
 
     bars: List[Dict[str, Any]] = []
-    for ts, o, h, l, c in rows:
+    for row in rows:
+        if not isinstance(row, tuple) or len(row) < 5:
+            continue
+        ts, o, h, l, c = row[:5]
+        v = row[5] if len(row) >= 6 else None
         bars.append(
             {
                 "ts": str(ts),
@@ -219,7 +223,7 @@ def get_ohlc(
                 "h": _coerce_float(h),
                 "l": _coerce_float(l),
                 "c": _coerce_float(c),
-                "v": None,
+                "v": _coerce_float(v),
             }
         )
 

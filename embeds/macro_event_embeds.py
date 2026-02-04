@@ -45,6 +45,9 @@ def build_macro_event_embed(
     blackout_after_min: int,
     now_et: datetime,
     econ_latest: Optional[Dict[str, Any]] = None,
+    schedule_label: Optional[str] = None,
+    source_label: Optional[str] = None,
+    econ_refreshed_age_min: Optional[int] = None,
 ) -> discord.Embed:
     e = discord.Embed(
         title=f"📅 {event_title}",
@@ -102,5 +105,12 @@ def build_macro_event_embed(
             inline=False,
         )
 
-    e.set_footer(text="TNT • Macro Calendar")
+    footer_parts: list[str] = ["TNT • Macro Calendar"]
+    if source_label:
+        footer_parts.append(f"source: {source_label}")
+    if schedule_label:
+        footer_parts.append(f"schedule: {schedule_label}")
+    if isinstance(econ_refreshed_age_min, int) and econ_refreshed_age_min >= 0:
+        footer_parts.append(f"econ refreshed: {econ_refreshed_age_min}m ago")
+    e.set_footer(text=" | ".join(footer_parts))
     return e

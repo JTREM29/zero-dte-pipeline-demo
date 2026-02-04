@@ -49,22 +49,30 @@ if ($parent -and -not (Test-Path -LiteralPath $parent)) {
 
 $body = ($payload | ConvertTo-Json -Depth 6 -Compress)
 # Use Invoke-WebRequest so we can inspect response headers while still writing PNG bytes to disk.
-$resp = Invoke-WebRequest -Method Post -Uri "$WorkerUrl/v1/render/oi_iv" -ContentType "application/json" -Body $body -OutFile $OutFile
+$resp = Invoke-WebRequest -Method Post -Uri "$WorkerUrl/v1/render/oi_iv" -ContentType "application/json" -Body $body -OutFile $OutFile -PassThru -UseBasicParsing
 "saved: $OutFile ($((Get-Item -LiteralPath $OutFile).Length) bytes)"
 
 if ($resp -and $resp.Headers) {
   $hs = "" + $resp.Headers["X-TNT-Service"]
   $hb = "" + $resp.Headers["X-TNT-Build"]
   $hl = "" + $resp.Headers["X-TNT-OI-IV-Layout"]
-  if ($hs -or $hb -or $hl) {
-    "render_headers: {" + ("service=$hs build=$hb layout=$hl") + "}"
-  }
+
+  $hsOut = if ($hs) { $hs } else { "<missing>" }
+  $hbOut = if ($hb) { $hb } else { "<missing>" }
+  $hlOut = if ($hl) { $hl } else { "<missing>" }
+  "render_headers: {" + ("service=$hsOut build=$hbOut layout=$hlOut") + "}"
 
   if ($FailFast) {
-    if ($hs -and ($hs -ne "tnt-worker-parity")) {
+    if (-not $hs) {
+      throw "render header missing: X-TNT-Service"
+    }
+    if ($hs -ne "tnt-worker-parity") {
       throw "render header mismatch: X-TNT-Service expected=tnt-worker-parity got=$hs"
     }
-    if ($hl -and ($hl -ne "v2")) {
+    if (-not $hl) {
+      throw "render header missing: X-TNT-OI-IV-Layout"
+    }
+    if ($hl -ne "v2") {
       throw "render header mismatch: X-TNT-OI-IV-Layout expected=v2 got=$hl"
     }
   }

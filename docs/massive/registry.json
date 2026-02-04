@@ -1,0 +1,3519 @@
+{
+  "docs_base_url": "https://massive.com",
+  "entries": [
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "date.any_of",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "last_updated",
+        "last_updated.gt",
+        "last_updated.gte",
+        "last_updated.lt",
+        "last_updated.lte",
+        "firm",
+        "firm.any_of",
+        "firm.gt",
+        "firm.gte",
+        "firm.lt",
+        "firm.lte",
+        "rating_action",
+        "rating_action.any_of",
+        "rating_action.gt",
+        "rating_action.gte",
+        "rating_action.lt",
+        "rating_action.lte",
+        "benzinga_firm_id",
+        "benzinga_firm_id.any_of",
+        "benzinga_firm_id.gt",
+        "benzinga_firm_id.gte",
+        "benzinga_firm_id.lt",
+        "benzinga_firm_id.lte",
+        "benzinga_rating_id",
+        "benzinga_rating_id.any_of",
+        "benzinga_rating_id.gt",
+        "benzinga_rating_id.gte",
+        "benzinga_rating_id.lt",
+        "benzinga_rating_id.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/benzinga/v1/analyst-insights",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/benzinga/analyst-insights.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "benzinga_id",
+        "benzinga_id.any_of",
+        "benzinga_id.gt",
+        "benzinga_id.gte",
+        "benzinga_id.lt",
+        "benzinga_id.lte",
+        "benzinga_firm_id",
+        "benzinga_firm_id.any_of",
+        "benzinga_firm_id.gt",
+        "benzinga_firm_id.gte",
+        "benzinga_firm_id.lt",
+        "benzinga_firm_id.lte",
+        "firm_name",
+        "firm_name.any_of",
+        "firm_name.gt",
+        "firm_name.gte",
+        "firm_name.lt",
+        "firm_name.lte",
+        "full_name",
+        "full_name.any_of",
+        "full_name.gt",
+        "full_name.gte",
+        "full_name.lt",
+        "full_name.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/benzinga/v1/analysts",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/benzinga/analyst-details.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "benzinga_id",
+        "benzinga_id.any_of",
+        "benzinga_id.gt",
+        "benzinga_id.gte",
+        "benzinga_id.lt",
+        "benzinga_id.lte",
+        "last_updated",
+        "last_updated.gt",
+        "last_updated.gte",
+        "last_updated.lt",
+        "last_updated.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/benzinga/v1/bulls-bears-say",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/benzinga/bulls-bears-say.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "date.any_of",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "limit",
+        "ticker"
+      ],
+      "path": "/benzinga/v1/consensus-ratings/{ticker}",
+      "required_params": [
+        "ticker"
+      ],
+      "url": "https://massive.com/docs/rest/partners/benzinga/consensus-ratings.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "date.any_of",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "importance",
+        "importance.any_of",
+        "importance.gt",
+        "importance.gte",
+        "importance.lt",
+        "importance.lte",
+        "last_updated",
+        "last_updated.any_of",
+        "last_updated.gt",
+        "last_updated.gte",
+        "last_updated.lt",
+        "last_updated.lte",
+        "date_status",
+        "date_status.any_of",
+        "date_status.gt",
+        "date_status.gte",
+        "date_status.lt",
+        "date_status.lte",
+        "eps_surprise_percent",
+        "eps_surprise_percent.any_of",
+        "eps_surprise_percent.gt",
+        "eps_surprise_percent.gte",
+        "eps_surprise_percent.lt",
+        "eps_surprise_percent.lte",
+        "revenue_surprise_percent",
+        "revenue_surprise_percent.any_of",
+        "revenue_surprise_percent.gt",
+        "revenue_surprise_percent.gte",
+        "revenue_surprise_percent.lt",
+        "revenue_surprise_percent.lte",
+        "fiscal_year",
+        "fiscal_year.any_of",
+        "fiscal_year.gt",
+        "fiscal_year.gte",
+        "fiscal_year.lt",
+        "fiscal_year.lte",
+        "fiscal_period",
+        "fiscal_period.any_of",
+        "fiscal_period.gt",
+        "fiscal_period.gte",
+        "fiscal_period.lt",
+        "fiscal_period.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/benzinga/v1/earnings",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/benzinga/earnings.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [],
+      "path": "/benzinga/v1/economic-calendar",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/benzinga/economic-calendar.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "benzinga_id",
+        "benzinga_id.any_of",
+        "benzinga_id.gt",
+        "benzinga_id.gte",
+        "benzinga_id.lt",
+        "benzinga_id.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/benzinga/v1/firms",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/benzinga/firm-details.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [],
+      "path": "/benzinga/v1/government-trades",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/benzinga/government-trades.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "date.any_of",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "positioning",
+        "positioning.any_of",
+        "positioning.gt",
+        "positioning.gte",
+        "positioning.lt",
+        "positioning.lte",
+        "importance",
+        "importance.any_of",
+        "importance.gt",
+        "importance.gte",
+        "importance.lt",
+        "importance.lte",
+        "last_updated",
+        "last_updated.any_of",
+        "last_updated.gt",
+        "last_updated.gte",
+        "last_updated.lt",
+        "last_updated.lte",
+        "fiscal_year",
+        "fiscal_year.any_of",
+        "fiscal_year.gt",
+        "fiscal_year.gte",
+        "fiscal_year.lt",
+        "fiscal_year.lte",
+        "fiscal_period",
+        "fiscal_period.any_of",
+        "fiscal_period.gt",
+        "fiscal_period.gte",
+        "fiscal_period.lt",
+        "fiscal_period.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/benzinga/v1/guidance",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/benzinga/corporate-guidance.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "date.any_of",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "importance",
+        "importance.gt",
+        "importance.gte",
+        "importance.lt",
+        "importance.lte",
+        "last_updated",
+        "last_updated.gt",
+        "last_updated.gte",
+        "last_updated.lt",
+        "last_updated.lte",
+        "rating_action",
+        "rating_action.any_of",
+        "rating_action.gt",
+        "rating_action.gte",
+        "rating_action.lt",
+        "rating_action.lte",
+        "price_target_action",
+        "price_target_action.any_of",
+        "price_target_action.gt",
+        "price_target_action.gte",
+        "price_target_action.lt",
+        "price_target_action.lte",
+        "benzinga_id",
+        "benzinga_id.any_of",
+        "benzinga_id.gt",
+        "benzinga_id.gte",
+        "benzinga_id.lt",
+        "benzinga_id.lte",
+        "benzinga_analyst_id",
+        "benzinga_analyst_id.any_of",
+        "benzinga_analyst_id.gt",
+        "benzinga_analyst_id.gte",
+        "benzinga_analyst_id.lt",
+        "benzinga_analyst_id.lte",
+        "benzinga_firm_id",
+        "benzinga_firm_id.any_of",
+        "benzinga_firm_id.gt",
+        "benzinga_firm_id.gte",
+        "benzinga_firm_id.lt",
+        "benzinga_firm_id.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/benzinga/v1/ratings",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/benzinga/analyst-ratings.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [],
+      "path": "/benzinga/v1/transcripts",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/benzinga/transcripts.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "published",
+        "published.gt",
+        "published.gte",
+        "published.lt",
+        "published.lte",
+        "channels",
+        "channels.all_of",
+        "channels.any_of",
+        "tags",
+        "tags.all_of",
+        "tags.any_of",
+        "author",
+        "author.any_of",
+        "author.gt",
+        "author.gte",
+        "author.lt",
+        "author.lte",
+        "stocks",
+        "stocks.all_of",
+        "stocks.any_of",
+        "tickers",
+        "tickers.all_of",
+        "tickers.any_of",
+        "limit",
+        "sort"
+      ],
+      "path": "/benzinga/v2/news",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/benzinga/news.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "composite_ticker",
+        "composite_ticker.any_of",
+        "composite_ticker.gt",
+        "composite_ticker.gte",
+        "composite_ticker.lt",
+        "composite_ticker.lte",
+        "processed_date",
+        "processed_date.gt",
+        "processed_date.gte",
+        "processed_date.lt",
+        "processed_date.lte",
+        "effective_date",
+        "effective_date.gt",
+        "effective_date.gte",
+        "effective_date.lt",
+        "effective_date.lte",
+        "risk_total_score",
+        "risk_total_score.gt",
+        "risk_total_score.gte",
+        "risk_total_score.lt",
+        "risk_total_score.lte",
+        "reward_score",
+        "reward_score.gt",
+        "reward_score.gte",
+        "reward_score.lt",
+        "reward_score.lte",
+        "quant_total_score",
+        "quant_total_score.gt",
+        "quant_total_score.gte",
+        "quant_total_score.lt",
+        "quant_total_score.lte",
+        "quant_grade",
+        "quant_grade.any_of",
+        "quant_grade.gt",
+        "quant_grade.gte",
+        "quant_grade.lt",
+        "quant_grade.lte",
+        "quant_composite_technical",
+        "quant_composite_technical.gt",
+        "quant_composite_technical.gte",
+        "quant_composite_technical.lt",
+        "quant_composite_technical.lte",
+        "quant_composite_sentiment",
+        "quant_composite_sentiment.gt",
+        "quant_composite_sentiment.gte",
+        "quant_composite_sentiment.lt",
+        "quant_composite_sentiment.lte",
+        "quant_composite_behavioral",
+        "quant_composite_behavioral.gt",
+        "quant_composite_behavioral.gte",
+        "quant_composite_behavioral.lt",
+        "quant_composite_behavioral.lte",
+        "quant_composite_fundamental",
+        "quant_composite_fundamental.gt",
+        "quant_composite_fundamental.gte",
+        "quant_composite_fundamental.lt",
+        "quant_composite_fundamental.lte",
+        "quant_composite_global",
+        "quant_composite_global.gt",
+        "quant_composite_global.gte",
+        "quant_composite_global.lt",
+        "quant_composite_global.lte",
+        "quant_composite_quality",
+        "quant_composite_quality.gt",
+        "quant_composite_quality.gte",
+        "quant_composite_quality.lt",
+        "quant_composite_quality.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/etf-global/v1/analytics",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/etf-global/analytics.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "composite_ticker",
+        "composite_ticker.any_of",
+        "composite_ticker.gt",
+        "composite_ticker.gte",
+        "composite_ticker.lt",
+        "composite_ticker.lte",
+        "constituent_ticker",
+        "constituent_ticker.any_of",
+        "constituent_ticker.gt",
+        "constituent_ticker.gte",
+        "constituent_ticker.lt",
+        "constituent_ticker.lte",
+        "effective_date",
+        "effective_date.gt",
+        "effective_date.gte",
+        "effective_date.lt",
+        "effective_date.lte",
+        "processed_date",
+        "processed_date.gt",
+        "processed_date.gte",
+        "processed_date.lt",
+        "processed_date.lte",
+        "us_code",
+        "us_code.any_of",
+        "us_code.gt",
+        "us_code.gte",
+        "us_code.lt",
+        "us_code.lte",
+        "isin",
+        "isin.any_of",
+        "isin.gt",
+        "isin.gte",
+        "isin.lt",
+        "isin.lte",
+        "figi",
+        "figi.any_of",
+        "figi.gt",
+        "figi.gte",
+        "figi.lt",
+        "figi.lte",
+        "sedol",
+        "sedol.any_of",
+        "sedol.gt",
+        "sedol.gte",
+        "sedol.lt",
+        "sedol.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/etf-global/v1/constituents",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/etf-global/constituents.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "processed_date",
+        "processed_date.gt",
+        "processed_date.gte",
+        "processed_date.lt",
+        "processed_date.lte",
+        "effective_date",
+        "effective_date.gt",
+        "effective_date.gte",
+        "effective_date.lt",
+        "effective_date.lte",
+        "composite_ticker",
+        "composite_ticker.any_of",
+        "composite_ticker.gt",
+        "composite_ticker.gte",
+        "composite_ticker.lt",
+        "composite_ticker.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/etf-global/v1/fund-flows",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/etf-global/fundflows.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "processed_date",
+        "processed_date.gt",
+        "processed_date.gte",
+        "processed_date.lt",
+        "processed_date.lte",
+        "effective_date",
+        "effective_date.gt",
+        "effective_date.gte",
+        "effective_date.lt",
+        "effective_date.lte",
+        "composite_ticker",
+        "composite_ticker.any_of",
+        "composite_ticker.gt",
+        "composite_ticker.gte",
+        "composite_ticker.lt",
+        "composite_ticker.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/etf-global/v1/profiles",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/etf-global/profiles.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "processed_date",
+        "processed_date.gt",
+        "processed_date.gte",
+        "processed_date.lt",
+        "processed_date.lte",
+        "effective_date",
+        "effective_date.gt",
+        "effective_date.gte",
+        "effective_date.lt",
+        "effective_date.lte",
+        "composite_ticker",
+        "composite_ticker.any_of",
+        "composite_ticker.gt",
+        "composite_ticker.gte",
+        "composite_ticker.lt",
+        "composite_ticker.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/etf-global/v1/taxonomies",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/etf-global/taxonomies.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "date.any_of",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/fed/v1/inflation",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/economy/inflation.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "date.any_of",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/fed/v1/inflation-expectations",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/economy/inflation-expectations.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "date.any_of",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/fed/v1/labor-market",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/economy/labor-market.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "date.any_of",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/fed/v1/treasury-yields",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/economy/treasury-yields.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "resolution",
+        "window_start",
+        "limit",
+        "window_start.gte",
+        "window_start.gt",
+        "window_start.lte",
+        "window_start.lt",
+        "sort"
+      ],
+      "path": "/futures/vX/aggs/{ticker}",
+      "required_params": [
+        "ticker"
+      ],
+      "url": "https://massive.com/docs/rest/futures/aggregates.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "product_code",
+        "product_code.any_of",
+        "product_code.gt",
+        "product_code.gte",
+        "product_code.lt",
+        "product_code.lte",
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "active",
+        "type",
+        "type.any_of",
+        "first_trade_date",
+        "first_trade_date.gt",
+        "first_trade_date.gte",
+        "first_trade_date.lt",
+        "first_trade_date.lte",
+        "last_trade_date",
+        "last_trade_date.gt",
+        "last_trade_date.gte",
+        "last_trade_date.lt",
+        "last_trade_date.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/futures/vX/contracts",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/futures/contracts.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "limit"
+      ],
+      "path": "/futures/vX/exchanges",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/futures/market-operations/exchanges.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "product_code",
+        "product_code.any_of",
+        "product_code.gt",
+        "product_code.gte",
+        "product_code.lt",
+        "product_code.lte",
+        "limit"
+      ],
+      "path": "/futures/vX/market-status",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/futures/market-operations/market-status.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "name",
+        "name.any_of",
+        "name.gt",
+        "name.gte",
+        "name.lt",
+        "name.lte",
+        "product_code",
+        "product_code.any_of",
+        "product_code.gt",
+        "product_code.gte",
+        "product_code.lt",
+        "product_code.lte",
+        "date",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "trading_venue",
+        "trading_venue.any_of",
+        "trading_venue.gt",
+        "trading_venue.gte",
+        "trading_venue.lt",
+        "trading_venue.lte",
+        "sector",
+        "sector.any_of",
+        "sub_sector",
+        "sub_sector.any_of",
+        "asset_class",
+        "asset_class.any_of",
+        "asset_sub_class",
+        "asset_sub_class.any_of",
+        "type",
+        "type.any_of",
+        "limit",
+        "sort"
+      ],
+      "path": "/futures/vX/products",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/futures/products.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "timestamp",
+        "session_end_date",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt",
+        "session_end_date.gte",
+        "session_end_date.gt",
+        "session_end_date.lte",
+        "session_end_date.lt",
+        "sort"
+      ],
+      "path": "/futures/vX/quotes/{ticker}",
+      "required_params": [
+        "ticker"
+      ],
+      "url": "https://massive.com/docs/rest/futures/trades-quotes/quotes.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "product_code",
+        "product_code.any_of",
+        "product_code.gt",
+        "product_code.gte",
+        "product_code.lt",
+        "product_code.lte",
+        "session_end_date",
+        "session_end_date.any_of",
+        "session_end_date.gt",
+        "session_end_date.gte",
+        "session_end_date.lt",
+        "session_end_date.lte",
+        "trading_venue",
+        "trading_venue.any_of",
+        "trading_venue.gt",
+        "trading_venue.gte",
+        "trading_venue.lt",
+        "trading_venue.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/futures/vX/schedules",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/futures/schedules.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "product_code",
+        "product_code.any_of",
+        "product_code.gt",
+        "product_code.gte",
+        "product_code.lt",
+        "product_code.lte",
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/futures/vX/snapshot",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/futures/snapshots/contracts-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "timestamp",
+        "session_end_date",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt",
+        "session_end_date.gte",
+        "session_end_date.gt",
+        "session_end_date.lte",
+        "session_end_date.lt",
+        "sort"
+      ],
+      "path": "/futures/vX/trades/{ticker}",
+      "required_params": [
+        "ticker"
+      ],
+      "url": "https://massive.com/docs/rest/futures/trades-quotes/trades.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "cik",
+        "cik.any_of",
+        "cik.gt",
+        "cik.gte",
+        "cik.lt",
+        "cik.lte",
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "section",
+        "section.any_of",
+        "filing_date",
+        "filing_date.gt",
+        "filing_date.gte",
+        "filing_date.lt",
+        "filing_date.lte",
+        "period_end",
+        "period_end.gt",
+        "period_end.gte",
+        "period_end.lt",
+        "period_end.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/filings/10-K/vX/sections",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/filings/10-k-sections.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "filing_date",
+        "filing_date.any_of",
+        "filing_date.gt",
+        "filing_date.gte",
+        "filing_date.lt",
+        "filing_date.lte",
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "cik",
+        "cik.any_of",
+        "cik.gt",
+        "cik.gte",
+        "cik.lt",
+        "cik.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/filings/vX/risk-factors",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/filings/risk-factors.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "cik",
+        "cik.any_of",
+        "cik.gt",
+        "cik.gte",
+        "cik.lt",
+        "cik.lte",
+        "tickers",
+        "tickers.all_of",
+        "tickers.any_of",
+        "period_end",
+        "period_end.gt",
+        "period_end.gte",
+        "period_end.lt",
+        "period_end.lte",
+        "filing_date",
+        "filing_date.gt",
+        "filing_date.gte",
+        "filing_date.lt",
+        "filing_date.lte",
+        "fiscal_year",
+        "fiscal_year.gt",
+        "fiscal_year.gte",
+        "fiscal_year.lt",
+        "fiscal_year.lte",
+        "fiscal_quarter",
+        "fiscal_quarter.gt",
+        "fiscal_quarter.gte",
+        "fiscal_quarter.lt",
+        "fiscal_quarter.lte",
+        "timeframe",
+        "timeframe.any_of",
+        "timeframe.gt",
+        "timeframe.gte",
+        "timeframe.lt",
+        "timeframe.lte",
+        "max_ticker",
+        "max_ticker.any_of",
+        "max_ticker.gt",
+        "max_ticker.gte",
+        "max_ticker.lt",
+        "max_ticker.lte",
+        "min_ticker",
+        "min_ticker.any_of",
+        "min_ticker.gt",
+        "min_ticker.gte",
+        "min_ticker.lt",
+        "min_ticker.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/financials/v1/balance-sheets",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/fundamentals/balance-sheets.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "cik",
+        "cik.any_of",
+        "cik.gt",
+        "cik.gte",
+        "cik.lt",
+        "cik.lte",
+        "period_end",
+        "period_end.gt",
+        "period_end.gte",
+        "period_end.lt",
+        "period_end.lte",
+        "filing_date",
+        "filing_date.gt",
+        "filing_date.gte",
+        "filing_date.lt",
+        "filing_date.lte",
+        "tickers",
+        "tickers.all_of",
+        "tickers.any_of",
+        "fiscal_year",
+        "fiscal_year.gt",
+        "fiscal_year.gte",
+        "fiscal_year.lt",
+        "fiscal_year.lte",
+        "fiscal_quarter",
+        "fiscal_quarter.gt",
+        "fiscal_quarter.gte",
+        "fiscal_quarter.lt",
+        "fiscal_quarter.lte",
+        "timeframe",
+        "timeframe.any_of",
+        "timeframe.gt",
+        "timeframe.gte",
+        "timeframe.lt",
+        "timeframe.lte",
+        "max_ticker",
+        "max_ticker.any_of",
+        "max_ticker.gt",
+        "max_ticker.gte",
+        "max_ticker.lt",
+        "max_ticker.lte",
+        "min_ticker",
+        "min_ticker.any_of",
+        "min_ticker.gt",
+        "min_ticker.gte",
+        "min_ticker.lt",
+        "min_ticker.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/financials/v1/cash-flow-statements",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/fundamentals/cash-flow-statements.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "cik",
+        "cik.any_of",
+        "cik.gt",
+        "cik.gte",
+        "cik.lt",
+        "cik.lte",
+        "tickers",
+        "tickers.all_of",
+        "tickers.any_of",
+        "period_end",
+        "period_end.gt",
+        "period_end.gte",
+        "period_end.lt",
+        "period_end.lte",
+        "filing_date",
+        "filing_date.gt",
+        "filing_date.gte",
+        "filing_date.lt",
+        "filing_date.lte",
+        "fiscal_year",
+        "fiscal_year.gt",
+        "fiscal_year.gte",
+        "fiscal_year.lt",
+        "fiscal_year.lte",
+        "fiscal_quarter",
+        "fiscal_quarter.gt",
+        "fiscal_quarter.gte",
+        "fiscal_quarter.lt",
+        "fiscal_quarter.lte",
+        "timeframe",
+        "timeframe.any_of",
+        "timeframe.gt",
+        "timeframe.gte",
+        "timeframe.lt",
+        "timeframe.lte",
+        "max_ticker",
+        "max_ticker.any_of",
+        "max_ticker.gt",
+        "max_ticker.gte",
+        "max_ticker.lt",
+        "max_ticker.lte",
+        "min_ticker",
+        "min_ticker.any_of",
+        "min_ticker.gt",
+        "min_ticker.gte",
+        "min_ticker.lt",
+        "min_ticker.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/financials/v1/income-statements",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/fundamentals/income-statements.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "cik",
+        "cik.any_of",
+        "cik.gt",
+        "cik.gte",
+        "cik.lt",
+        "cik.lte",
+        "price",
+        "price.gt",
+        "price.gte",
+        "price.lt",
+        "price.lte",
+        "average_volume",
+        "average_volume.gt",
+        "average_volume.gte",
+        "average_volume.lt",
+        "average_volume.lte",
+        "market_cap",
+        "market_cap.gt",
+        "market_cap.gte",
+        "market_cap.lt",
+        "market_cap.lte",
+        "earnings_per_share",
+        "earnings_per_share.gt",
+        "earnings_per_share.gte",
+        "earnings_per_share.lt",
+        "earnings_per_share.lte",
+        "price_to_earnings",
+        "price_to_earnings.gt",
+        "price_to_earnings.gte",
+        "price_to_earnings.lt",
+        "price_to_earnings.lte",
+        "price_to_book",
+        "price_to_book.gt",
+        "price_to_book.gte",
+        "price_to_book.lt",
+        "price_to_book.lte",
+        "price_to_sales",
+        "price_to_sales.gt",
+        "price_to_sales.gte",
+        "price_to_sales.lt",
+        "price_to_sales.lte",
+        "price_to_cash_flow",
+        "price_to_cash_flow.gt",
+        "price_to_cash_flow.gte",
+        "price_to_cash_flow.lt",
+        "price_to_cash_flow.lte",
+        "price_to_free_cash_flow",
+        "price_to_free_cash_flow.gt",
+        "price_to_free_cash_flow.gte",
+        "price_to_free_cash_flow.lt",
+        "price_to_free_cash_flow.lte",
+        "dividend_yield",
+        "dividend_yield.gt",
+        "dividend_yield.gte",
+        "dividend_yield.lt",
+        "dividend_yield.lte",
+        "return_on_assets",
+        "return_on_assets.gt",
+        "return_on_assets.gte",
+        "return_on_assets.lt",
+        "return_on_assets.lte",
+        "return_on_equity",
+        "return_on_equity.gt",
+        "return_on_equity.gte",
+        "return_on_equity.lt",
+        "return_on_equity.lte",
+        "debt_to_equity",
+        "debt_to_equity.gt",
+        "debt_to_equity.gte",
+        "debt_to_equity.lt",
+        "debt_to_equity.lte",
+        "current",
+        "current.gt",
+        "current.gte",
+        "current.lt",
+        "current.lte",
+        "quick",
+        "quick.gt",
+        "quick.gte",
+        "quick.lt",
+        "quick.lte",
+        "cash",
+        "cash.gt",
+        "cash.gte",
+        "cash.lt",
+        "cash.lte",
+        "ev_to_sales",
+        "ev_to_sales.gt",
+        "ev_to_sales.gte",
+        "ev_to_sales.lt",
+        "ev_to_sales.lte",
+        "ev_to_ebitda",
+        "ev_to_ebitda.gt",
+        "ev_to_ebitda.gte",
+        "ev_to_ebitda.lt",
+        "ev_to_ebitda.lte",
+        "enterprise_value",
+        "enterprise_value.gt",
+        "enterprise_value.gte",
+        "enterprise_value.lt",
+        "enterprise_value.lte",
+        "free_cash_flow",
+        "free_cash_flow.gt",
+        "free_cash_flow.gte",
+        "free_cash_flow.lt",
+        "free_cash_flow.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/financials/v1/ratios",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/fundamentals/ratios.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "taxonomy",
+        "taxonomy.gt",
+        "taxonomy.gte",
+        "taxonomy.lt",
+        "taxonomy.lte",
+        "primary_category",
+        "primary_category.any_of",
+        "primary_category.gt",
+        "primary_category.gte",
+        "primary_category.lt",
+        "primary_category.lte",
+        "secondary_category",
+        "secondary_category.any_of",
+        "secondary_category.gt",
+        "secondary_category.gte",
+        "secondary_category.lt",
+        "secondary_category.lte",
+        "tertiary_category",
+        "tertiary_category.any_of",
+        "tertiary_category.gt",
+        "tertiary_category.gte",
+        "tertiary_category.lt",
+        "tertiary_category.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/taxonomies/vX/risk-factors",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/filings/risk-categories.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "ex_dividend_date",
+        "ex_dividend_date.gt",
+        "ex_dividend_date.gte",
+        "ex_dividend_date.lt",
+        "ex_dividend_date.lte",
+        "frequency",
+        "frequency.gt",
+        "frequency.gte",
+        "frequency.lt",
+        "frequency.lte",
+        "distribution_type",
+        "distribution_type.any_of",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/v1/dividends",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/corporate-actions/dividends.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "days_to_cover",
+        "days_to_cover.any_of",
+        "days_to_cover.gt",
+        "days_to_cover.gte",
+        "days_to_cover.lt",
+        "days_to_cover.lte",
+        "settlement_date",
+        "settlement_date.any_of",
+        "settlement_date.gt",
+        "settlement_date.gte",
+        "settlement_date.lt",
+        "settlement_date.lte",
+        "avg_daily_volume",
+        "avg_daily_volume.any_of",
+        "avg_daily_volume.gt",
+        "avg_daily_volume.gte",
+        "avg_daily_volume.lt",
+        "avg_daily_volume.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/v1/short-interest",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/fundamentals/short-interest.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "date",
+        "date.any_of",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "short_volume_ratio",
+        "short_volume_ratio.any_of",
+        "short_volume_ratio.gt",
+        "short_volume_ratio.gte",
+        "short_volume_ratio.lt",
+        "short_volume_ratio.lte",
+        "total_volume",
+        "total_volume.any_of",
+        "total_volume.gt",
+        "total_volume.gte",
+        "total_volume.lt",
+        "total_volume.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/v1/short-volume",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/fundamentals/short-volume.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "execution_date",
+        "execution_date.gt",
+        "execution_date.gte",
+        "execution_date.lt",
+        "execution_date.lte",
+        "adjustment_type",
+        "adjustment_type.any_of",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/v1/splits",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/corporate-actions/splits.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "free_float_percent",
+        "free_float_percent.gt",
+        "free_float_percent.gte",
+        "free_float_percent.lt",
+        "free_float_percent.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/stocks/vX/float",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/fundamentals/float.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [],
+      "path": "/stocks/vX/listing/{identifier_type}/{identifier}",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/tickers/listing-overview.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [],
+      "path": "/stocks/vX/listings",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/tickers/all-listings.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [],
+      "path": "/stocks/vX/listings/updates",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/tickers/listing-updates.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "date.any_of",
+        "date.gt",
+        "date.gte",
+        "date.lt",
+        "date.lte",
+        "type",
+        "type.any_of",
+        "type.gt",
+        "type.gte",
+        "type.lt",
+        "type.lte",
+        "status",
+        "status.any_of",
+        "status.gt",
+        "status.gte",
+        "status.lt",
+        "status.lte",
+        "ticker",
+        "ticker.any_of",
+        "ticker.gt",
+        "ticker.gte",
+        "ticker.lt",
+        "ticker.lte",
+        "isin",
+        "isin.any_of",
+        "isin.gt",
+        "isin.gte",
+        "isin.lt",
+        "isin.lte",
+        "trading_venue",
+        "trading_venue.any_of",
+        "trading_venue.gt",
+        "trading_venue.gte",
+        "trading_venue.lt",
+        "trading_venue.lte",
+        "tmx_company_id",
+        "tmx_company_id.gt",
+        "tmx_company_id.gte",
+        "tmx_company_id.lt",
+        "tmx_company_id.lte",
+        "tmx_record_id",
+        "tmx_record_id.any_of",
+        "tmx_record_id.gt",
+        "tmx_record_id.gte",
+        "tmx_record_id.lt",
+        "tmx_record_id.lte",
+        "limit",
+        "sort"
+      ],
+      "path": "/tmx/v1/corporate-events",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/partners/tmx/corporate-events.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "from",
+        "to",
+        "amount",
+        "precision"
+      ],
+      "path": "/v1/conversion/{from}/{to}",
+      "required_params": [
+        "from",
+        "to"
+      ],
+      "url": "https://massive.com/docs/rest/forex/currency-conversion.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "cryptoTicker",
+        "timestamp",
+        "timespan",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/ema/{cryptoTicker}",
+      "required_params": [
+        "cryptoTicker"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/technical-indicators/exponential-moving-average.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "fxTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/ema/{fxTicker}",
+      "required_params": [
+        "fxTicker"
+      ],
+      "url": "https://massive.com/docs/rest/forex/technical-indicators/exponential-moving-average.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "indicesTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/ema/{indicesTicker}",
+      "required_params": [
+        "indicesTicker"
+      ],
+      "url": "https://massive.com/docs/rest/indices/technical-indicators/exponential-moving-average.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "optionsTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/ema/{optionsTicker}",
+      "required_params": [
+        "optionsTicker"
+      ],
+      "url": "https://massive.com/docs/rest/options/technical-indicators/exponential-moving-average.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stockTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/ema/{stockTicker}",
+      "required_params": [
+        "stockTicker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/technical-indicators/exponential-moving-average.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "cryptoTicker",
+        "timestamp",
+        "timespan",
+        "short_window",
+        "long_window",
+        "signal_window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/macd/{cryptoTicker}",
+      "required_params": [
+        "cryptoTicker"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/technical-indicators/moving-average-convergence-divergence.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "fxTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "short_window",
+        "long_window",
+        "signal_window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/macd/{fxTicker}",
+      "required_params": [
+        "fxTicker"
+      ],
+      "url": "https://massive.com/docs/rest/forex/technical-indicators/moving-average-convergence-divergence.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "indicesTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "short_window",
+        "long_window",
+        "signal_window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/macd/{indicesTicker}",
+      "required_params": [
+        "indicesTicker"
+      ],
+      "url": "https://massive.com/docs/rest/indices/technical-indicators/moving-average-convergence-divergence.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "optionsTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "short_window",
+        "long_window",
+        "signal_window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/macd/{optionsTicker}",
+      "required_params": [
+        "optionsTicker"
+      ],
+      "url": "https://massive.com/docs/rest/options/technical-indicators/moving-average-convergence-divergence.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stockTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "short_window",
+        "long_window",
+        "signal_window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/macd/{stockTicker}",
+      "required_params": [
+        "stockTicker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/technical-indicators/moving-average-convergence-divergence.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "cryptoTicker",
+        "timestamp",
+        "timespan",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/rsi/{cryptoTicker}",
+      "required_params": [
+        "cryptoTicker"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/technical-indicators/relative-strength-index.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "fxTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/rsi/{fxTicker}",
+      "required_params": [
+        "fxTicker"
+      ],
+      "url": "https://massive.com/docs/rest/forex/technical-indicators/relative-strength-index.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "indicesTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/rsi/{indicesTicker}",
+      "required_params": [
+        "indicesTicker"
+      ],
+      "url": "https://massive.com/docs/rest/indices/technical-indicators/relative-strength-index.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "optionsTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/rsi/{optionsTicker}",
+      "required_params": [
+        "optionsTicker"
+      ],
+      "url": "https://massive.com/docs/rest/options/technical-indicators/relative-strength-index.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stockTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/rsi/{stockTicker}",
+      "required_params": [
+        "stockTicker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/technical-indicators/relative-strength-index.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "cryptoTicker",
+        "timestamp",
+        "timespan",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/sma/{cryptoTicker}",
+      "required_params": [
+        "cryptoTicker"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/technical-indicators/simple-moving-average.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "fxTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/sma/{fxTicker}",
+      "required_params": [
+        "fxTicker"
+      ],
+      "url": "https://massive.com/docs/rest/forex/technical-indicators/simple-moving-average.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "indicesTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/sma/{indicesTicker}",
+      "required_params": [
+        "indicesTicker"
+      ],
+      "url": "https://massive.com/docs/rest/indices/technical-indicators/simple-moving-average.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "optionsTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/sma/{optionsTicker}",
+      "required_params": [
+        "optionsTicker"
+      ],
+      "url": "https://massive.com/docs/rest/options/technical-indicators/simple-moving-average.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stockTicker",
+        "timestamp",
+        "timespan",
+        "adjusted",
+        "window",
+        "series_type",
+        "expand_underlying",
+        "order",
+        "limit",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt"
+      ],
+      "path": "/v1/indicators/sma/{stockTicker}",
+      "required_params": [
+        "stockTicker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/technical-indicators/simple-moving-average.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "from",
+        "to"
+      ],
+      "path": "/v1/last/crypto/{from}/{to}",
+      "required_params": [
+        "from",
+        "to"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/trades/last-trade.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "from",
+        "to"
+      ],
+      "path": "/v1/last_quote/currencies/{from}/{to}",
+      "required_params": [
+        "from",
+        "to"
+      ],
+      "url": "https://massive.com/docs/rest/forex/quotes/last-quote.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "afterHours",
+        "currencies",
+        "earlyHours",
+        "exchanges",
+        "indicesGroups",
+        "market",
+        "serverTime"
+      ],
+      "path": "/v1/marketstatus/now",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/crypto/market-operations/market-status.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "afterHours",
+        "currencies",
+        "earlyHours",
+        "exchanges",
+        "indicesGroups",
+        "market",
+        "serverTime"
+      ],
+      "path": "/v1/marketstatus/now",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/forex/market-operations/market-status.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "afterHours",
+        "currencies",
+        "earlyHours",
+        "exchanges",
+        "indicesGroups",
+        "market",
+        "serverTime"
+      ],
+      "path": "/v1/marketstatus/now",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/indices/market-operations/market-status.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "afterHours",
+        "currencies",
+        "earlyHours",
+        "exchanges",
+        "indicesGroups",
+        "market",
+        "serverTime"
+      ],
+      "path": "/v1/marketstatus/now",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/options/market-operations/market-status.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "afterHours",
+        "currencies",
+        "earlyHours",
+        "exchanges",
+        "indicesGroups",
+        "market",
+        "serverTime"
+      ],
+      "path": "/v1/marketstatus/now",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/market-operations/market-status.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [],
+      "path": "/v1/marketstatus/upcoming",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/crypto/market-operations/market-holidays.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [],
+      "path": "/v1/marketstatus/upcoming",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/forex/market-operations/market-holidays.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [],
+      "path": "/v1/marketstatus/upcoming",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/indices/market-operations/market-holidays.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [],
+      "path": "/v1/marketstatus/upcoming",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/options/market-operations/market-holidays.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [],
+      "path": "/v1/marketstatus/upcoming",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/market-operations/market-holidays.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "from",
+        "to",
+        "date",
+        "adjusted"
+      ],
+      "path": "/v1/open-close/crypto/{from}/{to}/{date}",
+      "required_params": [
+        "from",
+        "to",
+        "date"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/aggregates/daily-ticker-summary.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "indicesTicker",
+        "date"
+      ],
+      "path": "/v1/open-close/{indicesTicker}/{date}",
+      "required_params": [
+        "indicesTicker",
+        "date"
+      ],
+      "url": "https://massive.com/docs/rest/indices/aggregates/daily-ticker-summary.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "optionsTicker",
+        "date",
+        "adjusted"
+      ],
+      "path": "/v1/open-close/{optionsTicker}/{date}",
+      "required_params": [
+        "optionsTicker",
+        "date"
+      ],
+      "url": "https://massive.com/docs/rest/options/aggregates/daily-ticker-summary.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stocksTicker",
+        "date",
+        "adjusted"
+      ],
+      "path": "/v1/open-close/{stocksTicker}/{date}",
+      "required_params": [
+        "stocksTicker",
+        "date"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/aggregates/daily-ticker-summary.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker"
+      ],
+      "path": "/v1/related-companies/{ticker}",
+      "required_params": [
+        "ticker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/tickers/related-tickers.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "adjusted"
+      ],
+      "path": "/v2/aggs/grouped/locale/global/market/crypto/{date}",
+      "required_params": [
+        "date"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/aggregates/daily-market-summary.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "adjusted"
+      ],
+      "path": "/v2/aggs/grouped/locale/global/market/fx/{date}",
+      "required_params": [
+        "date"
+      ],
+      "url": "https://massive.com/docs/rest/forex/aggregates/daily-market-summary.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "date",
+        "adjusted",
+        "include_otc"
+      ],
+      "path": "/v2/aggs/grouped/locale/us/market/stocks/{date}",
+      "required_params": [
+        "date"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/aggregates/daily-market-summary.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "cryptoTicker",
+        "adjusted"
+      ],
+      "path": "/v2/aggs/ticker/{cryptoTicker}/prev",
+      "required_params": [
+        "cryptoTicker"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/aggregates/previous-day-bar.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "cryptoTicker",
+        "multiplier",
+        "timespan",
+        "from",
+        "to",
+        "adjusted",
+        "sort",
+        "limit"
+      ],
+      "path": "/v2/aggs/ticker/{cryptoTicker}/range/{multiplier}/{timespan}/{from}/{to}",
+      "required_params": [
+        "cryptoTicker",
+        "multiplier",
+        "timespan",
+        "from",
+        "to"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/aggregates/custom-bars.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "forexTicker",
+        "adjusted"
+      ],
+      "path": "/v2/aggs/ticker/{forexTicker}/prev",
+      "required_params": [
+        "forexTicker"
+      ],
+      "url": "https://massive.com/docs/rest/forex/aggregates/previous-day-bar.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "forexTicker",
+        "multiplier",
+        "timespan",
+        "from",
+        "to",
+        "adjusted",
+        "sort",
+        "limit"
+      ],
+      "path": "/v2/aggs/ticker/{forexTicker}/range/{multiplier}/{timespan}/{from}/{to}",
+      "required_params": [
+        "forexTicker",
+        "multiplier",
+        "timespan",
+        "from",
+        "to"
+      ],
+      "url": "https://massive.com/docs/rest/forex/aggregates/custom-bars.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "indicesTicker"
+      ],
+      "path": "/v2/aggs/ticker/{indicesTicker}/prev",
+      "required_params": [
+        "indicesTicker"
+      ],
+      "url": "https://massive.com/docs/rest/indices/aggregates/previous-day-bar.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "indicesTicker",
+        "multiplier",
+        "timespan",
+        "from",
+        "to",
+        "sort",
+        "limit"
+      ],
+      "path": "/v2/aggs/ticker/{indicesTicker}/range/{multiplier}/{timespan}/{from}/{to}",
+      "required_params": [
+        "indicesTicker",
+        "multiplier",
+        "timespan",
+        "from",
+        "to"
+      ],
+      "url": "https://massive.com/docs/rest/indices/aggregates/custom-bars.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "optionsTicker",
+        "adjusted"
+      ],
+      "path": "/v2/aggs/ticker/{optionsTicker}/prev",
+      "required_params": [
+        "optionsTicker"
+      ],
+      "url": "https://massive.com/docs/rest/options/aggregates/previous-day-bar.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "optionsTicker",
+        "multiplier",
+        "timespan",
+        "from",
+        "to",
+        "adjusted",
+        "sort",
+        "limit"
+      ],
+      "path": "/v2/aggs/ticker/{optionsTicker}/range/{multiplier}/{timespan}/{from}/{to}",
+      "required_params": [
+        "optionsTicker",
+        "multiplier",
+        "timespan",
+        "from",
+        "to"
+      ],
+      "url": "https://massive.com/docs/rest/options/aggregates/custom-bars.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stocksTicker",
+        "adjusted"
+      ],
+      "path": "/v2/aggs/ticker/{stocksTicker}/prev",
+      "required_params": [
+        "stocksTicker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/aggregates/previous-day-bar.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stocksTicker",
+        "multiplier",
+        "timespan",
+        "from",
+        "to",
+        "adjusted",
+        "sort",
+        "limit"
+      ],
+      "path": "/v2/aggs/ticker/{stocksTicker}/range/{multiplier}/{timespan}/{from}/{to}",
+      "required_params": [
+        "stocksTicker",
+        "multiplier",
+        "timespan",
+        "from",
+        "to"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/aggregates/custom-bars.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stocksTicker"
+      ],
+      "path": "/v2/last/nbbo/{stocksTicker}",
+      "required_params": [
+        "stocksTicker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/trades-quotes/last-quote.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "optionsTicker"
+      ],
+      "path": "/v2/last/trade/{optionsTicker}",
+      "required_params": [
+        "optionsTicker"
+      ],
+      "url": "https://massive.com/docs/rest/options/trades-quotes/last-trade.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stocksTicker"
+      ],
+      "path": "/v2/last/trade/{stocksTicker}",
+      "required_params": [
+        "stocksTicker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/trades-quotes/last-trade.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "published_utc",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "published_utc.gte",
+        "published_utc.gt",
+        "published_utc.lte",
+        "published_utc.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v2/reference/news",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/news.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "tickers"
+      ],
+      "path": "/v2/snapshot/locale/global/markets/crypto/tickers",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/crypto/snapshots/full-market-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker"
+      ],
+      "path": "/v2/snapshot/locale/global/markets/crypto/tickers/{ticker}",
+      "required_params": [
+        "ticker"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/snapshots/single-ticker-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "direction"
+      ],
+      "path": "/v2/snapshot/locale/global/markets/crypto/{direction}",
+      "required_params": [
+        "direction"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/snapshots/top-market-movers.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "tickers"
+      ],
+      "path": "/v2/snapshot/locale/global/markets/forex/tickers",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/forex/snapshots/full-market-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker"
+      ],
+      "path": "/v2/snapshot/locale/global/markets/forex/tickers/{ticker}",
+      "required_params": [
+        "ticker"
+      ],
+      "url": "https://massive.com/docs/rest/forex/snapshots/single-ticker-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "direction"
+      ],
+      "path": "/v2/snapshot/locale/global/markets/forex/{direction}",
+      "required_params": [
+        "direction"
+      ],
+      "url": "https://massive.com/docs/rest/forex/snapshots/top-market-movers.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "tickers",
+        "include_otc"
+      ],
+      "path": "/v2/snapshot/locale/us/markets/stocks/tickers",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/snapshots/full-market-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stocksTicker"
+      ],
+      "path": "/v2/snapshot/locale/us/markets/stocks/tickers/{stocksTicker}",
+      "required_params": [
+        "stocksTicker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/snapshots/single-ticker-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "direction",
+        "include_otc"
+      ],
+      "path": "/v2/snapshot/locale/us/markets/stocks/{direction}",
+      "required_params": [
+        "direction"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/snapshots/top-market-movers.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "fxTicker",
+        "timestamp",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/quotes/{fxTicker}",
+      "required_params": [
+        "fxTicker"
+      ],
+      "url": "https://massive.com/docs/rest/forex/quotes/quotes.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "optionsTicker",
+        "timestamp",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/quotes/{optionsTicker}",
+      "required_params": [
+        "optionsTicker"
+      ],
+      "url": "https://massive.com/docs/rest/options/quotes.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "optionsTicker",
+        "timestamp",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/quotes/{optionsTicker}",
+      "required_params": [
+        "optionsTicker"
+      ],
+      "url": "https://massive.com/docs/rest/options/trades-quotes/quotes.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stockTicker",
+        "timestamp",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/quotes/{stockTicker}",
+      "required_params": [
+        "stockTicker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/trades-quotes/quotes.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "asset_class",
+        "data_type",
+        "id",
+        "sip",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/reference/conditions",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/crypto/market-operations/condition-codes.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "asset_class",
+        "data_type",
+        "id",
+        "sip",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/reference/conditions",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/options/market-operations/condition-codes.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "asset_class",
+        "data_type",
+        "id",
+        "sip",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/reference/conditions",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/market-operations/condition-codes.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "ex_dividend_date",
+        "record_date",
+        "declaration_date",
+        "pay_date",
+        "frequency",
+        "cash_amount",
+        "dividend_type",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "ex_dividend_date.gte",
+        "ex_dividend_date.gt",
+        "ex_dividend_date.lte",
+        "ex_dividend_date.lt",
+        "record_date.gte",
+        "record_date.gt",
+        "record_date.lte",
+        "record_date.lt",
+        "declaration_date.gte",
+        "declaration_date.gt",
+        "declaration_date.lte",
+        "declaration_date.lt",
+        "pay_date.gte",
+        "pay_date.gt",
+        "pay_date.lte",
+        "pay_date.lt",
+        "cash_amount.gte",
+        "cash_amount.gt",
+        "cash_amount.lte",
+        "cash_amount.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/reference/dividends",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/corporate-actions/reference-dividends.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "asset_class",
+        "locale"
+      ],
+      "path": "/v3/reference/exchanges",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/crypto/market-operations/exchanges.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "asset_class",
+        "locale"
+      ],
+      "path": "/v3/reference/exchanges",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/forex/market-operations/exchanges.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "asset_class",
+        "locale"
+      ],
+      "path": "/v3/reference/exchanges",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/options/market-operations/exchanges.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "asset_class",
+        "locale"
+      ],
+      "path": "/v3/reference/exchanges",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/market-operations/exchanges.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "underlying_ticker",
+        "ticker",
+        "contract_type",
+        "expiration_date",
+        "as_of",
+        "strike_price",
+        "expired",
+        "underlying_ticker.gte",
+        "underlying_ticker.gt",
+        "underlying_ticker.lte",
+        "underlying_ticker.lt",
+        "expiration_date.gte",
+        "expiration_date.gt",
+        "expiration_date.lte",
+        "expiration_date.lt",
+        "strike_price.gte",
+        "strike_price.gt",
+        "strike_price.lte",
+        "strike_price.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/reference/options/contracts",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/options/contracts/all-contracts.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "options_ticker",
+        "as_of"
+      ],
+      "path": "/v3/reference/options/contracts/{options_ticker}",
+      "required_params": [
+        "options_ticker"
+      ],
+      "url": "https://massive.com/docs/rest/options/contracts/contract-overview.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "execution_date",
+        "reverse_split",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "execution_date.gte",
+        "execution_date.gt",
+        "execution_date.lte",
+        "execution_date.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/reference/splits",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/corporate-actions/reference-splits.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "type",
+        "market",
+        "exchange",
+        "cusip",
+        "cik",
+        "date",
+        "search",
+        "active",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/reference/tickers",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/crypto/tickers/all-tickers.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "type",
+        "market",
+        "exchange",
+        "cusip",
+        "cik",
+        "date",
+        "search",
+        "active",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/reference/tickers",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/forex/tickers/all-tickers.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "type",
+        "market",
+        "exchange",
+        "cusip",
+        "cik",
+        "date",
+        "search",
+        "active",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/reference/tickers",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/indices/tickers/all-tickers.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "type",
+        "market",
+        "exchange",
+        "cusip",
+        "cik",
+        "date",
+        "search",
+        "active",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/reference/tickers",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/tickers/all-tickers.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "asset_class",
+        "locale"
+      ],
+      "path": "/v3/reference/tickers/types",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/forex/tickers/ticker-types.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "asset_class",
+        "locale"
+      ],
+      "path": "/v3/reference/tickers/types",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/tickers/ticker-types.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "date"
+      ],
+      "path": "/v3/reference/tickers/{ticker}",
+      "required_params": [
+        "ticker"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/tickers/ticker-overview.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "date"
+      ],
+      "path": "/v3/reference/tickers/{ticker}",
+      "required_params": [
+        "ticker"
+      ],
+      "url": "https://massive.com/docs/rest/forex/tickers/ticker-overview.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "date"
+      ],
+      "path": "/v3/reference/tickers/{ticker}",
+      "required_params": [
+        "ticker"
+      ],
+      "url": "https://massive.com/docs/rest/indices/tickers/ticker-overview.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "date"
+      ],
+      "path": "/v3/reference/tickers/{ticker}",
+      "required_params": [
+        "ticker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/tickers/ticker-overview.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "type",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "ticker.any_of",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/snapshot",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/crypto/snapshots/unified-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "type",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "ticker.any_of",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/snapshot",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/forex/snapshots/unified-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "type",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "ticker.any_of",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/snapshot",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/indices/snapshots/unified-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "type",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "ticker.any_of",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/snapshot",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/options/snapshots/unified-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "type",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "ticker.any_of",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/snapshot",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/snapshots/unified-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker.any_of",
+        "ticker",
+        "ticker.gte",
+        "ticker.gt",
+        "ticker.lte",
+        "ticker.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/snapshot/indices",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/indices/snapshots/indices-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "underlyingAsset",
+        "strike_price",
+        "expiration_date",
+        "contract_type",
+        "strike_price.gte",
+        "strike_price.gt",
+        "strike_price.lte",
+        "strike_price.lt",
+        "expiration_date.gte",
+        "expiration_date.gt",
+        "expiration_date.lte",
+        "expiration_date.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/snapshot/options/{underlyingAsset}",
+      "required_params": [
+        "underlyingAsset"
+      ],
+      "url": "https://massive.com/docs/rest/options/snapshots/option-chain-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "underlyingAsset",
+        "optionContract"
+      ],
+      "path": "/v3/snapshot/options/{underlyingAsset}/{optionContract}",
+      "required_params": [
+        "underlyingAsset",
+        "optionContract"
+      ],
+      "url": "https://massive.com/docs/rest/options/snapshots/option-contract-snapshot.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "cryptoTicker",
+        "timestamp",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/trades/{cryptoTicker}",
+      "required_params": [
+        "cryptoTicker"
+      ],
+      "url": "https://massive.com/docs/rest/crypto/trades/trades.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "optionsTicker",
+        "timestamp",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/trades/{optionsTicker}",
+      "required_params": [
+        "optionsTicker"
+      ],
+      "url": "https://massive.com/docs/rest/options/trades-quotes/trades.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "stockTicker",
+        "timestamp",
+        "timestamp.gte",
+        "timestamp.gt",
+        "timestamp.lte",
+        "timestamp.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/v3/trades/{stockTicker}",
+      "required_params": [
+        "stockTicker"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/trades-quotes/trades.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "cik",
+        "company_name",
+        "sic",
+        "filing_date",
+        "period_of_report_date",
+        "timeframe",
+        "include_sources",
+        "company_name.search",
+        "filing_date.gte",
+        "filing_date.gt",
+        "filing_date.lte",
+        "filing_date.lt",
+        "period_of_report_date.gte",
+        "period_of_report_date.gt",
+        "period_of_report_date.lte",
+        "period_of_report_date.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/vX/reference/financials",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/fundamentals/financials.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "ticker",
+        "us_code",
+        "isin",
+        "listing_date",
+        "ipo_status",
+        "listing_date.gte",
+        "listing_date.gt",
+        "listing_date.lte",
+        "listing_date.lt",
+        "order",
+        "limit",
+        "sort"
+      ],
+      "path": "/vX/reference/ipos",
+      "required_params": [],
+      "url": "https://massive.com/docs/rest/stocks/corporate-actions/ipos.md"
+    },
+    {
+      "method": "GET",
+      "name": "REST",
+      "notes": "auto-generated; parsing is best-effort",
+      "params": [
+        "id",
+        "types"
+      ],
+      "path": "/vX/reference/tickers/{id}/events",
+      "required_params": [
+        "id"
+      ],
+      "url": "https://massive.com/docs/rest/stocks/corporate-actions/ticker-events.md"
+    }
+  ],
+  "generated_utc": "2026-01-25T13:53:25.499538+00:00",
+  "source_dir": "C:\\Users\\jttre\\OneDrive\\Desktop\\ZeroDTE-pipeline\\docs\\massive"
+}

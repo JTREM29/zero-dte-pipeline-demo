@@ -1,0 +1,59 @@
+# WEBSOCKET
+## Stocks
+
+### Aggregates (Per Second)
+
+**Endpoint:** `WS /stocks/A`
+
+**Description:**
+
+Stream second-by-second aggregated OHLC (Open, High, Low, Close) and volume data for specified tickers via WebSocket. These aggregates are updated continuously in Eastern Time (ET) and cover pre-market, regular, and after-hours sessions. Each bar is constructed solely from qualifying trades that meet specific conditions; if no eligible trades occur within a given minute, no bar is emitted. By providing a steady flow of aggregate bars, this endpoint enables users to track intraday price movements, refine trading strategies, and power live data visualizations.
+
+Use Cases: Real-time monitoring, dynamic charting, intraday strategy development, automated trading.
+
+## Query Parameters
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `ticker` | string | Yes | Specify a stock ticker or use * to subscribe to all stock tickers. You can also use a comma separated list to subscribe to multiple stock tickers. You can retrieve available stock tickers from our [Stock Tickers API](https://massive.com/docs/rest/stocks/tickers/all-tickers).  |
+
+## Response Attributes
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `ev` | enum: A | The event type. |
+| `sym` | string | The ticker symbol for the given stock. |
+| `v` | integer | The tick volume. |
+| `av` | integer | Today's accumulated volume. |
+| `op` | number | Today's official opening price. |
+| `vw` | number | The tick's volume weighted average price. |
+| `o` | number | The opening tick price for this aggregate window. |
+| `c` | number | The closing tick price for this aggregate window. |
+| `h` | number | The highest tick price for this aggregate window. |
+| `l` | number | The lowest tick price for this aggregate window. |
+| `a` | number | Today's volume weighted average price. |
+| `z` | integer | The average trade size for this aggregate window. |
+| `s` | integer | The start timestamp of this aggregate window in Unix Milliseconds. |
+| `e` | integer | The end timestamp of this aggregate window in Unix Milliseconds. |
+| `otc` | boolean | Whether or not this aggregate is for an OTC ticker. This field will be left off if false. |
+
+## Sample Response
+
+```json
+{
+  "ev": "A",
+  "sym": "SPCE",
+  "v": 200,
+  "av": 8642007,
+  "op": 25.66,
+  "vw": 25.3981,
+  "o": 25.39,
+  "c": 25.39,
+  "h": 25.39,
+  "l": 25.39,
+  "a": 25.3714,
+  "z": 50,
+  "s": 1610144868000,
+  "e": 1610144869000
+}
+```

@@ -30,15 +30,19 @@ class Config:
     def _load_env(self) -> None:
         """Load environment variables from .env files and OS environment."""
         # Try to load from multiple .env locations
-        env_paths = [
-            Path.cwd() / ".env",
-            Path.cwd() / ".env.local",
-            Path.home() / ".zero-dte" / ".env",
-        ]
-        
-        for env_path in env_paths:
-            if env_path.exists():
-                load_dotenv(env_path, override=False)
+        env_path = Path.cwd() / ".env"
+        if env_path.exists():
+            load_dotenv(env_path, override=False)
+
+        env_local_path = Path.cwd() / ".env.local"
+        if env_local_path.exists():
+            # Local runtime config should win over inherited vars.
+            load_dotenv(env_local_path, override=True)
+
+        home_env = Path.home() / ".zero-dte" / ".env"
+        if home_env.exists():
+            # Treat as a fallback (do not override explicit config).
+            load_dotenv(home_env, override=False)
         
         # OS environment variables take precedence (already set)
     

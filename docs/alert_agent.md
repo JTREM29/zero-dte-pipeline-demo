@@ -11,8 +11,8 @@ This is a **deterministic compiler** design:
 
 Creation:
 - `/alert <text>`
-  - Natural language (strict), lightweight DSL-ish, or `preset:<name>`
-  - Bot replies with a preview and a **Create/Cancel** confirmation
+  - Natural language compiled into strict `AlertIntentV1` JSON (preview + confirm)
+  - Bot replies with a preview and a **Confirm/Cancel** confirmation before writing to Redis
 
 Management:
 - `/alerts` — list your alerts
@@ -20,8 +20,9 @@ Management:
 - `/alert_pause id:<id>` / `/alert_resume id:<id>`
 - `/alert_delete id:<id>`
 
-Optional (LLM compiler path; feature-flagged):
-- `/alert_llm <text>` — uses the strict JSON compiler contract (still previews + confirms)
+Notes:
+- `/alert` currently uses the strict LLM compiler contract (via the TNT “One Door” wrapper) and then validates the envelope + intent.
+- Trigger delivery to Discord is handled separately via the worker result pipeline (`type=alert_trigger`).
 
 ## Supported primitives (v1)
 
@@ -73,6 +74,36 @@ The repo includes a Redis-friendly scheduler skeleton in [tnt_alerts/scheduler_r
   - [tnt_alerts/watchlists.py](../tnt_alerts/watchlists.py) provides `expand_targets()` with a local file backend (`watchlists/<user_id>/<name>.json`) and a fallback to TNT concierge watchlists if available.
 
 This is a skeleton designed to plug into your existing worker/job pipeline; it does not change the current `/alert` runtime behavior by itself.
+
+## Local Redis + sanity steps
+
+If you don't have a shared Redis reachable, run a native Redis-compatible service on Windows and validate persistence.
+
+Recommendation (Windows): **Memurai Community Edition** (drop-in Redis compatible, stable Windows service).
+
+VS Code tasks:
+- `Redis: Verify service + port (native)`
+- `Alerts: Redis sanity`
+- `Alerts: Scheduler 5m (log-only)`
+- `Alerts: Scheduler 5m (enqueue)` (pushes `type=alert_trigger` jobs to `tnt:jobs`)
+
+These tasks read `TNT_REDIS_HOST`, `TNT_REDIS_PORT`, `TNT_REDIS_DB` from your environment.
+
+Quick setup (local CLX / Memurai):
+- Install Memurai as a Windows Service (port `6379`, bind `127.0.0.1` is fine).
+- Set env vars:
+  - `setx TNT_REDIS_HOST 127.0.0.1`
+  - `setx TNT_REDIS_PORT 6379`
+  - `setx TNT_REDIS_DB 0`
+- Restart VS Code so tasks inherit the vars.
+- Run `Redis: Verify service + port (native)` then `Alerts: Redis sanity`.
+
+Manual equivalent (PowerShell):
+- `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/redis_verify.ps1`
+
+Scripts (equivalent to the original redis-cli sanity checks):
+- `scripts/redis_alerts_sanity.py` prints `SMEMBERS alerts:active` and scans `alert:*`.
+- `scripts/run_alert_scheduler_5m.py` runs a 5-minute evaluation loop (defaults to log-only; add `--enqueue` to push jobs).
 ## Audit storage
 
 By default, alerts are written to:

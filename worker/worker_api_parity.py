@@ -209,6 +209,11 @@ async def render_oi_iv(request: Request) -> Response:
         include_iv = bool(payload.get("include_iv_overlay", True))
         dpi = int(payload.get("dpi") or 150)
 
+        # Optional layout tuning (used to prevent strike tick label clipping).
+        layout_bottom = payload.get("layout_bottom")
+        save_bbox_tight = payload.get("save_bbox_tight")
+        figsize = payload.get("figsize")
+
         if not isinstance(strikes, list) or not isinstance(call_oi, list) or not isinstance(put_oi, list):
             raise ValueError("missing_arrays")
         labels = [f"{float(s):g}" for s in strikes]
@@ -229,15 +234,43 @@ async def render_oi_iv(request: Request) -> Response:
         if not callable(render_oi_iv_png):
             raise RuntimeError("renderer_missing")
 
-        png = render_oi_iv_png(
-            title=title,
-            x_labels=labels,
-            iv_pct=(iv if include_iv else []),
-            oi_calls=oi_calls,
-            oi_puts=oi_puts,
-            dpi=max(80, min(400, dpi)),
-            include_iv_overlay=include_iv,
-        )
+        # Apply optional env overrides for this render only (restore after).
+        prev_env: dict[str, str | None] = {}
+        try:
+            if layout_bottom is not None:
+                try:
+                    b = float(layout_bottom)
+                    if 0.02 <= b <= 0.30:
+                        prev_env["TNT_OI_IV_LAYOUT_BOTTOM"] = os.getenv("TNT_OI_IV_LAYOUT_BOTTOM")
+                        os.environ["TNT_OI_IV_LAYOUT_BOTTOM"] = str(b)
+                except Exception:
+                    pass
+            if bool(save_bbox_tight):
+                prev_env["TNT_OI_IV_SAVE_BBOX_TIGHT"] = os.getenv("TNT_OI_IV_SAVE_BBOX_TIGHT")
+                os.environ["TNT_OI_IV_SAVE_BBOX_TIGHT"] = "1"
+            if isinstance(figsize, str) and figsize.strip():
+                prev_env["TNT_OI_IV_FIGSIZE"] = os.getenv("TNT_OI_IV_FIGSIZE")
+                os.environ["TNT_OI_IV_FIGSIZE"] = figsize.strip()
+
+            png = render_oi_iv_png(
+                title=title,
+                x_labels=labels,
+                iv_pct=(iv if include_iv else []),
+                oi_calls=oi_calls,
+                oi_puts=oi_puts,
+                dpi=max(80, min(400, dpi)),
+                include_iv_overlay=include_iv,
+            )
+        finally:
+            # Restore env (avoid cross-request leakage).
+            for k, v in prev_env.items():
+                try:
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+                except Exception:
+                    continue
         if not isinstance(png, (bytes, bytearray)) or not png:
             raise RuntimeError("render_empty")
         data = bytes(png)

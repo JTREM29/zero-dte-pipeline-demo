@@ -1,0 +1,47 @@
+# WebSocket
+
+## Crypto
+
+- [Aggregates (Per Minute)](https://massive.com/docs/websocket/crypto/aggregates-per-minute.md): Stream minute-by-minute aggregated OHLC (Open, High, Low, Close) and volume data for a specified cryptocurrency pair via WebSocket
+- [Aggregates (Per Second)](https://massive.com/docs/websocket/crypto/aggregates-per-second.md): Stream second-by-second aggregated OHLC (Open, High, Low, Close) and volume data for a specified cryptocurrency pair via WebSocket
+- [Fair Market Value](https://massive.com/docs/websocket/crypto/fair-market-value.md): Stream real-time Fair Market Value (FMV) data for a specified cryptocurrency pair via WebSocket
+- [Quotes](https://massive.com/docs/websocket/crypto/quotes.md): Stream quote data for specified cryptocurrency pairs via WebSocket
+- [Trades](https://massive.com/docs/websocket/crypto/trades.md): Stream trade data for crypto pairs via WebSocket
+
+## Forex
+
+- [Aggregates (Per Minute)](https://massive.com/docs/websocket/forex/aggregates-per-minute.md): Stream minute-by-minute aggregated OHLC (Open, High, Low, Close) and volume data for a specified Forex currency pair via WebSocket
+- [Aggregates (Per Second)](https://massive.com/docs/websocket/forex/aggregates-per-second.md): Stream second-by-second aggregated OHLC (Open, High, Low, Close) and volume data for a specified Forex currency pair via WebSocket
+- [Fair Market Value](https://massive.com/docs/websocket/forex/fair-market-value.md): Stream real-time Fair Market Value (FMV) data for a specified Forex currency pair via WebSocket
+- [Quotes](https://massive.com/docs/websocket/forex/quotes.md): Stream real-time Best Bid and Offer (BBO) quote data for specified Forex currency pairs via WebSocket
+
+## Futures
+
+- [Aggregates (Per Minute)](https://massive.com/docs/websocket/futures/aggregates-per-minute.md): Stream minute-by-minute aggregated OHLC (Open, High, Low, Close) and volume data for a specified futures contract ticker via WebSocket
+- [Aggregates (Per Second)](https://massive.com/docs/websocket/futures/aggregates-per-second.md): Stream second-by-second aggregated OHLC (Open, High, Low, Close) and volume data for a specified futures contract ticker via WebSocket
+- [Quotes](https://massive.com/docs/websocket/futures/quotes.md): Stream BBO (Best Bid and Offer) quote data for futures tickers via WebSocket
+- [Trades](https://massive.com/docs/websocket/futures/trades.md): Stream tick-level trade data for futures tickers via WebSocket
+
+## Indices
+
+- [Aggregates (Per Minute)](https://massive.com/docs/websocket/indices/aggregates-per-minute.md): Stream minute-by-minute aggregated OHLC (Open, High, Low, Close) for a specified index via WebSocket
+- [Aggregates (Per Second)](https://massive.com/docs/websocket/indices/aggregates-per-second.md): Stream second-by-second aggregated OHLC (Open, High, Low, Close) for a specified index via WebSocket
+- [Value](https://massive.com/docs/websocket/indices/value.md): Stream real-time index value updates for specified index tickers via WebSocket
+
+## Options
+
+- [Aggregates (Per Minute)](https://massive.com/docs/websocket/options/aggregates-per-minute.md): Stream minute-by-minute aggregated OHLC (Open, High, Low, Close) and volume data for a specified options contract via WebSocket
+- [Aggregates (Per Second)](https://massive.com/docs/websocket/options/aggregates-per-second.md): Stream second-by-second aggregated OHLC (Open, High, Low, Close) and volume data for a specified options contract via WebSocket
+- [Fair Market Value](https://massive.com/docs/websocket/options/fair-market-value.md): Stream real-time Fair Market Value (FMV) data for a specified options contract via WebSocket
+- [Quotes](https://massive.com/docs/websocket/options/quotes.md): Stream quote data for specified options contracts via WebSocket
+- [Trades](https://massive.com/docs/websocket/options/trades.md): Stream tick-level trade data for option contracts via WebSocket
+
+## Stocks
+
+- [Aggregates (Per Minute)](https://massive.com/docs/websocket/stocks/aggregates-per-minute.md): Stream minute-by-minute aggregated OHLC (Open, High, Low, Close) and volume data for specified tickers via WebSocket
+- [Aggregates (Per Second)](https://massive.com/docs/websocket/stocks/aggregates-per-second.md): Stream second-by-second aggregated OHLC (Open, High, Low, Close) and volume data for specified tickers via WebSocket
+- [Fair Market Value](https://massive.com/docs/websocket/stocks/fair-market-value.md): Stream real-time Fair Market Value (FMV) data for a specified stock ticker via WebSocket
+- [Net Order Imbalance (NOI)](https://massive.com/docs/websocket/stocks/imbalances.md): Stream real-time Net Order Imbalance (NOI) events for specified stock tickers via WebSocket
+- [Limit Up - Limit Down (LULD)](https://massive.com/docs/websocket/stocks/luld.md): Stream real-time Limit Up - Limit Down (LULD) events for specified stock tickers via WebSocket across multiple U.S
+- [Quotes](https://massive.com/docs/websocket/stocks/quotes.md): Stream NBBO (National Best Bid and Offer) quote data for stock tickers via WebSocket
+- [Trades](https://massive.com/docs/websocket/stocks/trades.md): Stream tick-level trade data for stock tickers via WebSocket

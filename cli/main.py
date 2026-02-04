@@ -3,8 +3,16 @@ import asyncio
 import json
 import sys
 import os
+import time
 from datetime import datetime
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
+
+try:
+    from zoneinfo import ZoneInfo
+
+    _ET = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover
+    _ET = None
 
 import click
 import pytest
@@ -48,7 +56,106 @@ def _generate_morning_report(
             )
             return await report_gen.generate()
 
-    return run_async(run())
+    result = run_async(run())
+    try:
+        _maybe_write_candidates_cache_from_report(result, symbols)
+    except Exception:
+        pass
+    return result
+
+
+def _maybe_write_candidates_cache_from_report(report_result, symbols: Sequence[str]) -> None:
+    """Best-effort: write `tnt:candidates:{SYM}` snapshots from MorningReportResult.
+
+    This is gated behind `TNT_CANDIDATES_CACHE_WRITE=1`.
+    """
+
+    enabled = (os.getenv("TNT_CANDIDATES_CACHE_WRITE", "0") or "0").strip() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return
+
+    report_dict = report_result.to_dict() if hasattr(report_result, "to_dict") else report_result
+    if not isinstance(report_dict, Mapping):
+        return
+
+    approved = report_dict.get("approved_candidates", []) or []
+    if not isinstance(approved, list):
+        approved = []
+
+    for sym in (symbols or []):
+        s = str(sym or "").strip().upper()
+        if not s:
+            continue
+        approved_for_sym: list[dict[str, Any]] = []
+        for item in approved:
+            if not isinstance(item, Mapping):
+                continue
+            underlying = str(item.get("underlying") or item.get("symbol") or "").strip().upper()
+            if underlying == s:
+                approved_for_sym.append(dict(item))
+
+        why = None
+        try:
+            if not approved_for_sym:
+                summary = report_dict.get("summary") if isinstance(report_dict.get("summary"), Mapping) else {}
+                why = str(summary.get("note") or summary.get("why") or "") or None
+        except Exception:
+            why = None
+        _write_candidates_cache_to_redis(symbol=s, approved=approved_for_sym, why=why)
+
+
+def _write_candidates_cache_to_redis(*, symbol: str, approved: list[dict[str, Any]], why: str | None = None) -> None:
+    enabled = (os.getenv("TNT_CANDIDATES_CACHE_WRITE", "0") or "0").strip() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return
+
+    try:
+        from services.context.ctx_reader import redis_client_for_ctx
+    except Exception:
+        return
+
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return
+
+    now = int(time.time())
+    as_of_et = None
+    try:
+        if _ET is not None:
+            as_of_et = datetime.fromtimestamp(now, tz=_ET).strftime("%Y-%m-%d %H:%M ET")
+    except Exception:
+        as_of_et = None
+
+    top = approved[0] if approved else None
+    status = "APPROVED" if approved else "NONE"
+    eligibility = "ELIGIBLE" if approved else "NO_TRADE"
+
+    conf = "LOW"
+    try:
+        if isinstance(top, Mapping):
+            v = top.get("confidence") if top.get("confidence") is not None else top.get("score")
+            x = float(v)  # type: ignore[arg-type]
+            conf = "HIGH" if x >= 0.75 else ("MED" if x >= 0.55 else "LOW")
+    except Exception:
+        conf = "LOW"
+
+    payload: dict[str, Any] = {
+        "ts_utc": now,
+        "as_of_et": as_of_et,
+        "status": status,
+        "why": why or ("NO_APPROVED_CANDIDATES" if not approved else None),
+        "eligibility": eligibility,
+        "confidence": conf,
+        "approved": approved,
+        "top": top,
+    }
+
+    try:
+        r = redis_client_for_ctx()
+        r.set(f"tnt:candidates:{sym}", json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+        r.expire(f"tnt:candidates:{sym}", int(max(60, int(os.getenv("TNT_CANDIDATES_CACHE_TTL_SEC", "3600") or "3600"))))
+    except Exception:
+        return
 
 
 def _extract_nested(
@@ -190,7 +297,6 @@ def main(ctx, debug, json_output):
 @click.pass_context
 def test_connectivity(ctx):
     """Test connectivity to all configured data sources."""
-    _ensure_iqfeed_enabled()
     from zero_dte_pipeline.data_connectors.unified import UnifiedDataConnector
     
     async def run():
@@ -232,7 +338,6 @@ def test_connectivity(ctx):
 @click.pass_context
 def morning_report(ctx, symbol, post_to_discord, target_expiry):
     """Full Morning Report (snapshot, regime, headlines, and candidates)."""
-    _ensure_iqfeed_enabled()
     click.echo(f"Generating morning report for: {symbol}...")
     as_json = ctx.obj.get("json_output", False)
 
@@ -253,6 +358,15 @@ def morning_report(ctx, symbol, post_to_discord, target_expiry):
             primary_expiration=target_expiration,
         )
 
+        # Optional: project report candidates into Redis for ctx snapshot embedding.
+        try:
+            if as_json and isinstance(result, Mapping):
+                approved = result.get("candidates", []) or []
+                if isinstance(approved, list):
+                    _write_candidates_cache_to_redis(symbol=str(symbol), approved=[dict(x) for x in approved if isinstance(x, Mapping)])
+        except Exception:
+            pass
+
         if as_json:
             click.echo(json.dumps(result, indent=2, default=str))
         else:
@@ -268,13 +382,21 @@ def morning_report(ctx, symbol, post_to_discord, target_expiry):
 @click.option("--post-discord", is_flag=True, default=False, help="Post TL;DR to Discord")
 def morning_report_simple_cmd(symbol: str, post_discord: bool):
     """Short-form morning report that emits the TL;DR summary."""
-    _ensure_iqfeed_enabled()
     try:
         payload = build_simple_morning_report(
             symbol,
             as_dict=True,
             post_to_discord=post_discord,
         )
+
+        # Optional: write simplified candidates list to Redis for ctx snapshot embedding.
+        try:
+            if isinstance(payload, Mapping):
+                approved = payload.get("candidates", []) or []
+                if isinstance(approved, list):
+                    _write_candidates_cache_to_redis(symbol=str(symbol), approved=[dict(x) for x in approved if isinstance(x, Mapping)])
+        except Exception:
+            pass
 
         summary = payload.get("tldr") or payload.get("text") or ""
         click.echo(summary)
@@ -297,7 +419,6 @@ def morning_report_simple_cmd(symbol: str, post_discord: bool):
 @click.pass_context
 def morning_brief(ctx, timeout, symbols, top_n):
     """Render condensed morning brief text built on the morning report output."""
-    _ensure_iqfeed_enabled()
     targets = ", ".join(symbols) if symbols else "default basket"
     click.echo(f"Generating morning brief for: {targets}...")
 
@@ -562,7 +683,7 @@ def get_candidates(ctx, underlying):
 def last_ticks_cmd(ctx, symbols, db_path):
     """Show latest WebSocket/REST tick cache rows from SQLite.
 
-    This is a quick smoke check that the Polygon WS collector is writing into `last_ticks`.
+    This is a quick smoke check that the WebSocket collector is writing into `last_ticks`.
     """
 
     import sqlite3
@@ -609,7 +730,7 @@ def last_ticks_cmd(ctx, symbols, db_path):
     click.echo(f"DB: {path}")
     if not payload["rows"]:
         click.echo("No last_ticks rows found for requested symbols.")
-        click.echo("Hint: run the task 'Polygon WS collector: indices (bg)' and wait a few seconds.")
+        click.echo("Hint: run the task 'Market WS collector: indices (bg)' and wait a few seconds.")
         return
 
     for r in payload["rows"]:
@@ -627,7 +748,7 @@ def last_ticks_cmd(ctx, symbols, db_path):
 @click.option("--json-output/--no-json-output", default=False, show_default=True)
 @click.option("--no-openai", is_flag=True, default=False, help="Skip OpenAI analysis")
 def morning_brief_cmd(symbols, json_output: bool, no_openai: bool) -> None:
-    """Generate a technical morning brief backed by Massive and IBKR data."""
+    """Generate a technical morning brief backed by external context and IBKR data."""
     requested = [s.upper() for s in symbols] if symbols else None
     brief = asyncio.run(build_brief(symbols=requested))
 

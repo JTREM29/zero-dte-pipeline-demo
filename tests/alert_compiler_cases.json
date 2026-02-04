@@ -1,0 +1,508 @@
+[
+  {
+    "id": "TC01",
+    "text": "Notify me when SPY crosses above VWAP on 5m",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY WHEN crosses_above(price,vwap) CONFIRM close ON 5m DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY"
+          ]
+        },
+        "condition": {
+          "type": "cross",
+          "op": "crosses_above",
+          "timeframe": "5m"
+        }
+      }
+    }
+  },
+  {
+    "id": "TC02",
+    "text": "Ping me when SPY, QQQ, IWM cross below VWAP 5m",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY,QQQ,IWM WHEN crosses_below(price,vwap) CONFIRM close ON 5m DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY",
+            "QQQ",
+            "IWM"
+          ]
+        },
+        "condition": {
+          "type": "cross",
+          "op": "crosses_below",
+          "timeframe": "5m"
+        }
+      }
+    }
+  },
+  {
+    "id": "TC03",
+    "text": "Alert when QQQ breaks yesterday high on 5m",
+    "expected": {
+      "ok": true,
+      "dsl": "QQQ WHEN breaks_above(y_high) CONFIRM close ON 5m DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "QQQ"
+          ]
+        },
+        "condition": {
+          "type": "break",
+          "op": "breaks_above",
+          "timeframe": "5m"
+        }
+      }
+    }
+  },
+  {
+    "id": "TC04",
+    "text": "QQQ alert if it breaks yesterday low; don't spam me",
+    "expected": {
+      "ok": true,
+      "dsl": "QQQ WHEN breaks_below(y_low) CONFIRM close ON 5m IF cooldown 5m AND max_triggers 3 DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "QQQ"
+          ]
+        },
+        "condition": {
+          "type": "break",
+          "op": "breaks_below"
+        },
+        "gates": {
+          "cooldown": {
+            "seconds": 300
+          },
+          "max_triggers": {
+            "count": 3
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "TC05",
+    "text": "Notify me when SPY crosses below its 200-day SMA",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY WHEN crosses_below(price,sma(200)) CONFIRM close ON 1D DURING RTH UNTIL 30d THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY"
+          ]
+        },
+        "condition": {
+          "timeframe": "1D"
+        }
+      }
+    }
+  },
+  {
+    "id": "TC06",
+    "text": "Alert when SPY breaks the 15-minute opening range high",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY WHEN breaks_above(or_high(15)) CONFIRM close ON 1m DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY"
+          ]
+        },
+        "condition": {
+          "type": "break",
+          "op": "breaks_above"
+        }
+      }
+    }
+  },
+  {
+    "id": "TC07",
+    "text": "Between 10:00 and 11:30, alert if SPY breaks opening range low",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY WHEN breaks_below(or_low(15)) CONFIRM close ON 1m DURING 10:00-11:30 ET UNTIL EOD THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY"
+          ]
+        },
+        "condition": {
+          "type": "break",
+          "op": "breaks_below"
+        },
+        "gates": {
+          "market_hours": {
+            "session": "CUSTOM",
+            "time_window_et": [
+              "10:00",
+              "11:30"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "TC08",
+    "text": "Let me know if SPY touches R1 today",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY,R1 WHEN touches(price,pivot(R1)) CONFIRM intrabar ON 5m DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY",
+            "R1"
+          ]
+        },
+        "condition": {
+          "type": "touch",
+          "confirm": "intrabar"
+        }
+      }
+    }
+  },
+  {
+    "id": "TC09",
+    "text": "watchlist:PORTFOLIO when new_low(10d) on 1D during RTH until 14d",
+    "expected": {
+      "ok": true,
+      "dsl": "watchlist:PORTFOLIO WHEN new_low(10d) ON 1D DURING RTH UNTIL 14d THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "watchlist",
+          "watchlist": "PORTFOLIO"
+        },
+        "condition": {
+          "timeframe": "1D"
+        }
+      }
+    }
+  },
+  {
+    "id": "TC10",
+    "text": "Alert if TSLA has RVOL over 2 today on 15m",
+    "expected": {
+      "ok": true,
+      "dsl": "TSLA WHEN rvol(20) > 2 ON 15m DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "TSLA"
+          ]
+        },
+        "condition": {
+          "type": "rvol",
+          "threshold": 2.0,
+          "lookback_bars": 20,
+          "timeframe": "15m"
+        }
+      }
+    }
+  },
+  {
+    "id": "TC11",
+    "text": "Alert when SPY breaks VWAP on 5m but only in bullish regime",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY WHEN crosses_below(price,vwap) CONFIRM close ON 5m IF regime IN {BULLISH} DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [
+        "PARSE_AMBIGUOUS"
+      ],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY"
+          ]
+        },
+        "condition": {
+          "type": "cross",
+          "op": "crosses_below",
+          "timeframe": "5m"
+        },
+        "gates": {
+          "regime": {
+            "allowed": [
+              "BULLISH"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "TC12",
+    "text": "Notify only if confidence is above 0.7 when QQQ breaks yesterday high",
+    "expected": {
+      "ok": true,
+      "dsl": "QQQ WHEN breaks_above(y_high) CONFIRM close ON 5m IF confidence >= 0.70 DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "QQQ"
+          ]
+        },
+        "condition": {
+          "type": "break",
+          "op": "breaks_above"
+        },
+        "gates": {
+          "regime": {
+            "min_confidence": 0.7
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "TC13",
+    "text": "SPY VWAP cross alerts, but not during transition",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY WHEN crosses_below(price,vwap) CONFIRM close ON 5m IF regime IN {BULLISH,NEUTRAL,BEARISH} DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY"
+          ]
+        },
+        "gates": {
+          "regime": {
+            "allowed": [
+              "BULLISH",
+              "NEUTRAL",
+              "BEARISH"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "TC14",
+    "text": "When IWM breaks yesterday low on 5m, ping and include chart",
+    "expected": {
+      "ok": true,
+      "dsl": "IWM WHEN breaks_below(y_low) CONFIRM close ON 5m DURING RTH UNTIL EOD THEN notify(compact) AND include_chart(execution)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "IWM"
+          ]
+        },
+        "condition": {
+          "type": "break",
+          "op": "breaks_below",
+          "timeframe": "5m"
+        },
+        "actions": [
+          {
+            "type": "discord_notify"
+          },
+          {
+            "type": "include_chart"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": "TC15",
+    "text": "Set this for the next 3 days: SPY cross above VWAP on 5m",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY WHEN crosses_above(price,vwap) CONFIRM close ON 5m DURING RTH UNTIL 3d THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY"
+          ]
+        },
+        "condition": {
+          "type": "cross",
+          "op": "crosses_above",
+          "timeframe": "5m"
+        },
+        "lifecycle": {
+          "expires": {
+            "type": "relative",
+            "days": 3
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "TC16",
+    "text": "Alert until 2026-02-01 when SPY crosses below 200 SMA",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY WHEN crosses_below(price,sma(200)) CONFIRM close ON 1D DURING RTH UNTIL 2026-02-01 THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY"
+          ]
+        },
+        "condition": {
+          "timeframe": "1D"
+        },
+        "lifecycle": {
+          "expires": {
+            "type": "date",
+            "date": "2026-02-01"
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "TC17",
+    "text": "Alert when SPY breaks VWAP",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY WHEN crosses_below(price,vwap) CONFIRM close ON 5m DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [
+        "PARSE_AMBIGUOUS",
+        "WARN_DEFAULT_TIMEFRAME_USED"
+      ],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY"
+          ]
+        },
+        "condition": {
+          "type": "cross",
+          "op": "crosses_below"
+        }
+      }
+    }
+  },
+  {
+    "id": "TC18",
+    "text": "Alert when SPY breaks VWAP either way",
+    "expected": {
+      "ok": false,
+      "dsl": null,
+      "warning_codes": [
+        "PARSE_AMBIGUOUS"
+      ],
+      "clarify": {
+        "question": "Do you mean crosses ABOVE VWAP, BELOW VWAP, or BOTH?",
+        "choices": [
+          "ABOVE",
+          "BELOW",
+          "BOTH"
+        ],
+        "default": "BOTH"
+      },
+      "intent_partial": null
+    }
+  },
+  {
+    "id": "TC19",
+    "text": "Only alert if data is fresh ù SPY VWAP cross 5m",
+    "expected": {
+      "ok": true,
+      "dsl": "SPY WHEN crosses_below(price,vwap) CONFIRM close ON 5m IF price_age <= 60s DURING RTH UNTIL EOD THEN notify(compact)",
+      "warning_codes": [],
+      "clarify": null,
+      "intent_partial": {
+        "targets": {
+          "type": "symbols",
+          "symbols": [
+            "SPY"
+          ]
+        },
+        "condition": {
+          "timeframe": "5m"
+        },
+        "gates": {
+          "data_freshness": {
+            "price_age_seconds": 60
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "TC20",
+    "text": "Create this alert for SYM0,SYM1,SYM2,SYM3,SYM4,SYM5,SYM6,SYM7,SYM8,SYM9,SYM10,SYM11,SYM12,SYM13,SYM14,SYM15,SYM16,SYM17,SYM18,SYM19,SYM20,SYM21,SYM22,SYM23,SYM24,SYM25,SYM26,SYM27,SYM28,SYM29 when SPY crosses above VWAP on 5m",
+    "expected": {
+      "ok": false,
+      "dsl": null,
+      "warning_codes": [
+        "ERR_TOO_MANY_SYMBOLS"
+      ],
+      "clarify": {
+        "question": "That’s more than 20 symbols. Split into 2 alerts or use watchlist:<name>. What do you prefer?",
+        "choices": [
+          "SPLIT_INTO_2",
+          "USE_WATCHLIST"
+        ],
+        "default": "USE_WATCHLIST"
+      },
+      "intent_partial": null
+    }
+  }
+]

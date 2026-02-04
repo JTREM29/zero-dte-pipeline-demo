@@ -82,7 +82,7 @@ def _parse_timeframe(text: str) -> tuple[str | None, str | None]:
         return tf, None
 
     if re.search(r"\b(\d+)\s*[- ]?day\s+sma\b", t) or re.search(r"\b(\d+)\s*d\s*sma\b", t):
-        return "1D", WARN_DEFAULT_TIMEFRAME_USED
+        return "1D", None
 
     return None, None
 
@@ -182,6 +182,24 @@ def _parse_targets(text: str) -> AlertTargets:
         "RVOL",
         "RSI",
         "MACD",
+
+        # Time zones / common time markers that are not tickers.
+        "ET",
+        "EDT",
+        "EST",
+        "CT",
+        "CDT",
+        "CST",
+        "MT",
+        "MDT",
+        "MST",
+        "PT",
+        "PDT",
+        "PST",
+        "UTC",
+        "GMT",
+        "AM",
+        "PM",
     }
 
     def _extract(seg: str) -> list[str]:
@@ -230,7 +248,8 @@ def _parse_market_hours(text: str) -> tuple[MarketHoursGate | None, str | None]:
     if "eth" in t:
         return MarketHoursGate(session="ETH", time_window_et=None), None
 
-    return MarketHoursGate(session="RTH", time_window_et=None), WARN_DEFAULT_SESSION_USED
+    # Default session is RTH; do not treat as a warning for DSL previews.
+    return MarketHoursGate(session="RTH", time_window_et=None), None
 
 
 def _parse_regime_gate(text: str) -> RegimeGate | None:
@@ -463,17 +482,7 @@ def _parse_condition_english(text: str, *, tf: str) -> tuple[list[object], str, 
     parse_code = PARSE_OK
 
     if "vwap" in t:
-        if "cross" in t and not any(k in t for k in ("above", "below", "over", "under", "either way", "both")):
-            parse_code = PARSE_AMBIGUOUS
-            return (
-                [
-                    ConditionCross(op="crosses_above", left=SeriesPrice(), right=IndicatorVWAP(), timeframe=tf, confirm=ConfirmSpec(mode="close")),
-                    ConditionCross(op="crosses_below", left=SeriesPrice(), right=IndicatorVWAP(), timeframe=tf, confirm=ConfirmSpec(mode="close")),
-                ],
-                parse_code,
-                [WARN_DEFAULT_CONFIRM_USED],
-            )
-
+        # Explicitly ambiguous direction (user asked for both ways): require clarification.
         if "either way" in t or "both" in t:
             parse_code = PARSE_AMBIGUOUS
             return (
@@ -482,20 +491,21 @@ def _parse_condition_english(text: str, *, tf: str) -> tuple[list[object], str, 
                     ConditionCross(op="crosses_below", left=SeriesPrice(), right=IndicatorVWAP(), timeframe=tf, confirm=ConfirmSpec(mode="close")),
                 ],
                 parse_code,
-                [WARN_DEFAULT_CONFIRM_USED],
+                [],
             )
 
+        # Missing direction: default to crosses_below (downside break) without forcing clarify.
+        if "cross" in t and not any(k in t for k in ("above", "below", "over", "under")):
+            return [ConditionCross(op="crosses_below", left=SeriesPrice(), right=IndicatorVWAP(), timeframe=tf, confirm=ConfirmSpec(mode="close"))], PARSE_OK, []
+
         if "above" in t or "over" in t:
-            warnings.append(WARN_DEFAULT_CONFIRM_USED)
             return [ConditionCross(op="crosses_above", left=SeriesPrice(), right=IndicatorVWAP(), timeframe=tf, confirm=ConfirmSpec(mode="close"))], parse_code, warnings
         if "below" in t or "under" in t:
-            warnings.append(WARN_DEFAULT_CONFIRM_USED)
             return [ConditionCross(op="crosses_below", left=SeriesPrice(), right=IndicatorVWAP(), timeframe=tf, confirm=ConfirmSpec(mode="close"))], parse_code, warnings
 
         if "break" in t or "breaks" in t:
-            parse_code = PARSE_AMBIGUOUS
-            warnings.append(WARN_DEFAULT_CONFIRM_USED)
-            return [ConditionCross(op="crosses_below", left=SeriesPrice(), right=IndicatorVWAP(), timeframe=tf, confirm=ConfirmSpec(mode="close"))], parse_code, warnings
+            # Users often say "breaks VWAP" meaning a downside break; default to crosses_below.
+            return [ConditionCross(op="crosses_below", left=SeriesPrice(), right=IndicatorVWAP(), timeframe=tf, confirm=ConfirmSpec(mode="close"))], PARSE_OK, warnings
 
         raise AlertCompileError(
             ERR_UNSUPPORTED_CONDITION,
@@ -504,44 +514,35 @@ def _parse_condition_english(text: str, *, tf: str) -> tuple[list[object], str, 
         )
 
     if "yesterday" in t and "high" in t:
-        warnings.append(WARN_DEFAULT_CONFIRM_USED)
         return [ConditionBreak(op="breaks_above", level=LevelRef(name="y_high"), timeframe=tf, confirm=ConfirmSpec(mode="close"))], parse_code, warnings
     if "yesterday" in t and "low" in t:
-        warnings.append(WARN_DEFAULT_CONFIRM_USED)
         return [ConditionBreak(op="breaks_below", level=LevelRef(name="y_low"), timeframe=tf, confirm=ConfirmSpec(mode="close"))], parse_code, warnings
 
     if "opening range" in t and "high" in t:
         mins = _parse_or_minutes(text) or 15
-        warnings.append(WARN_DEFAULT_CONFIRM_USED)
         return [ConditionBreak(op="breaks_above", level=LevelRef(name="or_high", minutes=mins), timeframe=tf, confirm=ConfirmSpec(mode="close"))], parse_code, warnings
     if "opening range" in t and "low" in t:
         mins = _parse_or_minutes(text) or 15
-        warnings.append(WARN_DEFAULT_CONFIRM_USED)
         return [ConditionBreak(op="breaks_below", level=LevelRef(name="or_low", minutes=mins), timeframe=tf, confirm=ConfirmSpec(mode="close"))], parse_code, warnings
 
     if "touch" in t:
         piv = _parse_touch_pivot(text)
         if piv:
-            warnings.append(WARN_DEFAULT_CONFIRM_USED)
             return [ConditionTouch(left=SeriesPrice(), right=piv, timeframe=tf, confirm=ConfirmSpec(mode="intrabar"))], parse_code, warnings
 
     sma = _parse_indicator_sma(text)
     if sma:
         if "below" in t or "under" in t:
-            warnings.append(WARN_DEFAULT_CONFIRM_USED)
             return [ConditionCross(op="crosses_below", left=SeriesPrice(), right=sma, timeframe="1D", confirm=ConfirmSpec(mode="close"))], parse_code, warnings
         if "above" in t or "over" in t:
-            warnings.append(WARN_DEFAULT_CONFIRM_USED)
             return [ConditionCross(op="crosses_above", left=SeriesPrice(), right=sma, timeframe="1D", confirm=ConfirmSpec(mode="close"))], parse_code, warnings
         raise AlertCompileError(ERR_UNSUPPORTED_CONDITION, "SMA cross needs direction", suggestion="Say 'crosses above' or 'crosses below'.")
 
     ema = _parse_indicator_ema(text)
     if ema:
         if "below" in t or "under" in t:
-            warnings.append(WARN_DEFAULT_CONFIRM_USED)
             return [ConditionCross(op="crosses_below", left=SeriesPrice(), right=ema, timeframe=tf, confirm=ConfirmSpec(mode="close"))], parse_code, warnings
         if "above" in t or "over" in t:
-            warnings.append(WARN_DEFAULT_CONFIRM_USED)
             return [ConditionCross(op="crosses_above", left=SeriesPrice(), right=ema, timeframe=tf, confirm=ConfirmSpec(mode="close"))], parse_code, warnings
         raise AlertCompileError(ERR_UNSUPPORTED_CONDITION, "EMA cross needs direction")
 
@@ -588,28 +589,33 @@ def compile_request(*, request_text: str, user_id: str, channel_id: str) -> Comp
     if tf is None:
         if re.search(r"\b(\d+)\s*[- ]?day\s+sma\b", raw, re.I) or re.search(r"\b(\d+)\s*d\s*sma\b", raw, re.I):
             tf = "1D"
-            warnings.append(WARN_DEFAULT_TIMEFRAME_USED)
+            # Inferred from the request; not considered a warning for UX.
         elif "opening range" in raw.lower():
             tf = "1m"
-            warnings.append(WARN_DEFAULT_TIMEFRAME_USED)
+            # Inferred from the request; not considered a warning for UX.
         else:
             tf = "5m"
-            warnings.append(WARN_DEFAULT_TIMEFRAME_USED)
+            # Default to 5m for intraday requests; warnings (if any) are added at the envelope layer.
 
     expires, _ = _parse_expiry(raw)
     if tf == "1D" and isinstance(expires, ExpiresEOD):
         expires = ExpiresDuration(days=30)
 
-    mh, warn_sess = _parse_market_hours(raw)
-    if warn_sess:
-        warnings.append(warn_sess)
+    mh, _ = _parse_market_hours(raw)
+
+    # Anti-spam gates are opt-in.
+    cooldown = _parse_cooldown_gate(raw)
+    max_triggers = _parse_max_triggers(raw)
+    if cooldown is not None and max_triggers is None:
+        # A simple "don't spam" request implies both defaults.
+        max_triggers = 3
 
     gates = Gates(
         regime=_parse_regime_gate(raw),
         confidence_min=_parse_confidence_gate(raw),
         market_hours=mh,
-        cooldown=_parse_cooldown_gate(raw) or CooldownGate(seconds=300),
-        max_triggers=_parse_max_triggers(raw) or 3,
+        cooldown=cooldown,
+        max_triggers=max_triggers,
         data_freshness=_parse_price_age_gate(raw),
     )
 

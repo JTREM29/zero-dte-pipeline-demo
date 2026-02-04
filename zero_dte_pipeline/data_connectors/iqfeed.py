@@ -29,6 +29,11 @@ from zero_dte_pipeline.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+# IQFeed is hard-disabled by default. Enable explicitly with TNT_ENABLE_IQFEED=1.
+if (os.getenv("TNT_ENABLE_IQFEED", "0") or "0").strip() != "1":
+    raise RuntimeError("IQFeed disabled (set TNT_ENABLE_IQFEED=1 to enable)")
+
+
 class IQFeedConnector(DataConnector):
     """IQFeed data connector with improved authentication handling.
     

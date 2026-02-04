@@ -37,9 +37,19 @@ db/
 tmp/
 analysis/
 src/
+artifacts/
+cache/
+.venv*/
 *.db
 *.sqlite
+*.rdb
+appendonly.aof
+memurai*.txt
+/*.png
 *~
+
+# Local scratch
+query
 
 # Environment
 .env
@@ -63,6 +73,9 @@ data/
 *.csv
 *.parquet
 *.json.gz
+
+# Massive docs cache (generated)
+tools/massive_docs/cache/
 
 # Testing
 .pytest_cache/
