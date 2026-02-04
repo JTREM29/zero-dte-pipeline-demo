@@ -5,6 +5,8 @@ import math
 import os
 from typing import Optional
 
+import re
+
 from delivery.tnt_chart_style import apply_tnt_dark_rcparams, style_tnt_dark_axes, style_tnt_dark_figure, tnt_png_metadata
 
 
@@ -14,6 +16,310 @@ TNT_PUT_COLOR = "#EF4444"  # TNT red
 TNT_BAR_ALPHA = 0.90
 TNT_GRID_ALPHA = 0.12
 TNT_WATERMARK = True
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name, str(default)) or str(default)).strip())
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float((os.getenv(name, str(default)) or str(default)).strip())
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+_SPOT_RE = re.compile(r"\bSpot\s+([0-9]+(?:\.[0-9]+)?)\b")
+
+
+def _infer_spot_from_title(title: str) -> float | None:
+    try:
+        m = _SPOT_RE.search(str(title or ""))
+        if not m:
+            return None
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def _percentile(values: list[float], p: float) -> float:
+    if not values:
+        return 0.0
+    v = sorted(float(x) for x in values)
+    if len(v) == 1:
+        return float(v[0])
+    p = max(0.0, min(100.0, float(p)))
+    k = (len(v) - 1) * (p / 100.0)
+    f = int(k)
+    c = min(f + 1, len(v) - 1)
+    if f == c:
+        return float(v[f])
+    return float(v[f] + (v[c] - v[f]) * (k - f))
+
+
+def _top_levels(
+    *,
+    strikes: list[float],
+    series: list[float],
+    kind: str,
+    topn: int,
+    min_fraction_of_max: float,
+) -> list[tuple[int, float, float, str]]:
+    """Return up to topn levels as tuples: (idx, strike, value, label)."""
+    if not strikes or not series or len(strikes) != len(series):
+        return []
+    mx = float(max(series)) if series else 0.0
+    if mx <= 0.0:
+        return []
+    min_fraction_of_max = float(min_fraction_of_max)
+    if not math.isfinite(min_fraction_of_max) or min_fraction_of_max <= 0.0:
+        min_fraction_of_max = 0.35
+    min_fraction_of_max = max(0.05, min(0.95, min_fraction_of_max))
+
+    cands: list[tuple[int, float, float]] = []
+    for i, v in enumerate(series):
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if not math.isfinite(fv) or fv <= 0.0:
+            continue
+        cands.append((int(i), float(strikes[i]), fv))
+    cands.sort(key=lambda x: x[2], reverse=True)
+
+    seen_strikes: set[float] = set()
+    out: list[tuple[int, float, float, str]] = []
+    want = max(0, int(topn))
+    if want <= 0:
+        return []
+    for i, s, v in cands[: max(1, want * 3)]:
+        if v < mx * float(min_fraction_of_max):
+            continue
+        if s in seen_strikes:
+            continue
+        seen_strikes.add(s)
+        if kind == "put":
+            label = f"Put wall @ {s:g}"
+        elif kind == "call":
+            label = f"Call wall @ {s:g}"
+        else:
+            label = f"Magnet @ {s:g}"
+        out.append((i, s, v, label))
+        if len(out) >= want:
+            break
+    return out
+
+
+def _find_void_spans(
+    *,
+    combined: list[float],
+    pctl: float,
+    min_width: int,
+) -> list[tuple[int, int]]:
+    """Return spans in index space as (i0, i1) inclusive."""
+    if not combined or len(combined) < 6:
+        return []
+    thr = _percentile([float(x) for x in combined], float(pctl))
+    low = [float(x) <= float(thr) for x in combined]
+    spans: list[tuple[int, int]] = []
+    i = 0
+    n = len(low)
+    min_width = max(1, int(min_width))
+    while i < n:
+        if not low[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and low[j]:
+            j += 1
+        if (j - i) >= min_width:
+            spans.append((int(i), int(j - 1)))
+        i = j
+    # Merge adjacent spans.
+    merged: list[tuple[int, int]] = []
+    for a, b in spans:
+        if not merged:
+            merged.append((a, b))
+            continue
+        pa, pb = merged[-1]
+        if a <= (pb + 1):
+            merged[-1] = (pa, max(pb, b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def _pressure_line_text(
+    *,
+    put_levels: list[tuple[int, float, float, str]],
+    call_levels: list[tuple[int, float, float, str]],
+    magnet: tuple[int, float, float, str] | None,
+) -> str | None:
+    parts: list[str] = []
+    try:
+        if put_levels:
+            parts.append(f"Put wall {put_levels[0][1]:g}")
+        if magnet is not None:
+            parts.append(f"Magnet {float(magnet[1]):g}")
+        if call_levels:
+            parts.append(f"Call wall {call_levels[0][1]:g}")
+    except Exception:
+        parts = []
+    if not parts:
+        return None
+    return " | ".join(parts)
+
+
+def _add_oi_overlays(
+    ax,
+    *,
+    fig,
+    xs: list[int],
+    strike_vals: list[float],
+    oi_calls_pos: list[float],
+    oi_puts_pos: list[float],
+    title: str,
+) -> tuple[str | None, dict[str, str]]:
+    """Add optional overlays; return (pressure_line, meta_flags)."""
+    meta_flags: dict[str, str] = {}
+
+    annotate_walls = _env_bool("TNT_OI_ANNOTATE_WALLS", True)
+    annotate_topn = _env_int("TNT_OI_ANNOTATE_WALLS_TOPN", 2)
+    annotate_magnet = _env_bool("TNT_OI_ANNOTATE_MAGNET", True)
+    min_fraction = _env_float("TNT_OI_ANNOTATE_MIN_FRACTION", 0.35)
+    show_voids = _env_bool("TNT_OI_SHOW_VOIDS", False)
+    void_pctl = _env_float("TNT_OI_VOID_PCTL", 20.0)
+    void_min_width = _env_int("TNT_OI_VOID_MIN_WIDTH", 2)
+    show_pressure = _env_bool("TNT_OI_SHOW_PRESSURE_LINE", True)
+
+    meta_flags["tnt_oi_iv_annotate_walls"] = "1" if bool(annotate_walls) else "0"
+    meta_flags["tnt_oi_iv_annotate_magnet"] = "1" if bool(annotate_magnet) else "0"
+    meta_flags["tnt_oi_iv_voids"] = "1" if bool(show_voids) else "0"
+    meta_flags["tnt_oi_iv_pressure_line"] = "1" if bool(show_pressure) else "0"
+
+    n = len(xs)
+    if n <= 0 or len(oi_calls_pos) != n or len(oi_puts_pos) != n or len(strike_vals) != n:
+        return None, meta_flags
+
+    combined = [float(c) + float(p) for c, p in zip(oi_calls_pos, oi_puts_pos)]
+
+    # Void shading.
+    if bool(show_voids):
+        try:
+            spans = _find_void_spans(combined=combined, pctl=float(void_pctl), min_width=int(void_min_width))
+            for i0, i1 in spans:
+                # pad slightly beyond bar clusters
+                ax.axvspan(float(i0) - 0.65, float(i1) + 0.65, color="#c9d1d9", alpha=0.06, zorder=2)
+            if spans:
+                ax.text(
+                    0.01,
+                    0.02,
+                    f"OI voids: pctl<{float(void_pctl):g}",
+                    transform=ax.transAxes,
+                    fontsize=8,
+                    alpha=0.70,
+                    ha="left",
+                    va="bottom",
+                )
+        except Exception:
+            pass
+
+    pressure_line: str | None = None
+    if bool(annotate_walls):
+        try:
+            put_lv = _top_levels(strikes=strike_vals, series=oi_puts_pos, kind="put", topn=int(annotate_topn), min_fraction_of_max=float(min_fraction))
+            call_lv = _top_levels(strikes=strike_vals, series=oi_calls_pos, kind="call", topn=int(annotate_topn), min_fraction_of_max=float(min_fraction))
+
+            magnet_lv: tuple[int, float, float, str] | None = None
+            if bool(annotate_magnet):
+                mx = float(max(combined)) if combined else 0.0
+                if mx > 0.0:
+                    spot = _infer_spot_from_title(title)
+                    best_i = None
+                    best_v = None
+                    best_d = None
+                    center = float((n - 1) / 2.0)
+                    for i, v in enumerate(combined):
+                        fv = float(v)
+                        if fv <= 0.0 or not math.isfinite(fv):
+                            continue
+                        if (best_v is None) or (fv > float(best_v)):
+                            best_i, best_v = int(i), fv
+                            if spot is not None:
+                                best_d = abs(float(strike_vals[i]) - float(spot))
+                            else:
+                                best_d = abs(float(i) - center)
+                        elif fv == float(best_v):
+                            if spot is not None:
+                                d = abs(float(strike_vals[i]) - float(spot))
+                            else:
+                                d = abs(float(i) - center)
+                            if best_d is None or d < float(best_d):
+                                best_i, best_v, best_d = int(i), fv, float(d)
+                    if best_i is not None and best_v is not None:
+                        s = float(strike_vals[int(best_i)])
+                        magnet_lv = (int(best_i), s, float(best_v), f"Magnet @ {s:g}")
+
+            # Pressure line (returned so title headroom can reserve space).
+            if bool(show_pressure):
+                pressure_line = _pressure_line_text(put_levels=put_lv, call_levels=call_lv, magnet=magnet_lv)
+
+            # Sparse annotations with simple staggering.
+            y_top = 1.0
+            try:
+                y_top = float(ax.get_ylim()[1])
+            except Exception:
+                y_top = 1.0
+            base_y = y_top * 0.92
+            step = y_top * 0.08
+
+            # Merge + dedupe by strike (keep magnet if not already a wall).
+            all_lv: list[tuple[int, float, float, str]] = []
+            all_lv.extend(list(put_lv))
+            all_lv.extend(list(call_lv))
+            if magnet_lv is not None:
+                all_lv.append(magnet_lv)
+            # Dedupe strike.
+            dedup: list[tuple[int, float, float, str]] = []
+            seen: set[float] = set()
+            for i, s, v, lab in all_lv:
+                if float(s) in seen:
+                    continue
+                seen.add(float(s))
+                dedup.append((int(i), float(s), float(v), str(lab)))
+
+            dedup = sorted(dedup, key=lambda x: (x[0], x[1]))[:4]
+            for k, (i, s, v, lab) in enumerate(dedup):
+                y = base_y - (k % 3) * step
+                ax.annotate(
+                    f"{lab}\n{float(v):,.0f}",
+                    xy=(float(xs[int(i)]), min(float(v), y_top * 0.98)),
+                    xytext=(float(xs[int(i)]), float(y)),
+                    textcoords="data",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                    color="#E6E6E6",
+                    bbox={"boxstyle": "round,pad=0.25", "facecolor": "#0b0f14", "edgecolor": "#2d333b", "alpha": 0.55},
+                    arrowprops={"arrowstyle": "-|>", "color": "#8b949e", "alpha": 0.45, "lw": 0.9},
+                    clip_on=False,
+                    zorder=6,
+                )
+        except Exception:
+            pressure_line = None
+
+    return pressure_line, meta_flags
 
 
 def infer_iv_percent_units(values: list[float]) -> list[float]:
@@ -353,12 +659,38 @@ def render_oi_iv_png(
     except Exception:
         pass
 
+    # Optional overlays (walls/magnet/voids/pressure), behind env toggles.
+    pressure_line = None
+    overlay_meta: dict[str, str] = {}
+    try:
+        # Prefer numeric strike values if possible; fall back to index-as-strike.
+        strike_vals: list[float] = []
+        for i, lab in enumerate(list(x_labels)):
+            try:
+                strike_vals.append(float(lab))
+            except Exception:
+                strike_vals.append(float(i))
+        pressure_line, overlay_meta = _add_oi_overlays(
+            ax,
+            fig=fig,
+            xs=xs,
+            strike_vals=strike_vals,
+            oi_calls_pos=oi_calls_pos,
+            oi_puts_pos=oi_puts_pos,
+            title=str(title or ""),
+        )
+    except Exception:
+        pressure_line = None
+        overlay_meta = {}
+
     # Title + light subheader.
     # Use fig-level text so it never overlaps/clips regardless of backend.
     try:
         sub = f"{n} strikes  •  IV overlay {'on' if include_iv_overlay else 'off'}"
         fig.text(0.06, 0.965, str(title or ""), ha="left", va="top", fontsize=11, color="#c9d1d9")
         fig.text(0.06, 0.935, sub, ha="left", va="top", fontsize=8.5, color="#8b949e", alpha=0.85)
+        if str(pressure_line or "").strip():
+            fig.text(0.06, 0.905, f"Pressure: {pressure_line}", ha="left", va="top", fontsize=9, color="#c9d1d9", alpha=0.82)
     except Exception:
         pass
     ax.set_xlabel("Strike", color="#c9d1d9")
@@ -498,8 +830,14 @@ def render_oi_iv_png(
         except Exception:
             bottom = 0.18
         bottom = max(0.02, min(0.30, float(bottom)))
-        # Leave extra headroom for fig-level title/subheader.
-        fig.tight_layout(rect=(0.06, bottom, 0.985, 0.88))
+        # Leave extra headroom for fig-level title/subheader (+ optional pressure line).
+        top = 0.88
+        try:
+            if str(pressure_line or "").strip():
+                top = 0.86
+        except Exception:
+            top = 0.88
+        fig.tight_layout(rect=(0.06, bottom, 0.985, float(top)))
     except Exception:
         pass
     dpi_used = int(dpi) if int(dpi) > 0 else 150
@@ -512,6 +850,11 @@ def render_oi_iv_png(
     # Style contract rails (avoid drift across worker/local renders).
     meta["tnt_oi_iv_palette"] = "option_b"
     meta["tnt_oi_iv_watermark"] = "1" if bool(TNT_WATERMARK) else "0"
+    try:
+        for k, v in dict(overlay_meta or {}).items():
+            meta[str(k)] = str(v)
+    except Exception:
+        pass
     save_kwargs: dict[str, object] = {}
     try:
         truthy = {"1", "true", "yes", "y", "on"}
