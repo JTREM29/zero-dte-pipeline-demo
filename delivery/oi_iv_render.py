@@ -168,10 +168,20 @@ def _pressure_line_text(
 ) -> str | None:
     parts: list[str] = []
     try:
+        magnet_s: float | None = None
+        if magnet is not None:
+            magnet_s = float(magnet[1])
+        # If magnet sits on the same strike as a wall, omit it from the pressure line
+        # (the on-chart annotation will fold it into the wall label).
+        if magnet_s is not None:
+            if put_levels and abs(float(put_levels[0][1]) - magnet_s) < 1e-9:
+                magnet_s = None
+            if call_levels and abs(float(call_levels[0][1]) - magnet_s) < 1e-9:
+                magnet_s = None
         if put_levels:
             parts.append(f"Put wall {put_levels[0][1]:g}")
-        if magnet is not None:
-            parts.append(f"Magnet {float(magnet[1]):g}")
+        if magnet_s is not None:
+            parts.append(f"Magnet {float(magnet_s):g}")
         if call_levels:
             parts.append(f"Call wall {call_levels[0][1]:g}")
     except Exception:
@@ -190,6 +200,7 @@ def _add_oi_overlays(
     oi_calls_pos: list[float],
     oi_puts_pos: list[float],
     title: str,
+    skip_strikes: set[float] | None = None,
 ) -> tuple[str | None, dict[str, str]]:
     """Add optional overlays; return (pressure_line, meta_flags)."""
     meta_flags: dict[str, str] = {}
@@ -271,6 +282,24 @@ def _add_oi_overlays(
                         s = float(strike_vals[int(best_i)])
                         magnet_lv = (int(best_i), s, float(best_v), f"Magnet @ {s:g}")
 
+            # If magnet lands on an already-annotated wall strike, fold it into that wall
+            # label instead of creating a separate magnet box.
+            if magnet_lv is not None:
+                ms = float(magnet_lv[1])
+                folded = False
+                for src in ("put", "call"):
+                    lv = put_lv if src == "put" else call_lv
+                    for j, (ii, ss, vv, ll) in enumerate(list(lv)):
+                        if abs(float(ss) - ms) < 1e-9:
+                            kind = "Put wall" if src == "put" else "Call wall"
+                            lv[j] = (int(ii), float(ss), float(vv), f"{kind} + Magnet @ {float(ss):g}")
+                            folded = True
+                            break
+                    if folded:
+                        break
+                if folded:
+                    magnet_lv = None
+
             # Pressure line (returned so title headroom can reserve space).
             if bool(show_pressure):
                 pressure_line = _pressure_line_text(put_levels=put_lv, call_levels=call_lv, magnet=magnet_lv)
@@ -292,7 +321,7 @@ def _add_oi_overlays(
                 all_lv.append(magnet_lv)
             # Dedupe strike.
             dedup: list[tuple[int, float, float, str]] = []
-            seen: set[float] = set()
+            seen: set[float] = set(float(s) for s in (skip_strikes or set()))
             for i, s, v, lab in all_lv:
                 if float(s) in seen:
                     continue
@@ -589,6 +618,7 @@ def render_oi_iv_png(
 
     ax2 = None
     wall_callout_drawn = False
+    wall_callout_strike: float | None = None
     if bool(include_iv_overlay):
         ax2 = ax.twinx()
         style_tnt_dark_axes(ax2, grid=False)
@@ -641,6 +671,11 @@ def render_oi_iv_png(
                     label = f"Put wall @ {x_labels[i]}"
                     val = float(oi_puts_pos[i])
 
+                try:
+                    wall_callout_strike = float(x_labels[i])
+                except Exception:
+                    wall_callout_strike = float(i)
+
                 ax.annotate(
                     f"{label}\n{val:,.0f}",
                     xy=(xs[i], y_top),
@@ -678,6 +713,7 @@ def render_oi_iv_png(
             oi_calls_pos=oi_calls_pos,
             oi_puts_pos=oi_puts_pos,
             title=str(title or ""),
+            skip_strikes={float(wall_callout_strike)} if wall_callout_strike is not None else None,
         )
     except Exception:
         pressure_line = None

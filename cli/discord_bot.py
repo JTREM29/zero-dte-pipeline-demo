@@ -1245,7 +1245,7 @@ async def run_cache_warm_cycle() -> None:
                         v_stamp = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
                         stamp_key = "sv1" if (allow_stamp in truthy and v_stamp in truthy) else "sv0"
 
-                        base = f"oi_png:v12:{sym}:strike:{exp}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
+                        base = f"oi_png:v13:{sym}:strike:{exp}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
                         key = _gprr_cache_key(base)
                         existing = await _png_cache_get(key, family="oi")
                         if existing is not None and existing[0]:
@@ -9610,7 +9610,7 @@ async def oi(
     v_stamp = (os.getenv("TNT_RENDER_STAMP_VISIBLE", "0") or "0").strip().lower()
     stamp_key = "sv1" if (allow_stamp in truthy and v_stamp in truthy) else "sv0"
 
-    cache_key_png = f"oi_png:v12:{sym}:{by_norm}:{exp_for_key}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
+    cache_key_png = f"oi_png:v13:{sym}:{by_norm}:{exp_for_key}:{int(top_n)}:{window_key}:{int(max_contracts)}:{iv_key}:{stamp_key}"
     cache_key_png_full = _gprr_cache_key(cache_key_png)
 
     # Always print the cache key used for this request (helps debug stale cache vs fresh render).
