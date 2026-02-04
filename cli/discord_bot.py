@@ -347,6 +347,18 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Optional: macro econ + calendar commands (Massive cache + autopost).
+try:
+    from commands.macro_commands import register_macro_commands as _register_macro_commands
+
+    _register_macro_commands(bot)
+except Exception as _exc:
+    # Keep startup resilient; macro commands are optional.
+    try:
+        print(f"[TNT][MACRO][WARN] macro commands not registered: {type(_exc).__name__}: {_exc}")
+    except Exception:
+        pass
+
 # IMPORTANT: `delivery.discord_bot` defines a lot of the legacy automation loops and helpers,
 # but we want a *single* Discord gateway session. Re-bind the delivery module's `bot`
 # reference to this instance so delivery's automation scheduler can run safely here.
@@ -14509,6 +14521,21 @@ async def on_ready() -> None:
             delivery._ensure_tnt_automation_tasks()  # type: ignore[attr-defined]
     except Exception:
         pass
+
+    # Macro econ loops: refresh Massive econ cache + autopost macro cards.
+    try:
+        if not hasattr(bot, "_tnt_macro_task") or getattr(bot, "_tnt_macro_task") is None or getattr(bot, "_tnt_macro_task").done():
+            from jobs.macro_econ_jobs import run_macro_loops
+            from services.redis_env import redis_client
+
+            r = redis_client(timeout_s=2.0, decode_responses=True)
+            setattr(bot, "_tnt_macro_task", asyncio.create_task(run_macro_loops(bot, r)))
+            print("[TNT][MACRO] Macro econ loops started")
+    except Exception as exc:
+        try:
+            print(f"[TNT][MACRO][WARN] Failed to start macro loops: {type(exc).__name__}: {exc}")
+        except Exception:
+            pass
 
     # Alerts delivery loop (Redis -> Discord).
     # This is independent of earnings + /oi and is gated by TNT_ALERTS_DISCORD_DELIVERY_ENABLED.
