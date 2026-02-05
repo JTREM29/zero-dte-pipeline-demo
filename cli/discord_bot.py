@@ -70,11 +70,18 @@ def _print_env_snapshot() -> None:
         oi_mode = (os.getenv("TNT_OI_WORKER_MODE") or "").strip() or "(default)"
         if not oi_mode:
             oi_mode = "(default)"
+
         worker_url = (os.getenv("TNT_WORKER_URL") or "").strip() or "(missing)"
+        worker_xl = (os.getenv("TNT_WORKER_URL_XL") or "").strip() or "(missing)"
+        worker_2 = (os.getenv("TNT_WORKER_URL_2") or "").strip() or "(missing)"
+        route_proof = (os.getenv("TNT_WORKER_ROUTE_PROOF") or "").strip() or "0"
         sanitize_always = (os.getenv("TNT_WORKER_SANITIZE_ALWAYS") or "").strip() or "0"
         node_role = (os.getenv("TNT_NODE_ROLE") or "").strip() or "(unset)"
         print(
             f"[TNT][OI][ENV] worker_mode={oi_mode} worker_url={worker_url} sanitize_always={sanitize_always}"
+        )
+        print(
+            f"[TNT][WORKER][ENV] TNT_WORKER_URL={worker_url} TNT_WORKER_URL_XL={worker_xl} TNT_WORKER_URL_2={worker_2} route_proof={route_proof}"
         )
         print(f"[TNT][NODE] role={node_role}")
         try:
@@ -424,8 +431,8 @@ async def _alerts_delivery_loop() -> None:
         print("[TNT][ALERTS][DELIVERY] disabled (TNT_ALERTS_DISCORD_DELIVERY_ENABLED=0)")
         return
 
-    channel_id = _env_int("TNT_ALERTS_CHANNEL_ID", 0)
-    if channel_id <= 0:
+    default_channel_id = _env_int("TNT_ALERTS_CHANNEL_ID", 0)
+    if default_channel_id <= 0:
         print("[TNT][ALERTS][DELIVERY][WARN] missing TNT_ALERTS_CHANNEL_ID; delivery loop disabled")
         return
 
@@ -449,27 +456,30 @@ async def _alerts_delivery_loop() -> None:
         print(f"[TNT][ALERTS][DELIVERY][WARN] Redis unavailable: {type(exc).__name__}: {exc}")
         return
 
-    async def _resolve_channel() -> discord.abc.Messageable | None:
+    async def _resolve_channel(ch_id: int) -> discord.abc.Messageable | None:
         try:
-            ch = bot.get_channel(channel_id)
+            ch = bot.get_channel(ch_id)
             if ch is not None:
                 return ch
         except Exception:
             pass
         try:
-            return await bot.fetch_channel(channel_id)
+            return await bot.fetch_channel(ch_id)
         except Exception as exc:
-            print(f"[TNT][ALERTS][DELIVERY][WARN] fetch_channel failed id={channel_id}: {type(exc).__name__}: {exc}")
+            print(f"[TNT][ALERTS][DELIVERY][WARN] fetch_channel failed id={ch_id}: {type(exc).__name__}: {exc}")
             return None
 
-    channel = await _resolve_channel()
+    channel_cache: dict[int, discord.abc.Messageable] = {}
+
+    channel = await _resolve_channel(default_channel_id)
     if channel is None:
-        print(f"[TNT][ALERTS][DELIVERY][WARN] channel not found id={channel_id}; delivery loop disabled")
+        print(f"[TNT][ALERTS][DELIVERY][WARN] channel not found id={default_channel_id}; delivery loop disabled")
         return
+    channel_cache[default_channel_id] = channel
 
     print(
         "[TNT][ALERTS][DELIVERY] enabled=1 "
-        f"channel_id={channel_id} queue={queue_key} poll_timeout={poll_timeout} "
+        f"channel_id={default_channel_id} queue={queue_key} poll_timeout={poll_timeout} "
         f"bundle_window_sec={bundle_window_sec} dry_run={int(bool(dry_run))}"
     )
 
@@ -518,32 +528,198 @@ async def _alerts_delivery_loop() -> None:
             if len(jobs) > 1:
                 print(f"[TNT][ALERTS][DELIVERY][BUNDLE] queue={queue_key} n={len(jobs)}")
 
-        lines: list[str] = []
+        # Group posts by target channel id (defaults to TNT_ALERTS_CHANNEL_ID).
+        by_channel_lines: dict[int, list[str]] = {}
+        by_channel_ops: dict[int, list[str]] = {}
+        by_channel_last_job_id: dict[int, str] = {}
         for jb in jobs:
-            if str(jb.get("type") or jb.get("job_type") or "") not in {"alert_trigger", "ALERT_TRIGGER"}:
+            jtype = str(jb.get("type") or jb.get("job_type") or "").strip()
+            try:
+                ch_id = int(jb.get("channel_id") or 0) if isinstance(jb, dict) else 0
+            except Exception:
+                ch_id = 0
+            if ch_id <= 0:
+                ch_id = default_channel_id
+
+            if jtype in {"alert_trigger", "ALERT_TRIGGER"}:
+                by_channel_lines.setdefault(ch_id, []).append(_format_alert_trigger_line(jb))
+                try:
+                    jid = str(jb.get("job_id") or "").strip()
+                    if jid:
+                        by_channel_last_job_id[ch_id] = jid
+                except Exception:
+                    pass
                 continue
-            lines.append(_format_alert_trigger_line(jb))
-            if len(lines) >= 12:
-                break
+            if jtype in {"ops_banner", "OPS_BANNER"}:
+                content = str(jb.get("content") or "").strip()
+                if content:
+                    by_channel_ops.setdefault(ch_id, []).append(content)
 
-        if not lines:
+        if not by_channel_lines and not by_channel_ops:
             continue
-
-        if len(lines) == 1:
-            content = "🚨 ALERT TRIGGERED — " + lines[0]
-        else:
-            content = "🚨 ALERTS TRIGGERED (bundle)\n" + "\n".join([f"- {ln}" for ln in lines])
 
         if dry_run:
-            print(f"[TNT][ALERTS][DELIVERY][POSTED] DRY_RUN=1 bytes={len(content)}")
+            total = sum(len(v) for v in by_channel_lines.values()) + sum(len(v) for v in by_channel_ops.values())
+            print(f"[TNT][ALERTS][DELIVERY][POSTED] DRY_RUN=1 n_items={total}")
             continue
 
-        try:
-            await channel.send(content)
-            print(f"[TNT][ALERTS][DELIVERY][POSTED] n={len(lines)}")
-        except Exception as exc:
-            print(f"[TNT][ALERTS][DELIVERY][WARN] send failed: {type(exc).__name__}: {exc}")
-            await asyncio.sleep(0.5)
+        async def _get_channel(ch_id: int) -> discord.abc.Messageable | None:
+            if ch_id in channel_cache:
+                return channel_cache[ch_id]
+            ch = await _resolve_channel(ch_id)
+            if ch is not None:
+                channel_cache[ch_id] = ch
+            return ch
+
+        def _record_last_send(
+            kind: str,
+            ch_id: int,
+            msg_id: str | int | None,
+            *,
+            channel_obj: object | None = None,
+            extra: dict[str, object] | None = None,
+        ) -> None:
+            try:
+                from services.discord_send_telemetry import record_discord_last_send
+
+                record_discord_last_send(
+                    r,
+                    kind=kind,
+                    channel_id=ch_id,
+                    guild_id=getattr(getattr(channel_obj, "guild", None), "id", None) if channel_obj is not None else None,
+                    channel_name=getattr(channel_obj, "name", None) if channel_obj is not None else None,
+                    msg_id=msg_id,
+                    extra=(extra if isinstance(extra, dict) and extra else None),
+                )
+            except Exception:
+                return
+
+        # Send ops banners first (they're intentionally small and infrequent).
+        for ch_id, msgs in by_channel_ops.items():
+            ch = await _get_channel(ch_id)
+            if ch is None:
+                print(f"[TNT][ALERTS][DELIVERY][WARN] channel not found id={ch_id}; skipping ops_banner")
+                continue
+            for msg in msgs[:3]:
+                try:
+                    print(f"[TNT][ALERTS][DELIVERY][SEND] channel_id={ch_id} n=1 bytes={len(msg)} type=ops_banner")
+                    sent = await ch.send(msg)
+                    _record_last_send("ALERT", ch_id, getattr(sent, "id", None), channel_obj=ch, extra={"type": "ops_banner"})
+                    print(f"[TNT][ALERTS][DELIVERY][POSTED] channel_id={ch_id} n=1 type=ops_banner")
+                except discord.Forbidden as exc:
+                    print(f"[TNT][ALERTS][DELIVERY][FORBIDDEN] channel_id={ch_id}: {type(exc).__name__}: {exc}")
+                    try:
+                        from services.discord_send_telemetry import record_discord_last_attempt
+
+                        record_discord_last_attempt(
+                            r,
+                            kind="ALERT",
+                            channel_id=ch_id,
+                            guild_id=getattr(getattr(ch, "guild", None), "id", None),
+                            channel_name=getattr(ch, "name", None),
+                            error_code="FORBIDDEN",
+                            error=f"{type(exc).__name__}: {exc}",
+                            extra={"type": "ops_banner"},
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.0)
+                except Exception as exc:
+                    print(f"[TNT][ALERTS][DELIVERY][WARN] send failed channel_id={ch_id}: {type(exc).__name__}: {exc}")
+                    try:
+                        from services.discord_send_telemetry import record_discord_last_attempt
+
+                        record_discord_last_attempt(
+                            r,
+                            kind="ALERT",
+                            channel_id=ch_id,
+                            guild_id=getattr(getattr(ch, "guild", None), "id", None),
+                            channel_name=getattr(ch, "name", None),
+                            error_code="SEND_FAILED",
+                            error=f"{type(exc).__name__}: {exc}",
+                            extra={"type": "ops_banner"},
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.5)
+
+        # Send alert triggers per channel (optionally bundled).
+        for ch_id, lines in by_channel_lines.items():
+            if not lines:
+                continue
+            ch = await _get_channel(ch_id)
+            if ch is None:
+                print(f"[TNT][ALERTS][DELIVERY][WARN] channel not found id={ch_id}; skipping alert_trigger")
+                continue
+
+            if len(lines) == 1:
+                content = "🚨 ALERT TRIGGERED — " + lines[0]
+            else:
+                content = "🚨 ALERTS TRIGGERED (bundle)\n" + "\n".join([f"- {ln}" for ln in lines[:12]])
+
+            try:
+                print(f"[TNT][ALERTS][DELIVERY][SEND] channel_id={ch_id} n={len(lines[:12])} bytes={len(content)}")
+                sent = await ch.send(content)
+                jid2 = by_channel_last_job_id.get(ch_id, "")
+                extra2: dict[str, object] = {"type": "alert_trigger", "n": int(len(lines[:12]))}
+                if jid2:
+                    extra2["job_id"] = jid2
+                _record_last_send("ALERT", ch_id, getattr(sent, "id", None), channel_obj=ch, extra=extra2)
+                # Back-compat keys used by ops scripts.
+                try:
+                    r.set("tnt:alerts:discord:last_posted_utc", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+                    r.set("tnt:alerts:discord:last_posted_channel_id", str(ch_id))
+                    r.set("tnt:alerts:discord:last_posted_channel_source", "bot")
+                    jid = by_channel_last_job_id.get(ch_id, "")
+                    if jid:
+                        r.set("tnt:alerts:discord:last_posted_job_id", jid)
+                except Exception:
+                    pass
+                print(f"[TNT][ALERTS][DELIVERY][POSTED] channel_id={ch_id} n={len(lines[:12])}")
+            except discord.Forbidden as exc:
+                print(f"[TNT][ALERTS][DELIVERY][FORBIDDEN] channel_id={ch_id}: {type(exc).__name__}: {exc}")
+                try:
+                    from services.discord_send_telemetry import record_discord_last_attempt
+
+                    jid2 = by_channel_last_job_id.get(ch_id, "")
+                    extra2: dict[str, object] = {"type": "alert_trigger", "n": int(len(lines[:12]))}
+                    if jid2:
+                        extra2["job_id"] = jid2
+                    record_discord_last_attempt(
+                        r,
+                        kind="ALERT",
+                        channel_id=ch_id,
+                        guild_id=getattr(getattr(ch, "guild", None), "id", None),
+                        channel_name=getattr(ch, "name", None),
+                        error_code="FORBIDDEN",
+                        error=f"{type(exc).__name__}: {exc}",
+                        extra=extra2,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+            except Exception as exc:
+                print(f"[TNT][ALERTS][DELIVERY][WARN] send failed channel_id={ch_id}: {type(exc).__name__}: {exc}")
+                try:
+                    from services.discord_send_telemetry import record_discord_last_attempt
+
+                    jid2 = by_channel_last_job_id.get(ch_id, "")
+                    extra2: dict[str, object] = {"type": "alert_trigger", "n": int(len(lines[:12]))}
+                    if jid2:
+                        extra2["job_id"] = jid2
+                    record_discord_last_attempt(
+                        r,
+                        kind="ALERT",
+                        channel_id=ch_id,
+                        guild_id=getattr(getattr(ch, "guild", None), "id", None),
+                        channel_name=getattr(ch, "name", None),
+                        error_code="SEND_FAILED",
+                        error=f"{type(exc).__name__}: {exc}",
+                        extra=extra2,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
 
 
 
@@ -1686,9 +1862,18 @@ async def _worker_render_oi_iv_payload_png(payload: dict[str, object]) -> bytes:
 
 
 async def _worker_post_oi_iv_png(payload: dict[str, object], *, sanitize: bool) -> bytes:
-    base = _normalize_worker_base(os.getenv("TNT_WORKER_URL", "") or "")
+    from delivery.worker_routing import pick_worker_url
+
+    symbol = str(payload.get("symbol") or "").upper().strip()
+    base = _normalize_worker_base(pick_worker_url(symbol, payload=dict(payload)))
     if not base:
-        raise RuntimeError("TNT_WORKER_URL not set")
+        raise RuntimeError("worker URL not set (need TNT_WORKER_URL_XL or TNT_WORKER_URL)")
+
+    if (os.getenv("TNT_WORKER_ROUTE_PROOF", "") or "").strip():
+        try:
+            print(f"[route] oi_iv symbol={symbol or '?'} worker={base}")
+        except Exception:
+            pass
 
     # When /oi is worker-required, ensure we're talking to the parity worker API.
     # Otherwise we can silently hit a legacy worker that renders the old stacked layout.
@@ -1800,8 +1985,10 @@ def _sha256_pixels_png(png: bytes) -> str | None:
 async def _oi_worker_payload_renderer_ok() -> bool:
     """One-time capability check: only use worker if its payload renderer matches local pixels."""
 
+    from delivery.worker_routing import pick_worker_url
+
     try:
-        base = _normalize_worker_base(os.getenv("TNT_WORKER_URL", "") or "")
+        base = _normalize_worker_base(pick_worker_url("SPY", payload={"symbol": "SPY"}))
     except Exception:
         base = ""
     if not base:
@@ -1969,9 +2156,17 @@ async def _worker_render_oi_png(*, symbol: str) -> bytes:
     Raises on failure.
     """
 
-    base = _normalize_worker_base(os.getenv("TNT_WORKER_URL", "") or "")
+    from delivery.worker_routing import pick_worker_url
+
+    base = _normalize_worker_base(pick_worker_url(str(symbol), payload={"symbol": str(symbol)}))
     if not base:
-        raise RuntimeError("TNT_WORKER_URL not set")
+        raise RuntimeError("worker URL not set (need TNT_WORKER_URL_XL or TNT_WORKER_URL)")
+
+    if (os.getenv("TNT_WORKER_ROUTE_PROOF", "") or "").strip():
+        try:
+            print(f"[route] oi symbol={symbol or '?'} worker={base}")
+        except Exception:
+            pass
 
     import aiohttp
 
@@ -2039,6 +2234,22 @@ async def run_heavy_chart(
 
     ack = await _instant_ack_editor(interaction)
 
+    def _record_kind_send(*, kind: str, channel_id: int, msg_id: int | str | None, extra: dict[str, object] | None = None) -> None:
+        try:
+            from services.discord_send_telemetry import record_discord_last_send
+
+            record_discord_last_send(
+                None,
+                kind=kind,
+                channel_id=channel_id,
+                guild_id=getattr(interaction, "guild_id", None),
+                channel_name=getattr(getattr(interaction, "channel", None), "name", None),
+                msg_id=msg_id,
+                extra=extra,
+            )
+        except Exception:
+            return
+
     def _maybe_log_render_proof(*, meta: dict[str, object] | None) -> None:
         try:
             if str(cmd) != "oi":
@@ -2073,15 +2284,33 @@ async def run_heavy_chart(
 
         content = _append_gprr_banner_cached(str(caption or ""), cached_asof_ts=float(cached_ts) if cached_ts else None)
         posted = False
+        posted_msg_id = None
         try:
             if post_to_channel and (interaction.channel is not None) and bool(getattr(ack, "_ephemeral", False)):
-                await interaction.channel.send(
+                sent = await interaction.channel.send(
                     content=content,
                     files=[_file_from_png_bytes(bytes(png_bytes), filename=str(filename))],
                 )
                 posted = True
-        except Exception:
-            pass
+                posted_msg_id = getattr(sent, "id", None)
+        except Exception as exc:
+            try:
+                if str(cmd) == "oi":
+                    from services.discord_send_telemetry import record_discord_last_attempt
+
+                    ch_id = int(getattr(interaction, "channel_id", 0) or 0)
+                    record_discord_last_attempt(
+                        None,
+                        kind="OI",
+                        channel_id=(ch_id or int(getattr(getattr(interaction, "channel", None), "id", 0) or 0)),
+                        guild_id=getattr(interaction, "guild_id", None),
+                        channel_name=getattr(getattr(interaction, "channel", None), "name", None),
+                        error_code="CHANNEL_SEND_FAILED",
+                        error=f"{type(exc).__name__}: {exc}",
+                        extra={"cached": 1},
+                    )
+            except Exception:
+                pass
 
         _maybe_log_render_proof(meta=meta)
 
@@ -2092,6 +2321,21 @@ async def run_heavy_chart(
                 content=content,
                 attachments=[_file_from_png_bytes(bytes(png_bytes), filename=str(filename))],
             )
+
+        # Universal send telemetry: record only after Discord confirms output.
+        try:
+            if str(cmd) == "oi":
+                ch_id = int(getattr(interaction, "channel_id", 0) or 0)
+                ack_msg = getattr(ack, "_ack_msg", None)
+                ack_id = getattr(ack_msg, "id", None)
+                _record_kind_send(
+                    kind="OI",
+                    channel_id=(ch_id or int(getattr(getattr(interaction, "channel", None), "id", 0) or 0)),
+                    msg_id=(posted_msg_id if posted else ack_id),
+                    extra={"cached": 1, "posted": int(1 if posted else 0)},
+                )
+        except Exception:
+            pass
         return True
 
     # 2️⃣ cache-first
@@ -2251,15 +2495,33 @@ async def run_heavy_chart(
     # 6️⃣ respond
     content = _append_gprr_banner(caption)
     posted = False
+    posted_msg_id = None
     try:
         if post_to_channel and (interaction.channel is not None) and bool(getattr(ack, "_ephemeral", False)):
-            await interaction.channel.send(
+            sent = await interaction.channel.send(
                 content=content,
                 files=[_file_from_png_bytes(bytes(png_bytes), filename=filename)],
             )
             posted = True
-    except Exception:
-        pass
+            posted_msg_id = getattr(sent, "id", None)
+    except Exception as exc:
+        try:
+            if str(cmd) == "oi":
+                from services.discord_send_telemetry import record_discord_last_attempt
+
+                ch_id = int(getattr(interaction, "channel_id", 0) or 0)
+                record_discord_last_attempt(
+                    None,
+                    kind="OI",
+                    channel_id=(ch_id or int(getattr(getattr(interaction, "channel", None), "id", 0) or 0)),
+                    guild_id=getattr(interaction, "guild_id", None),
+                    channel_name=getattr(getattr(interaction, "channel", None), "name", None),
+                    error_code="CHANNEL_SEND_FAILED",
+                    error=f"{type(exc).__name__}: {exc}",
+                    extra={"cached": 0},
+                )
+        except Exception:
+            pass
 
     _maybe_log_render_proof(meta=meta)
 
@@ -2270,6 +2532,21 @@ async def run_heavy_chart(
             content=content,
             attachments=[_file_from_png_bytes(bytes(png_bytes), filename=filename)],
         )
+
+    # Universal send telemetry: record only after Discord confirms output.
+    try:
+        if str(cmd) == "oi":
+            ch_id = int(getattr(interaction, "channel_id", 0) or 0)
+            ack_msg = getattr(ack, "_ack_msg", None)
+            ack_id = getattr(ack_msg, "id", None)
+            _record_kind_send(
+                kind="OI",
+                channel_id=(ch_id or int(getattr(getattr(interaction, "channel", None), "id", 0) or 0)),
+                msg_id=(posted_msg_id if posted else ack_id),
+                extra={"cached": 0, "posted": int(1 if posted else 0)},
+            )
+    except Exception:
+        pass
 
 
 _ACK_WORKING_TEXT = "Working…"
