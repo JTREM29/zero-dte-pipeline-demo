@@ -12,8 +12,7 @@ Get-CimInstance Win32_Process |
         ($_.Name -match '^python') -and $_.CommandLine -and (
             ($_.CommandLine -like '*cli.discord_bot*') -or
             ($_.CommandLine -like '*delivery.discord_bot*') -or
-            ($_.CommandLine -like '*delivery.discord_bot_head*') -or
-            ($_.CommandLine -like "*$repoRoot*")
+            ($_.CommandLine -like '*delivery.discord_bot_head*')
         )
     } |
     ForEach-Object {
