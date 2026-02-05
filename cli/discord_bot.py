@@ -15321,49 +15321,128 @@ if __name__ == "__main__":
         if allow_multi:
             return True
 
+        def _parse_pid_stamp(path: Path) -> int | None:
+            try:
+                if not path.exists():
+                    return None
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                for raw in text.splitlines():
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    if line.lower().startswith("pid="):
+                        try:
+                            pid_val = int(line.split("=", 1)[1].strip())
+                        except Exception:
+                            return None
+                        return pid_val if pid_val > 0 else None
+            except Exception:
+                return None
+            return None
+
+        def _pid_is_running(pid: int) -> bool:
+            if pid <= 0:
+                return False
+            try:
+                if os.name == "nt":
+                    import ctypes  # local import to avoid global dependency churn
+
+                    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                    STILL_ACTIVE = 259
+                    handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+                    if not handle:
+                        return False
+                    try:
+                        exit_code = ctypes.c_ulong()
+                        ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                        if not ok:
+                            return False
+                        return int(exit_code.value) == STILL_ACTIVE
+                    finally:
+                        try:
+                            ctypes.windll.kernel32.CloseHandle(handle)
+                        except Exception:
+                            pass
+                else:
+                    os.kill(pid, 0)
+                    return True
+            except Exception:
+                return False
+
         try:
             lock_dir = Path("logs")
             lock_dir.mkdir(parents=True, exist_ok=True)
             safe_entry = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in _TNT_ENTRYPOINT)
             lock_path = lock_dir / f"tnt_discord_bot.{safe_entry}.lock"
-            fh = open(lock_path, "a+", encoding="utf-8")
+            existing_pid = _parse_pid_stamp(lock_path)
 
-            # Ensure the lock handle is not inheritable. If a child process inherits
-            # this handle, it can appear to "also" hold the singleton lock and we end
-            # up with two running bot processes.
-            try:
-                os.set_inheritable(fh.fileno(), False)
-            except Exception:
-                pass
+            def _try_open_and_lock() -> object | None:
+                fh_local = open(lock_path, "a+", encoding="utf-8")
 
-            try:
-                # Windows: msvcrt lock (non-blocking)
-                import msvcrt  # type: ignore
+                # Ensure the lock handle is not inheritable. If a child process inherits
+                # this handle, it can appear to "also" hold the singleton lock and we end
+                # up with two running bot processes.
+                try:
+                    os.set_inheritable(fh_local.fileno(), False)
+                except Exception:
+                    pass
 
                 try:
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                except OSError:
-                    try:
-                        fh.close()
-                    except Exception:
-                        pass
-                    return False
-            except Exception:
-                # POSIX: fcntl flock (non-blocking)
-                try:
-                    import fcntl  # type: ignore
+                    # Windows: msvcrt lock (non-blocking)
+                    import msvcrt  # type: ignore
 
                     try:
-                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        msvcrt.locking(fh_local.fileno(), msvcrt.LK_NBLCK, 1)
                     except OSError:
                         try:
-                            fh.close()
+                            fh_local.close()
+                        except Exception:
+                            pass
+                        return None
+                except Exception:
+                    # POSIX: fcntl flock (non-blocking)
+                    try:
+                        import fcntl  # type: ignore
+
+                        try:
+                            fcntl.flock(fh_local.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except OSError:
+                            try:
+                                fh_local.close()
+                            except Exception:
+                                pass
+                            return None
+                    except Exception:
+                        # If locking isn't supported, don't block startup.
+                        return fh_local
+
+                return fh_local
+
+            fh = _try_open_and_lock()
+            if fh is None:
+                # Self-heal: if the stamp points at a dead PID, try deleting the
+                # lock file and retry once.
+                if os.name == "nt" and existing_pid is not None and not _pid_is_running(existing_pid):
+                    try:
+                        lock_path.unlink(missing_ok=True)
+                    except Exception as exc:
+                        try:
+                            print(f"[TNT][bot][WARN] failed to remove stale lock (pid={existing_pid} dead): {exc}")
                         except Exception:
                             pass
                         return False
-                except Exception:
-                    # If locking isn't supported, don't block startup.
-                    return True
+
+                    fh = _try_open_and_lock()
+                    if fh is not None:
+                        try:
+                            print(f"[TNT][bot] stale lock detected (pid={existing_pid} dead); removed lock and recovered")
+                        except Exception:
+                            pass
+                    else:
+                        return False
+
+            if fh is None:
+                return False
 
             # Write PID stamp (informational).
             try:

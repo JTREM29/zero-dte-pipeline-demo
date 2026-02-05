@@ -1759,132 +1759,24 @@ def fmt_last_price(symbol: str, last_price: Optional[float], ts_utc: Optional[st
 def _coerce_ai_string(value: Optional[object], *, max_len: int = 240) -> str:
     if value is None:
         return ""
-    if level_ctx:
-        lines.append(f"- Upside: {fmt_targets(level_ctx.get('upside_targets'))}")
-        lines.append(f"- Downside: {fmt_targets(level_ctx.get('downside_targets'))}")
 
-        if level_ctx.get("extension_mode") and last_price is not None:
-            broken_levels = level_ctx.get("broken") if isinstance(level_ctx.get("broken"), list) else []
-            try:
-                price_val = float(last_price)
-            except Exception:  # noqa: BLE001
-                price_val = None
-
-            if price_val is not None:
-                pivot_regime = (payload.get("pivot_regime") or "").upper()
-                if pivot_regime.startswith("ABOVE"):
-                    broken_support = [item for item in broken_levels if isinstance(item, (list, tuple)) and len(item) == 2 and item[1] < price_val]
-                    if broken_support:
-                        lines.append(f"- Support (broken): {fmt_targets(broken_support[:3])}")
-                else:
-                    broken_overhead = [item for item in broken_levels if isinstance(item, (list, tuple)) and len(item) == 2 and item[1] > price_val]
-                    if broken_overhead:
-                        lines.append(f"- Overhead resistance (broken): {fmt_targets(broken_overhead[:3])}")
+    if isinstance(value, str):
+        text = value
     else:
-        lines.append("- Upside: n/a")
-        lines.append("- Downside: n/a")
-        lines.append("- (no level context available)")
-        lines.append("")
-        lines.append("🧠 How Pros Would Trade It:")
-        lines.append("- Insufficient level data; defer to fresh signal or manual review")
-        lines.append("")
-        lines.append("🚫 Do Nothing If:")
-        lines.append("- Levels unknown -> wait for updated data")
-        lines.append("")
-        lines.append("_Not financial advice._")
-        return "\n".join(lines)
+        try:
+            text = str(value)
+        except Exception:  # noqa: BLE001
+            return ""
 
-    if level_ctx:
-        bull_targets = "-"  # keep placeholder if we craft plan below
-    bull_targets_lines: list[str] = []
-    bear_targets_lines: list[str] = []
-    if level_ctx:
-        bull_targets_lines.append(f"- Upside: {fmt_targets(level_ctx.get('upside_targets'))}")
-        bear_targets_lines.append(f"- Downside: {fmt_targets(level_ctx.get('downside_targets'))}")
+    text = text.strip()
+    if not text:
+        return ""
 
-    lines.append("")
-    lines.append("🧠 How Pros Would Trade It:")
-    bull_plan = ["- Bull: enter on reclaim + hold above Pivot"]
-    bear_plan = ["- Bear: enter on lose + hold below Pivot"]
-    if level_ctx:
-        bull_plan.append(f"- Targets: {fmt_targets(level_ctx.get('upside_targets'))}")
-        bear_plan.append(f"- Targets: {fmt_targets(level_ctx.get('downside_targets'))}")
-    else:
-        bull_plan.append("- Targets: need updated pivots")
-        bear_plan.append("- Targets: need updated pivots")
-    bull_plan.append(f"- Invalidation: lose **{fmt_money(pivot)}**")
-    bear_plan.append(f"- Invalidation: reclaim **{fmt_money(pivot)}**")
-    lines.extend(bull_plan)
-    lines.extend(bear_plan)
-    symbol_norm = symbol.upper().strip()
-    bias_norm = (bias or "NEUTRAL").upper().strip()
-    conviction_norm = (conviction or "LOW").upper().strip()
+    if max_len > 0 and len(text) > max_len:
+        # Keep it deterministic and safe for Discord embeds.
+        text = text[: max(0, max_len - 1)].rstrip() + "…"
 
-    price_f = _f(last_price)
-    P = _f(piv.get("P"))
-    R1 = _f(piv.get("R1"))
-    R2 = _f(piv.get("R2"))
-    S1 = _f(piv.get("S1"))
-    S2 = _f(piv.get("S2"))
-
-    confirm = vix_sqqq_confirmation_from_dirs(vix_dir, sqqq_dir)
-
-    regime = detect_regime(price_f, P, R1, R2, S1, S2)
-    d_pivot = _delta(price_f, P) if P is not None else None
-    if d_pivot is None:
-        vs_pivot = "n/a"
-    else:
-        if d_pivot > 0:
-            rel = "above"
-        elif d_pivot < 0:
-            rel = "below"
-        else:
-            rel = "at"
-        vs_pivot = f"{d_pivot:+.2f} pts ({rel} P {_fmt(P)})"
-
-    ladd = ladder_levels(price_f if price_f is not None else last_price, piv)
-    up_targets = " → ".join([f"{k} {_fmt(v)}" for k, v in ladd["up"][:2]]) or "n/a"
-    down_targets = " → ".join([f"{k} {_fmt(v)}" for k, v in ladd["down"][:2]]) or "n/a"
-
-    if regime in ("BELOW_S1", "BELOW_P", "EXTENSION_DOWN"):
-        primary = f"**Bear plan:** stay below **P {_fmt(P)}** → targets: {down_targets}"
-        if S1 is not None and price_f is not None and price_f < S1:
-            alternate = f"**Bull flip:** reclaim + hold **S1 {_fmt(S1)}** then **P {_fmt(P)}** → targets: {up_targets}"
-        else:
-            alternate = f"**Bull flip:** reclaim + hold **P {_fmt(P)}** → targets: {up_targets}"
-    elif regime in ("ABOVE_P", "ABOVE_R1", "EXTENSION_UP"):
-        primary = f"**Bull plan:** stay above **P {_fmt(P)}** → targets: {up_targets}"
-        alternate = f"**Bear flip:** lose + hold below **P {_fmt(P)}** → targets: {down_targets}"
-    else:
-        primary = f"**Range plan:** trade edges only (S/R reactions). Targets: up {up_targets} | down {down_targets}"
-        alternate = f"**Trend plan:** wait for break + retest of **P {_fmt(P)}** then follow direction."
-
-    msg: List[str] = []
-    msg.append(f"🚨 **{symbol_norm} — Trade Context**")
-    msg.append(fmt_last_price(symbol_norm, last_price, last_price_ts_utc, last_price_tf))
-    if P is not None:
-        msg.append(f"📏 **vs Pivot:** {vs_pivot}")
-    msg.append("")
-    msg.append(
-        f"**Bias:** **{bias_norm}** | **Confirmation:** **{confirm}** | **Regime:** **{regime}** | **Conviction:** **{conviction_norm}**"
-    )
-    msg.append("")
-    msg.append("**Key Levels (RTH):**")
-    msg.append(f"• P {_fmt(P)} | R1 {_fmt(R1)} | R2 {_fmt(R2)}")
-    msg.append(f"• S1 {_fmt(S1)} | S2 {_fmt(S2)}")
-    msg.append("")
-    msg.append("**How Pros Would Trade It**")
-    msg.append(f"• {primary}")
-    msg.append(f"• {alternate}")
-    msg.append("")
-    msg.append("🚫 **Do Nothing If**")
-    msg.append("• No break + retest confirmation (first spike only)")
-    msg.append("• Choppy price around pivot (no direction)")
-    msg.append("• Confirmation flips HARD against the plan")
-    msg.append("")
-    msg.append("_Not financial advice._")
-
-    return "\n".join(msg)
+    return text
 
 import discord
 from discord import app_commands
