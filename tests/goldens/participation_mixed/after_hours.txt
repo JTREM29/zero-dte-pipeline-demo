@@ -1,0 +1,27 @@
+🌙 **After Hours Rundown**
+ET date/time: 2025-12-17 15:23
+
+📊 Futures Context — @ES#
+• ON range: H 4835.25 / L 4818.75 / Anchor 4826.50
+• RTH: H 4848.00 / L 4804.25
+• Prior RTH: H 4862.25 / L 4795.50 / Close 4832.75
+• Posture: Overnight holding inside prior RTH range.
+• Updated: 2025-12-17 | 2025-12-17 15:23 ET
+
+📊 Coverage:
+• Monitoring SPY, QQQ into tomorrow.
+
+📈 Regime Snapshot:
+• Balance with buyers defending ON mid.
+
+📐 Levels To Review:
+• SPY 677: Support zone reference.
+• QQQ 613: Support zone reference.
+
+📝 Options Flow:
+• Gamma: NORMAL
+• Theta: NORMAL
+• Vol: NORMAL
+• Behavior: Reduced participation until posture confirms.
+
+_Not financial advice._

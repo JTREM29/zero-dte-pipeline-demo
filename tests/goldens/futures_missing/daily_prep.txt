@@ -1,0 +1,43 @@
+📌 **Daily Prep — Plan of Record**
+ET stamp: 2025-12-17 15:23 | Session: RTH
+Status: **STAND DOWN** | Bias: **BULLISH** | Edge: 0.13
+
+🧾 Data Mode: OPEN (live snapshot; stale price open>10m)
+💵 **Last Price**
+• SPY: 678.98 (live snapshot | 2025-12-17 14:38 ET | OPEN)
+• QQQ: 614.89 (live snapshot | 2025-12-17 14:38 ET | OPEN)
+🧭 **Directional Confirmation (VIX + SQQQ)**
+• TF: 1m | VIX trend: **down** | SQQQ dir: **down**
+• 🟢 Bias confirm: **BULLISH** — Fixture bias: VIX easing with SQQQ lower
+
+🚫 Stand-Down Triggers:
+• Futures context missing.
+
+⏱ Timeframes:
+• Execution: 5m
+• Structure: 60m
+• Context: 1D
+
+🔎 Regime Read:
+• Transitioning at key levels — wait for cash tape confirmation.
+
+📊 Futures Context — @ES#
+• Futures context unavailable: missing
+
+📐 Key Levels (RTH):
+• **SPY**: P 679.00 | R1 681.00 | S1 677.00
+• **QQQ**: P 615.10 | R1 617.25 | S1 612.95
+
+🧠 How Pros Would Trade It:
+• Stand-down: wait for futures context to refresh and bias to reconfirm before deploying risk.
+• Alternate: keep prep manual; let confirmation + liquidity rebuild before re-engaging.
+
+🛡 Risk Controls:
+• Invalidation: stay sidelined until futures context refreshes and bias reconfirms.
+
+🚫 Do Nothing If:
+• Confirmation flips NEUTRAL/UNKNOWN around Pivot.
+• Futures context stays stale or a high-impact macro release is <15m away.
+
+ET stamp: 2025-12-17 15:23 ET
+_Not financial advice._

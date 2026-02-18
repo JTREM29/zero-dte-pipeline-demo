@@ -1,0 +1,29 @@
+{
+  "version": "1.0",
+  "cases": [
+    {
+      "name": "simple_vwap_cross",
+      "input_text": "Notify me when SPY crosses above VWAP on 5m",
+      "expected_ok": true,
+      "expected_condition_type": "cross",
+      "expected_timeframe": "5m"
+    },
+    {
+      "name": "yesterday_high_break",
+      "input_text": "Alert when QQQ breaks yesterday high",
+      "expected_ok": true,
+      "expected_condition_type": "break"
+    },
+    {
+      "name": "ambiguous_break",
+      "input_text": "Alert when SPY breaks VWAP",
+      "expected_ok": false,
+      "expected_clarify": true
+    },
+    {
+      "name": "too_many_symbols",
+      "input_text": "Alert for SPY, QQQ, IWM, DIA, XLF, XLK, XLV, XLE, XLP, XLI, XLB, XLRE, XLU, SMH, SOXX, ARKK, ARKG, ARKF, ARKW, TQQQ, SQQQ",
+      "expected_ok": false
+    }
+  ]
+}

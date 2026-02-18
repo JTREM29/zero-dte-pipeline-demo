@@ -1,0 +1,46 @@
+🎯 Focus List — Next RTH
+ET stamp: 2025-12-17 15:23 ET
+
+Stand-Down: **OFF**
+Reason: n/a
+Participation caution: Breadth mixed; confirm bias before adds.
+🚦 Permissions: Aggression **REDUCED** | Momentum-only: false | No-trade: false
+Reason(s): Breadth mixed; confirm bias before adds.
+
+📊 Market Participation (TNT)
+• Regime: **MIXED** | Quality: **OK** | Gate: **CAUTION**
+• Leaders: NVDA, AMD, TSLA
+• Laggards: XLU, PG, KO
+• Notes: Breadth mixed; confirm bias before adds.
+
+📊 Futures Context — @ES#
+• ON range: H 4835.25 / L 4818.75 / Anchor 4826.50
+• Posture: ON holding inside prior RTH range.
+
+📈 Guidance
+• Primary focus: Confirm posture only at key zones; wait for gates to resolve.
+• Default behavior: reduced participation
+
+📈 Regime Snapshot
+• Focus on relative strength groups vs ON range.
+
+🔭 Focus Symbols
+• SPY: observe behavior at key zones; wait for posture confirmation.
+• QQQ: observe behavior at key zones; wait for posture confirmation.
+• IWM: observe behavior at key zones; wait for posture confirmation.
+
+📐 Levels In Play
+• SPY 677: Support zone reference.
+• QQQ 613: Support zone reference.
+
+🧠 Options Environment (context only)
+• Gamma: NORMAL
+• Theta: NORMAL
+• Vol Regime: NORMAL
+
+🚫 Guardrails
+• If data becomes stale/degraded, stand down.
+• If market participation conflicts with bias, reduce participation.
+• If futures context is stale, stand down until refresh.
+
+TNT charts are posture & behavior only. No execution guidance.

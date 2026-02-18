@@ -1,0 +1,23 @@
+🌅 **Pre-Market Briefing**
+ET date/time: 2025-12-17 15:23
+
+📊 Futures Context — @ES#
+• Futures context unavailable: missing
+
+🎯 Opening Watch:
+• Primary symbols: SPY, QQQ
+
+📈 Regime Snapshot:
+• Still balanced; watch for break of ON range.
+
+📐 Key Levels For The Open:
+• SPY 677: Support zone reference.
+• QQQ 613: Support zone reference.
+
+📝 Options Flow Highlights:
+• Gamma: NORMAL
+• Theta: NORMAL
+• Vol: NORMAL
+• Behavior: Reduced participation until posture confirms.
+
+_Not financial advice._

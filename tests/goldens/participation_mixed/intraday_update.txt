@@ -1,0 +1,24 @@
+⏱ Intraday Update (RTH) — 2025-12-17 15:23 ET
+💵 Last: SPY 678.98, QQQ 614.89, IWM 251.27
+
+🧭 Posture: BULL | Regime: MIXED | Conv: HIGH
+🚦 Permissions: Aggression **REDUCED** | Stand-down: OFF | Momentum-only: false | No-trade: false
+Reason(s): Participation caution: Breadth mixed; confirm bias before adds.
+
+📐 Key Levels
+SPY: P 679.00 / R1 681.00 / S1 677.00
+QQQ: P 615.10 / R1 617.25 / S1 612.95
+
+🟦 Futures Alignment: ALIGNED
+Event Risk: NONE
+
+✅ Allowed
+• Observe posture; reduce participation until confirmation.
+
+🚫 Prohibited
+• Escalating aggression when posture is not confirmed.
+• Any action during degraded inputs.
+
+Invalidation: posture degrades or data becomes stale/degraded.
+
+TNT charts are posture & behavior only. No execution guidance.

@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CompilerEnvelope v1",
+  "type": "object",
+  "required": ["ok", "warnings", "clarify"],
+  "properties": {
+    "ok": { "type": "boolean" },
+    "intent": {
+      "oneOf": [
+        { "$ref": "alert_intent_v1.schema.json" },
+        { "type": "null" }
+      ]
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "clarify": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "question": { "type": "string" },
+            "choices": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "default": { "type": "string" }
+          }
+        },
+        { "type": "null" }
+      ]
+    }
+  }
+}
