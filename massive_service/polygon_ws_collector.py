@@ -220,6 +220,13 @@ async def main_async() -> None:
     if os.getenv("POLYGON_ENABLED", "1") == "0":
         print("[polygon_ws_collector] POLYGON_ENABLED=0, exiting")
         return
+    
+    # Allow selective WS disable (e.g., on render-only workers).
+    # TNT_DISABLE_POLYGON_WS=1 means "do not start WS collector."
+    # Default (unset or 0) means WS is allowed.
+    if os.getenv("TNT_DISABLE_POLYGON_WS", "0") == "1":
+        print("[polygon_ws_collector] TNT_DISABLE_POLYGON_WS=1, WebSocket disabled on this machine")
+        return
 
     backoff = 1.0
     while True:

@@ -116,7 +116,48 @@ GitHub Actions executes both Python 3.12 and 3.13. Each job:
 
 Keep local runs aligned with the same sequence so failures reproduce quickly.
 
-## 7. Troubleshooting Notes
+## 7. Multi-Machine Deployment (Polygon WebSocket Control)
+
+When running the pipeline across multiple machines (e.g., CLX for bot + data collection, Worker-01 for render-only), you need to control which machine runs the Polygon WebSocket collector to avoid exceeding connection limits.
+
+**Architecture**:
+- **CLX (Main)**: Discord bot, REST ingest, Polygon WS, schedulers, Redis
+- **Worker-01 (Render)**: Render worker only (/healthz endpoint)
+
+**Configuration**:
+
+Set `TNT_DISABLE_POLYGON_WS` in your `.env` or `.env.local`:
+
+- On **CLX** (main machine): `TNT_DISABLE_POLYGON_WS=0` (or leave unset) — WebSocket **enabled**
+- On **Worker-01** (render worker): `TNT_DISABLE_POLYGON_WS=1` — WebSocket **disabled**
+
+The `polygon_ws_collector` module checks this variable at startup:
+```python
+# In massive_service/polygon_ws_collector.py
+if os.getenv("TNT_DISABLE_POLYGON_WS", "0") == "1":
+    print("[polygon_ws_collector] TNT_DISABLE_POLYGON_WS=1, WebSocket disabled on this machine")
+    return
+```
+
+**Verification**:
+
+To confirm which processes are using Polygon WebSocket, run on each machine:
+
+```powershell
+# On CLX
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match 'polygon_ws_collector|polygon|websocket' } |
+  Select-Object ProcessId, CommandLine | Format-Table -AutoSize
+
+# On Worker-01 (after setting TNT_DISABLE_POLYGON_WS=1)
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match 'polygon_ws_collector|polygon|websocket' } |
+  Select-Object ProcessId, CommandLine | Format-Table -AutoSize
+```
+
+Worker-01 should show no polygon_ws_collector processes. If both show none and you still get `max_connections` errors, check for duplicate processes on hidden terminals or scheduled tasks.
+
+## 8. Troubleshooting Notes
 
 - **Missing futures context**: confirm the IQFeed collector is writing fresh rows and that `FUTURES_CONTEXT_PATH` points at the expected JSON.
 - **Discord rate limits**: the bot respects the 2,000 character limit; if messages are rejected, double-check the template edits didnt exceed the guards.
